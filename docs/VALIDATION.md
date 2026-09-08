@@ -64,17 +64,32 @@ PIN files, contacts, or face data.
 
 ## Visual previews
 
-`core-preview.png` and `overlays-preview.png` are software design previews, **not
+`core-motion.gif`, `core-preview.png`, and `overlays-preview.png` are software design previews, **not
 captured OpenGL windows**. Overlay weather values are explicitly fixture/sample
 data. The overlay preview invokes the real overlay layout/text methods through
 Pillow drawing adapters; glow and weather-icon rendering are approximations.
 
 ```sh
 pip install Pillow  # optional development-only dependency
-python tools/render_core_preview.py
+python tools/render_core_preview.py --motion
 python tools/render_overlays_preview.py
 ```
 
 Live speech services, live weather requests, device operations, and real OpenGL
 rasterization remain target-machine checks. No blanket claim that every hardware
 integration works is made by these automated results.
+
+
+## Particle-flow build (`amber-flow-v3`)
+
+Added checks cover three-dimensional positions, stream heads matching their
+trails, nonzero depth range, outward-moving light packets, bounded vertex arrays,
+and seven particle/trail batch submissions. These validate the actual generated
+geometry and renderer call structure, not GPU performance. The new vertex-array
+renderer requires the same compatibility OpenGL context used by the existing app.
+
+On your laptop, check that small bright heads travel around both sides of the
+sphere, trails fade behind them, and short rays travel outward. Test “reduce
+motion” and “resume animation”, then show weather and return to the core. Capture
+a short screen recording if it still looks static or runs slowly; include the
+`python main.py --diagnose` output. Static preview PNGs cannot establish motion.

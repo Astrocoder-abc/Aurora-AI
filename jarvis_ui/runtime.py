@@ -5,7 +5,7 @@ import sys
 
 from .paths import PROJECT_ROOT
 
-UI_BUILD = 'amber-windowed-v2'
+UI_BUILD = 'amber-flow-v3'
 
 
 def window_size(desktop, requested=(960, 640)):

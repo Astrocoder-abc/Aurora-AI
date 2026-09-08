@@ -88,14 +88,18 @@ class DashboardTests(unittest.TestCase):
         self.hud._voice_color = lambda: (1, .56, .06)
         self.hud._draw_circle_2d = MagicMock()
         functions = ('glBlendFunc', 'glPointSize', 'glBegin', 'glColor4f',
-                     'glVertex2f', 'glEnd', 'glLineWidth')
+                     'glVertex2f', 'glEnd', 'glLineWidth', 'glPushClientAttrib', 'glPushAttrib',
+                     'glEnableClientState', 'glEnable', 'glVertexPointer', 'glColorPointer',
+                     'glDrawArrays', 'glPopAttrib', 'glPopClientAttrib')
         constants = ('GL_SRC_ALPHA', 'GL_ONE', 'GL_POINTS', 'GL_LINE_STRIP',
-                     'GL_LINES', 'GL_TRIANGLE_FAN', 'GL_ONE_MINUS_SRC_ALPHA')
+                     'GL_LINES', 'GL_TRIANGLE_FAN', 'GL_ONE_MINUS_SRC_ALPHA', 'GL_CLIENT_VERTEX_ARRAY_BIT',
+                     'GL_POINT_BIT', 'GL_VERTEX_ARRAY', 'GL_COLOR_ARRAY', 'GL_POINT_SMOOTH', 'GL_FLOAT')
         patches = {name: MagicMock() for name in functions}
         patches.update({name: name for name in constants})
         with patch.dict(self.module.__dict__, patches):
             self.hud._draw_idle_indicator((1, .56, .06))
-        self.assertLessEqual(patches['glBegin'].call_count, 16)
+        self.assertLessEqual(patches['glBegin'].call_count, 3)
+        self.assertEqual(patches['glDrawArrays'].call_count, 7)
         patches['glBlendFunc'].assert_called_with('GL_SRC_ALPHA', 'GL_ONE_MINUS_SRC_ALPHA')
         patches['glPointSize'].assert_called_with(1)
 
@@ -205,7 +209,7 @@ class StartupTests(unittest.TestCase):
         result = subprocess.run([sys.executable, str(ROOT / 'main.py'), '--diagnose'],
                                 cwd='/tmp', capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('amber-windowed-v2', result.stdout)
+        self.assertIn('amber-flow-v3', result.stdout)
         self.assertIn(str(ROOT / 'jarvis_ui' / 'hologram.py'), result.stdout)
 
     def test_window_fits_desktop_without_minimum_size_overflow(self):

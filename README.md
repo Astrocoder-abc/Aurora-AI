@@ -36,7 +36,7 @@ python main.py
 
 Starts in a normal **960×640 window**, reduced to leave desktop/taskbar space.
 Fullscreen and F11 switching are disabled unless you explicitly pass `--fullscreen`.
-The title bar identifies this build as **Amber Core | amber-windowed-v2**.
+The title bar identifies this build as **Amber Core | amber-flow-v3**.
 Camera and voice are attempted; unavailable camera or voice
 setup is reported in the dashboard event log. Missing core dependencies are
 reported in the terminal with a nonzero exit code.
@@ -97,9 +97,19 @@ Paths do not depend on your terminal's current working directory.
 
 No clickable buttons, toolbar, hover targets, or mouse navigation. Inspired by
 the supplied amber-core reference, the default view is almost black with a
-**glowing gold particle sphere**, elliptical orbital filaments, scattered embers,
-radial streaks, and a white-hot nucleus. Roughly 4,700 points are batched into a
-few draw calls. The particle model is seeded once and does not grow over time.
+**glowing gold particle sphere** built from moving three-dimensional positions.
+It contains 3,460 particles, including 40 bright relay heads with short fading
+trails. Near particles appear brighter/larger; far particles recede. Orbit planes
+precess, nearby relays briefly connect, and light packets move outward instead
+of forming fixed center-to-edge spokes. There are no complete decorative orbit
+circles in the core. Seven vertex-array batches draw the particles and trails,
+plus a few small nucleus/glow draws. The seeded model does not accumulate history.
+
+The app generates particle motion every frame; it does **not** load the preview
+image/GIF or play a canned animation. It uses perspective projection and additive
+particle lighting, **not hardware ray tracing**. Motion uses elapsed time rather
+than frame count, and the particles follow different paths rather than rotating
+a single flat image.
 
 The core stays amber through listening/thinking/speaking; warmth and energy
 change instead of switching the whole screen to cyan. The bottom signal animation
@@ -108,7 +118,7 @@ voice as offline if it cannot start. Grid, corner frames, and large telemetry
 panels are hidden by default. Weather docks beside the core; existing atoms,
 shapes, and solar-system displays remain available.
 
-![Software-rendered design preview of the amber particle core](docs/core-preview.png)
+![Animated software preview of the particle flow](docs/core-motion.gif)
 
 This is a **software design preview**, produced from the same particle geometry,
 not a captured OpenGL window. Glow/point rasterization may differ on your GPU.
@@ -116,7 +126,7 @@ To regenerate it (optional development dependency):
 
 ```sh
 pip install Pillow
-python tools/render_core_preview.py
+python tools/render_core_preview.py --motion
 ```
 
 Say **“Aurora”** and your request together, or say the wake word alone and then
@@ -280,7 +290,7 @@ python main.py --windowed
 Do not pull the Arena branch into `main`. Confirm the switch succeeds before
 continuing. Don't discard local changes to get past an error.
 
-The report must say `Aurora UI build: amber-windowed-v2`. It also prints the
+The report must say `Aurora UI build: amber-flow-v3`. It also prints the
 project folder, Python executable, UI file, branch and commit. An unrecognized
 `--diagnose`/`--windowed` option indicates that terminal is still launching an
 older `main.py`. For a low-load visual check, use

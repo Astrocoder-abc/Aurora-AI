@@ -17,6 +17,7 @@ showed "Not Responding" in Windows — fixed here.)
 """
 
 import math
+import ctypes
 from copy import deepcopy
 import random
 import time
@@ -28,6 +29,7 @@ from collections import deque, OrderedDict
 import threading
 
 from jarvis_ui.particle_core import ParticleCore
+from jarvis_ui.particle_buffers import build_buffers
 from jarvis_ui.overlays import overlay_rect, visible_page
 from jarvis_ui.runtime import UI_BUILD, window_size
 
@@ -1821,31 +1823,34 @@ class Hologram:
         color = self._voice_color()
         glBlendFunc(GL_SRC_ALPHA, GL_ONE)
         try:
-            # All points of one size share a draw call (no per-particle polygons).
-            for size, halo in ((1, True), (2, True), (1, False), (2, False)):
-                glPointSize(size + 3 if halo else size)
-                glBegin(GL_POINTS)
-                for x, y, alpha, point_size in frame.particles:
-                    if point_size == size:
-                        glColor4f(*color, alpha * self.brightness * (.09 if halo else 1))
-                        glVertex2f(cx + x * radius, cy + y * radius)
-                glEnd()
-            for orbit in frame.orbits:
-                glLineWidth(1)
-                glBegin(GL_LINE_STRIP)
-                for x, y, alpha in orbit:
-                    glColor4f(*color, alpha * .95)
-                    glVertex2f(cx + x * radius, cy + y * radius)
-                glEnd()
-            # Central filaments taper into sparse orange radial streaks.
-            glLineWidth(1)
-            glBegin(GL_LINES)
-            for x, y, alpha in frame.rays:
-                glColor4f(1, .78, .3, alpha * 1.4)
-                glVertex2f(cx, cy)
-                glColor4f(*color, alpha * .8)
-                glVertex2f(cx + x * radius, cy + y * radius)
-            glEnd()
+            batches, line_batch = build_buffers(frame, (cx, cy), radius, color, self.brightness)
+            # A handful of vertex-array draws replaces thousands of Python GL calls.
+            glPushClientAttrib(GL_CLIENT_VERTEX_ARRAY_BIT)
+            glPushAttrib(GL_POINT_BIT)
+            try:
+                glEnableClientState(GL_VERTEX_ARRAY)
+                glEnableClientState(GL_COLOR_ARRAY)
+                glEnable(GL_POINT_SMOOTH)
+                def draw_batch(vertices, colors, primitive):
+                    if not vertices:
+                        return
+                    glVertexPointer(2, GL_FLOAT, 0, ctypes.c_void_p(vertices.buffer_info()[0]))
+                    glColorPointer(4, GL_FLOAT, 0, ctypes.c_void_p(colors.buffer_info()[0]))
+                    glDrawArrays(primitive, 0, len(vertices) // 2)
+                for size, (vertices, colors) in batches.items():
+                    # Broad dim halo plus a sharp head: real moving points, no sprites/images.
+                    halo = colors[:]
+                    for index in range(3, len(halo), 4):
+                        halo[index] *= .075
+                    glPointSize(size * 2.5 + 1)
+                    draw_batch(vertices, halo, GL_POINTS)
+                    glPointSize(size)
+                    draw_batch(vertices, colors, GL_POINTS)
+                glLineWidth(1.2)
+                draw_batch(*line_batch, GL_LINES)
+            finally:
+                glPopAttrib()
+                glPopClientAttrib()
             # Smooth radial glow, not nested opaque disks; white-hot central seed.
             for scale, alpha in ((.4, .09), (.2, .22), (.08, .85)):
                 glBegin(GL_TRIANGLE_FAN)
@@ -1858,7 +1863,7 @@ class Hologram:
                                cy + math.sin(angle) * radius * scale)
                 glEnd()
             glColor4f(1, .94, .65, .95)
-            self._draw_circle_2d(cx, cy, radius * .035, segments=32)
+            self._draw_circle_2d(cx, cy, radius * .021, segments=32)
         finally:
             glPointSize(1)
             glLineWidth(1)
