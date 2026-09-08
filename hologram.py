@@ -1,0 +1,1778 @@
+"""
+Jarvis-style dashboard: a central holographic display surrounded by
+dashboard chrome (top bar, system panel, event log, bottom status bar,
+grid, glow). The central display can show:
+  - "demo": the original 4-ring generic hologram
+  - "atom": a real Bohr-model atom — correct number of electron shells
+    and electrons per shell for whatever element was requested
+  - "solar_system": the sun + planets, reusing the same orbit engine
+
+EDITABLE: point to select the next orbit/shell, pinch + move to reshape
+it (vertical = radius, horizontal = spin speed).
+
+FULLSCREEN: launches fullscreen by default. Press F11 to toggle back to
+a windowed view, ESC to quit. (Previous versions never processed pygame's
+window events at all, which is almost certainly why the window sometimes
+showed "Not Responding" in Windows — fixed here.)
+"""
+
+import math
+import random
+import time
+import pygame
+from pygame.locals import DOUBLEBUF, OPENGL, FULLSCREEN
+from OpenGL.GL import *
+from OpenGL.GLU import gluPerspective
+from collections import deque
+import threading
+
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+
+COLOR_LISTENING = (0.1, 1.0, 0.9)
+COLOR_SPEAKING = (0.2, 1.0, 0.3)
+
+THEMES = [
+    (0.1, 0.6, 1.0),
+    (0.8, 0.2, 1.0),
+    (1.0, 0.55, 0.05),
+    (1.0, 0.2, 0.4),
+]
+
+FLASH_COLORS = {
+    "thumbs_up": (0.2, 1.0, 0.3),
+    "thumbs_down": (1.0, 0.15, 0.15),
+    "rock_sign": (0.8, 0.1, 1.0),
+    "ok_sign": (0.2, 0.9, 1.0),
+    "peace": (1.0, 1.0, 1.0),
+    "throw": (1.0, 0.7, 0.1),
+    "point": (1.0, 1.0, 1.0),
+}
+
+DEFAULT_ORBITS = [
+    {"radius": 1.6, "tilt": 0, "speed": 35, "electrons": [0]},
+    {"radius": 1.3, "tilt": 90, "speed": -50, "electrons": [60]},
+    {"radius": 1.0, "tilt": 45, "speed": 70, "electrons": [120]},
+    {"radius": 0.7, "tilt": -45, "speed": -90, "electrons": [200]},
+]
+
+# Full periodic table (atomic number, symbol, name). Electron shells are
+# generated generically via fill_shells() below (simplified 2-8-8-18-18-32
+# Bohr-model rule) rather than hand-written per element — accurate enough
+# for a stylized hologram, and it means every one of the 118 elements
+# works, not just a hand-picked subset.
+PERIODIC_TABLE = [
+    (1, "H", "hydrogen"), (2, "He", "helium"), (3, "Li", "lithium"),
+    (4, "Be", "beryllium"), (5, "B", "boron"), (6, "C", "carbon"),
+    (7, "N", "nitrogen"), (8, "O", "oxygen"), (9, "F", "fluorine"),
+    (10, "Ne", "neon"), (11, "Na", "sodium"), (12, "Mg", "magnesium"),
+    (13, "Al", "aluminum"), (14, "Si", "silicon"), (15, "P", "phosphorus"),
+    (16, "S", "sulfur"), (17, "Cl", "chlorine"), (18, "Ar", "argon"),
+    (19, "K", "potassium"), (20, "Ca", "calcium"), (21, "Sc", "scandium"),
+    (22, "Ti", "titanium"), (23, "V", "vanadium"), (24, "Cr", "chromium"),
+    (25, "Mn", "manganese"), (26, "Fe", "iron"), (27, "Co", "cobalt"),
+    (28, "Ni", "nickel"), (29, "Cu", "copper"), (30, "Zn", "zinc"),
+    (31, "Ga", "gallium"), (32, "Ge", "germanium"), (33, "As", "arsenic"),
+    (34, "Se", "selenium"), (35, "Br", "bromine"), (36, "Kr", "krypton"),
+    (37, "Rb", "rubidium"), (38, "Sr", "strontium"), (39, "Y", "yttrium"),
+    (40, "Zr", "zirconium"), (41, "Nb", "niobium"), (42, "Mo", "molybdenum"),
+    (43, "Tc", "technetium"), (44, "Ru", "ruthenium"), (45, "Rh", "rhodium"),
+    (46, "Pd", "palladium"), (47, "Ag", "silver"), (48, "Cd", "cadmium"),
+    (49, "In", "indium"), (50, "Sn", "tin"), (51, "Sb", "antimony"),
+    (52, "Te", "tellurium"), (53, "I", "iodine"), (54, "Xe", "xenon"),
+    (55, "Cs", "cesium"), (56, "Ba", "barium"), (57, "La", "lanthanum"),
+    (58, "Ce", "cerium"), (59, "Pr", "praseodymium"), (60, "Nd", "neodymium"),
+    (61, "Pm", "promethium"), (62, "Sm", "samarium"), (63, "Eu", "europium"),
+    (64, "Gd", "gadolinium"), (65, "Tb", "terbium"), (66, "Dy", "dysprosium"),
+    (67, "Ho", "holmium"), (68, "Er", "erbium"), (69, "Tm", "thulium"),
+    (70, "Yb", "ytterbium"), (71, "Lu", "lutetium"), (72, "Hf", "hafnium"),
+    (73, "Ta", "tantalum"), (74, "W", "tungsten"), (75, "Re", "rhenium"),
+    (76, "Os", "osmium"), (77, "Ir", "iridium"), (78, "Pt", "platinum"),
+    (79, "Au", "gold"), (80, "Hg", "mercury"), (81, "Tl", "thallium"),
+    (82, "Pb", "lead"), (83, "Bi", "bismuth"), (84, "Po", "polonium"),
+    (85, "At", "astatine"), (86, "Rn", "radon"), (87, "Fr", "francium"),
+    (88, "Ra", "radium"), (89, "Ac", "actinium"), (90, "Th", "thorium"),
+    (91, "Pa", "protactinium"), (92, "U", "uranium"), (93, "Np", "neptunium"),
+    (94, "Pu", "plutonium"), (95, "Am", "americium"), (96, "Cm", "curium"),
+    (97, "Bk", "berkelium"), (98, "Cf", "californium"), (99, "Es", "einsteinium"),
+    (100, "Fm", "fermium"), (101, "Md", "mendelevium"), (102, "No", "nobelium"),
+    (103, "Lr", "lawrencium"), (104, "Rf", "rutherfordium"), (105, "Db", "dubnium"),
+    (106, "Sg", "seaborgium"), (107, "Bh", "bohrium"), (108, "Hs", "hassium"),
+    (109, "Mt", "meitnerium"), (110, "Ds", "darmstadtium"), (111, "Rg", "roentgenium"),
+    (112, "Cn", "copernicium"), (113, "Nh", "nihonium"), (114, "Fl", "flerovium"),
+    (115, "Mc", "moscovium"), (116, "Lv", "livermorium"), (117, "Ts", "tennessine"),
+    (118, "Og", "oganesson"),
+]
+
+ELEMENTS = {name: (symbol, atomic_number) for atomic_number, symbol, name in PERIODIC_TABLE}
+
+# Precise most-common-isotope neutron counts for the elements people ask
+# about most often; everything else falls back to an approximation (the
+# real neutron:proton ratio drifts from ~1:1 for light elements toward
+# ~1.5:1 for heavy ones — close enough for a stylized nucleus, and the
+# nucleon-cluster render is capped/representative past ~40 particles
+# anyway, so exact precision there wouldn't be visible even if hand-typed).
+NEUTRONS = {
+    "hydrogen": 0, "helium": 2, "lithium": 4, "beryllium": 5, "boron": 6,
+    "carbon": 6, "nitrogen": 7, "oxygen": 8, "fluorine": 10, "neon": 10,
+    "sodium": 12, "magnesium": 12, "aluminum": 14, "silicon": 14,
+    "phosphorus": 16, "sulfur": 16, "chlorine": 18, "argon": 22,
+    "potassium": 20, "calcium": 20, "iron": 30, "copper": 35, "gold": 118,
+    "silver": 61, "lead": 125, "uranium": 146, "mercury": 121, "tin": 69,
+    "platinum": 117, "titanium": 26, "zinc": 35, "nickel": 31, "tungsten": 110,
+}
+
+
+def _approx_neutrons(protons):
+    if protons <= 20:
+        return protons
+    ratio = 1.0 + 0.5 * min(1.0, (protons - 20) / 80)
+    return round(protons * ratio)
+
+
+# Reverse lookup so a custom proton count that happens to match a real
+# element can be labeled with its name/symbol.
+ATOMIC_NUMBER_TO_ELEMENT = {
+    atomic_number: (symbol, name) for atomic_number, symbol, name in PERIODIC_TABLE
+}
+
+# Simplified shell capacities (2-8-8-18-18-32 rule) used to build electron
+# shells for ANY electron count, not just the known elements above — this
+# is what lets custom/edited "elements" work.
+SHELL_CAPACITIES = [2, 8, 8, 18, 18, 32]
+
+
+def fill_shells(electron_count):
+    shells = []
+    remaining = max(0, electron_count)
+    for cap in SHELL_CAPACITIES:
+        if remaining <= 0:
+            break
+        take = min(cap, remaining)
+        shells.append(take)
+        remaining -= take
+    if remaining > 0:
+        shells.append(remaining)
+    return shells
+
+PLANETS = [
+    ("Mercury", 0.55, 140), ("Venus", 0.75, 100), ("Earth", 0.95, 80),
+    ("Mars", 1.15, 65), ("Jupiter", 1.5, 40), ("Saturn", 1.8, 30),
+    ("Uranus", 2.05, -22), ("Neptune", 2.3, 18),
+]
+
+# Curated real star systems with their actual (approximate) known planet
+# counts/naming. Anything NOT in this list still works — see
+# _generate_procedural_system — so "every star system" is handled either
+# with real data (for well-known ones) or a consistent generated layout
+# (for anything else, including made-up names).
+STAR_SYSTEMS = {
+    "trappist-1": [(f"TRAPPIST-1{c}", 0.5 + i * 0.28, 90 - i * 10) for i, c in enumerate("bcdefgh")],
+    "kepler-90": [(f"Kepler-90{c}", 0.5 + i * 0.28, 100 - i * 10) for i, c in enumerate("bcdefghi")],
+    "proxima centauri": [("Proxima b", 0.6, 70), ("Proxima c", 1.3, -30), ("Proxima d", 0.4, 130)],
+    "alpha centauri": [("Alpha Centauri Bb", 0.6, 85)],
+    "55 cancri": [(f"55 Cancri {c}", 0.5 + i * 0.3, 95 - i * 12) for i, c in enumerate("bcdef")],
+    "gliese 581": [(f"Gliese 581{c}", 0.5 + i * 0.3, 90 - i * 10) for i, c in enumerate("bcde")],
+    "upsilon andromedae": [(f"Upsilon Andromedae {c}", 0.5 + i * 0.32, 80 - i * 12) for i, c in enumerate("bcd")],
+    "hd 10180": [(f"HD 10180 {c}", 0.5 + i * 0.26, 100 - i * 9) for i, c in enumerate("bcdefgh")],
+}
+
+
+def _generate_procedural_system(name):
+    """Deterministic 'fake' star system for any name not in the curated
+    list above — same name always generates the same layout, so it feels
+    consistent rather than random each time."""
+    seed = sum(ord(c) for c in name) if name else 42
+    rng = random.Random(seed)
+    count = rng.randint(2, 6)
+    planets = []
+    for i in range(count):
+        radius = 0.5 + i * 0.32 + rng.uniform(-0.04, 0.04)
+        speed = rng.uniform(20, 130) * rng.choice([1, -1])
+        planets.append((f"{name.title()} {chr(ord('b') + i)}", radius, speed))
+    return planets
+
+# Real chemistry shell naming convention (K, L, M, N, O, P, Q for shells
+# 1-7) — used for the atom display's shell composition readout.
+SHELL_NAMES = ["K", "L", "M", "N", "O", "P", "Q"]
+
+# Distinct color per electron shell so the atom reads as layered structure
+# rather than flat same-colored rings.
+SHELL_COLORS = [
+    (0.3, 0.65, 1.0), (0.3, 1.0, 0.6), (1.0, 0.65, 0.25),
+    (0.8, 0.35, 1.0), (1.0, 0.35, 0.5), (0.35, 1.0, 1.0), (1.0, 0.9, 0.3),
+]
+
+SHAPES = {"sphere", "cube", "torus", "pyramid", "cylinder", "eiffel tower", "skyscraper", "dna"}
+
+# Alternate phrasings that map onto one of the models above — these are
+# stylized representations, not architecturally distinct per building, so
+# well-known skyscrapers all render as the generic skyscraper model with
+# their own label, rather than needing bespoke geometry for each one.
+SHAPE_ALIASES = {
+    "eiffel": "eiffel tower",
+    "tower eiffel": "eiffel tower",
+    "burj khalifa": "skyscraper",
+    "empire state building": "skyscraper",
+    "empire state": "skyscraper",
+    "building": "skyscraper",
+    "tower block": "skyscraper",
+    "world trade center": "skyscraper",
+    "one world trade center": "skyscraper",
+    "double helix": "dna",
+    "helix": "dna",
+    "dna strand": "dna",
+    "dna helix": "dna",
+}
+
+# Stylized (not cartographically precise) US state layout, normalized 0..1
+# so it can be scaled into any panel size. Good enough to be immediately
+# recognizable as "a US map" with the right state glowing, which is the
+# actual goal here rather than GIS-grade accuracy.
+US_STATE_POSITIONS = {
+    "washington": (0.10, 0.08), "oregon": (0.09, 0.20), "california": (0.08, 0.42),
+    "nevada": (0.16, 0.35), "idaho": (0.20, 0.18), "montana": (0.28, 0.10),
+    "wyoming": (0.28, 0.25), "utah": (0.22, 0.38), "colorado": (0.32, 0.38),
+    "arizona": (0.20, 0.55), "new mexico": (0.30, 0.55),
+    "north dakota": (0.38, 0.10), "south dakota": (0.38, 0.22), "nebraska": (0.38, 0.32),
+    "kansas": (0.40, 0.42), "oklahoma": (0.42, 0.55), "texas": (0.40, 0.70),
+    "minnesota": (0.48, 0.12), "iowa": (0.48, 0.28), "missouri": (0.48, 0.42),
+    "arkansas": (0.48, 0.55), "louisiana": (0.48, 0.70),
+    "wisconsin": (0.54, 0.18), "illinois": (0.55, 0.32), "michigan": (0.60, 0.20),
+    "indiana": (0.58, 0.32), "ohio": (0.62, 0.30), "kentucky": (0.58, 0.42),
+    "tennessee": (0.56, 0.48), "mississippi": (0.52, 0.62), "alabama": (0.56, 0.62),
+    "florida": (0.66, 0.85), "georgia": (0.62, 0.62), "south carolina": (0.66, 0.58),
+    "north carolina": (0.68, 0.52), "virginia": (0.70, 0.44), "west virginia": (0.66, 0.40),
+    "maryland": (0.72, 0.42), "delaware": (0.75, 0.42), "pennsylvania": (0.70, 0.32),
+    "new jersey": (0.75, 0.36), "new york": (0.72, 0.22), "connecticut": (0.78, 0.28),
+    "rhode island": (0.80, 0.28), "massachusetts": (0.79, 0.24), "vermont": (0.76, 0.16),
+    "new hampshire": (0.78, 0.16), "maine": (0.82, 0.08),
+    "alaska": (0.04, 0.90), "hawaii": (0.14, 0.92),
+    "district of columbia": (0.715, 0.435),
+}
+
+US_STATE_ABBREV = {
+    "washington": "WA", "oregon": "OR", "california": "CA", "nevada": "NV",
+    "idaho": "ID", "montana": "MT", "wyoming": "WY", "utah": "UT",
+    "colorado": "CO", "arizona": "AZ", "new mexico": "NM", "north dakota": "ND",
+    "south dakota": "SD", "nebraska": "NE", "kansas": "KS", "oklahoma": "OK",
+    "texas": "TX", "minnesota": "MN", "iowa": "IA", "missouri": "MO",
+    "arkansas": "AR", "louisiana": "LA", "wisconsin": "WI", "illinois": "IL",
+    "michigan": "MI", "indiana": "IN", "ohio": "OH", "kentucky": "KY",
+    "tennessee": "TN", "mississippi": "MS", "alabama": "AL", "florida": "FL",
+    "georgia": "GA", "south carolina": "SC", "north carolina": "NC",
+    "virginia": "VA", "west virginia": "WV", "maryland": "MD", "delaware": "DE",
+    "pennsylvania": "PA", "new jersey": "NJ", "new york": "NY", "connecticut": "CT",
+    "rhode island": "RI", "massachusetts": "MA", "vermont": "VT",
+    "new hampshire": "NH", "maine": "ME", "alaska": "AK", "hawaii": "HI",
+    "district of columbia": "DC",
+}
+
+RADIUS_MIN, RADIUS_MAX = 0.35, 2.6
+SPEED_MIN, SPEED_MAX = -180, 180
+
+
+class Hologram:
+    def __init__(self, fullscreen=True, windowed_size=(1200, 800)):
+        pygame.init()
+        if not pygame.mixer.get_init():
+            pygame.mixer.init()  # init on the main thread — doing this from
+                                  # the background voice thread caused
+                                  # intermittent crashes
+        self.windowed_size = windowed_size
+        self.fullscreen = fullscreen
+        self._set_display_mode(fullscreen)
+
+        # Bahnschrift/Agency FB have a geometric, technical HUD look closer
+        # to sci-fi interfaces than a plain monospace font — both ship
+        # with Windows, so this is a free upgrade with no install needed.
+        # Falls back gracefully through the list, ending at Consolas.
+        font_candidates = ["bahnschrift", "agencyfb", "eurostile", "consolas"]
+
+        def _pick_font(size, bold=False):
+            for name in font_candidates:
+                try:
+                    f = pygame.font.SysFont(name, size, bold=bold)
+                    if f:
+                        return f
+                except Exception:
+                    continue
+            return None
+
+        try:
+            self.font = _pick_font(16)
+            self.font_big = _pick_font(28, bold=True)
+            self.font_small = _pick_font(13)
+            self.font_huge = _pick_font(54, bold=True)
+        except Exception:
+            self.font = self.font_big = self.font_small = self.font_huge = None
+
+        # Twinkling starfield — same seed every run, so it's not distracting
+        # random noise each frame, just a fixed field of stars that twinkle.
+        _star_rng = random.Random(7)
+        self.stars = [
+            (_star_rng.random(), _star_rng.random(), _star_rng.uniform(0, 6.28), _star_rng.choice([1, 1, 1, 2]))
+            for _ in range(90)
+        ]
+
+        self.rotation_x = 0.0
+        self.rotation_y = 0.0
+        self.roll = 0.0
+        self.translate_x = 0.0
+        self.translate_y = 0.0
+        self.zoom = 1.0
+        self.brightness = 1.0
+
+        self.pulse_phase = 0.0
+        self.sweep_phase = 0.0
+        self.scanline_phase = 0.0
+        self.elapsed = 0.0
+
+        self.flash_color = (1.0, 1.0, 1.0)
+        self.flash_intensity = 0.0
+
+        self.theme_index = 0
+        self._theme_prev_color = THEMES[0]
+        self._theme_transition_start = -999.0  # already-complete, no transition on first frame
+        self._theme_transition_duration = 0.6
+        self.state = "idle"
+
+        self.mode = "empty"
+        self.mode_label = "AWAITING COMMAND"
+        self.shape_name = "sphere"
+        self.orbits = []
+        self.selected_index = None
+        self.protons = 1
+        self.neutrons = 0
+        self.electron_count = 1
+        self.shell_summary = ""
+        self.current_element_z = 1
+        self.current_star_index = 0
+
+        self.hud_lines = []
+        self.event_log = deque(maxlen=6)
+        self._event_log_lock = threading.Lock()
+        self._last_time = time.time()
+        self._fps = 0.0
+        self.should_quit = False
+
+        # Materialize transition: whenever content changes, it grows in
+        # from nothing rather than snapping instantly into place.
+        self._materialize_start = 0.0
+        self._materialize_duration = 0.45
+
+        # Sparkline history for the system panel (CPU% over the last
+        # ~20 seconds), sampled once per frame in update().
+        self.cpu_history = deque([0.0] * 40, maxlen=40)
+
+        self.docked = False       # True -> hologram shifts left, widget panel gets the right side
+        self._dock_shift = 0.0    # smoothed offset, eases toward the docked/undocked target
+        self.weather = None       # dict set by show_weather(), or None
+        self.map_highlight = None # US state key, drawn instead of the weather icon when set
+        self.info_card = None     # {"question": str, "answer": str} for general Q&A, or None
+
+        if PSUTIL_AVAILABLE:
+            psutil.cpu_percent(interval=None)  # first call always returns 0.0 — prime it now
+
+    # ---- display mode / fullscreen -----------------------------------------
+
+    def _set_display_mode(self, fullscreen):
+        if fullscreen:
+            info = pygame.display.Info()
+            self.width, self.height = info.current_w, info.current_h
+            flags = DOUBLEBUF | OPENGL | FULLSCREEN
+        else:
+            self.width, self.height = self.windowed_size
+            flags = DOUBLEBUF | OPENGL
+
+        try:
+            pygame.display.gl_set_attribute(pygame.GL_MULTISAMPLEBUFFERS, 1)
+            pygame.display.gl_set_attribute(pygame.GL_MULTISAMPLESAMPLES, 4)
+        except Exception:
+            pass  # MSAA unsupported on this GPU/driver — fine, just less smooth
+
+        pygame.display.set_mode((self.width, self.height), flags)
+        pygame.display.set_caption("AURORA")
+        self._init_gl_state()
+
+    def _init_gl_state(self):
+        glClearColor(0.01, 0.02, 0.045, 1.0)
+        glEnable(GL_DEPTH_TEST)
+        glEnable(GL_LINE_SMOOTH)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        try:
+            glEnable(GL_MULTISAMPLE)
+        except Exception:
+            pass
+
+        # Depth fog: without any shading, a wireframe object can look
+        # flat from certain angles since the outline is the only depth
+        # cue. Fading distant lines toward the background color gives a
+        # real 3D depth signal from ANY viewing angle, not just ones
+        # where the silhouette happens to reveal volume.
+        try:
+            glEnable(GL_FOG)
+            glFogi(GL_FOG_MODE, GL_LINEAR)
+            glFogfv(GL_FOG_COLOR, (0.01, 0.02, 0.045, 1.0))
+            glFogf(GL_FOG_START, 4.0)
+            glFogf(GL_FOG_END, 11.0)
+            glHint(GL_FOG_HINT, GL_NICEST)
+        except Exception:
+            pass
+
+        glViewport(0, 0, self.width, self.height)
+        glMatrixMode(GL_PROJECTION)
+        glLoadIdentity()
+        gluPerspective(45, (self.width / self.height), 0.1, 50.0)
+        glMatrixMode(GL_MODELVIEW)
+        glLoadIdentity()
+        glTranslatef(0.0, 0.0, -6)
+
+    def toggle_fullscreen(self):
+        self.fullscreen = not self.fullscreen
+        self._set_display_mode(self.fullscreen)
+
+    def process_events(self):
+        """Pump pygame's event queue — MUST be called every frame, or
+        Windows will mark the window 'Not Responding' even while it's
+        rendering fine. Also handles F11 (toggle fullscreen), ESC/window
+        close (quit)."""
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                self.should_quit = True
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_F11:
+                    self.toggle_fullscreen()
+                elif event.key == pygame.K_ESCAPE:
+                    self.should_quit = True
+
+    # ---- external control API -------------------------------------------
+
+    def set_state(self, state):
+        self.state = state
+
+    def apply_zoom_delta(self, delta, sensitivity=4.0):
+        self.zoom = max(0.4, min(3.0, self.zoom + delta * sensitivity))
+
+    def apply_roll_delta(self, delta_deg, sensitivity=1.0):
+        self.roll = (self.roll + delta_deg * sensitivity) % 360
+
+    def apply_pan_delta(self, dx, dy, sensitivity=6.0):
+        self.translate_x = max(-3.0, min(3.0, self.translate_x + dx * sensitivity))
+        self.translate_y = max(-2.0, min(2.0, self.translate_y - dy * sensitivity))
+
+    def trigger_flash(self, gesture_name, intensity=1.0):
+        self.flash_color = FLASH_COLORS.get(gesture_name, (1.0, 1.0, 1.0))
+        self.flash_intensity = intensity
+
+    def _start_theme_transition(self):
+        self._theme_prev_color = self._current_theme_color()
+        self._theme_transition_start = self.elapsed
+
+    def cycle_theme(self, direction=1):
+        self._start_theme_transition()
+        self.theme_index = (self.theme_index + direction) % len(THEMES)
+
+    def set_theme_index(self, index):
+        self._start_theme_transition()
+        self.theme_index = index % len(THEMES)
+
+    def _current_theme_color(self):
+        """Eased blend from whatever the theme was before the last
+        change toward the new one, instead of an instant color snap."""
+        target = THEMES[self.theme_index]
+        t = min(1.0, (self.elapsed - self._theme_transition_start) / self._theme_transition_duration)
+        if t >= 1.0:
+            return target
+        ease = 1 - (1 - t) ** 3
+        return tuple(self._theme_prev_color[i] + (target[i] - self._theme_prev_color[i]) * ease for i in range(3))
+
+    def adjust_brightness(self, delta):
+        self.brightness = max(0.4, min(1.8, self.brightness + delta))
+
+    def set_hud_lines(self, lines):
+        self.hud_lines = lines
+
+    def log_event(self, text):
+        with self._event_log_lock:
+            self.event_log.appendleft(f"{time.strftime('%H:%M:%S')}  {text}")
+
+    # ---- docking (make room for a side widget) -----------------------------
+
+    def dock_left(self):
+        self.docked = True
+
+    def undock(self):
+        self.docked = False
+
+    def show_weather(self, data):
+        """data: dict with keys location, temp_c, condition, description,
+        humidity, wind_kph, updated_at, and optionally 'state' (a US state
+        name key into US_STATE_POSITIONS) to show a map instead of the
+        generic weather icon. Automatically docks the hologram left."""
+        self.weather = data
+        state = data.get("state")
+        self.map_highlight = state if state in US_STATE_POSITIONS else None
+        self.dock_left()
+        self._trigger_materialize()
+
+    def hide_weather(self):
+        self.weather = None
+        self.map_highlight = None
+        self.undock()
+
+    def show_info_card(self, question, answer):
+        """General Q&A gets a visual readout too, not just speech —
+        this is the fallback for anything that doesn't match one of the
+        specialized displays (atom, shape, weather, etc.)."""
+        self.hide_weather()
+        self.mode = "info"
+        self.mode_label = "RESPONSE"
+        self.info_card = {"question": question, "answer": answer}
+        self.orbits = []
+        self.selected_index = None
+        self._trigger_materialize()
+
+    def hide_info_card(self):
+        self.info_card = None
+
+    def _trigger_materialize(self):
+        self._materialize_start = self.elapsed
+
+    # ---- content: atom / solar system / demo ------------------------------
+
+    def load_atom(self, element_query):
+        """Rebuild the display as a Bohr-model atom for the requested
+        element. Returns (symbol, name) on success, or None if the
+        element wasn't recognized."""
+        key = element_query.strip().lower()
+        match = ELEMENTS.get(key)
+        if not match:
+            for name, (symbol, atomic_number) in ELEMENTS.items():
+                if symbol.lower() == key:
+                    match = (symbol, atomic_number)
+                    key = name
+                    break
+        if not match:
+            return None
+
+        symbol, atomic_number = match
+        self.hide_weather()
+        self.protons = atomic_number
+        self.neutrons = NEUTRONS.get(key, _approx_neutrons(atomic_number))
+        self.electron_count = atomic_number
+        self.current_element_z = atomic_number
+        self._rebuild_atom_orbits()
+        self.mode = "atom"
+        self.mode_label = f"{key.upper()} ({symbol}) — {self.protons}p {self.neutrons}n {self.electron_count}e"
+        self._trigger_materialize()
+        return symbol, key
+
+    def next_element(self):
+        self.current_element_z = self.current_element_z % 118 + 1
+        symbol, name = ATOMIC_NUMBER_TO_ELEMENT[self.current_element_z]
+        self.load_atom(name)
+        return symbol, name, self.current_element_z
+
+    def previous_element(self):
+        self.current_element_z = (self.current_element_z - 2) % 118 + 1
+        symbol, name = ATOMIC_NUMBER_TO_ELEMENT[self.current_element_z]
+        self.load_atom(name)
+        return symbol, name, self.current_element_z
+
+    # ---- particle editing: build custom elements ---------------------------
+
+    def _rebuild_atom_orbits(self):
+        shells = fill_shells(self.electron_count)
+        new_orbits = []
+        base_radius = 0.55
+        for i, count in enumerate(shells):
+            radius = base_radius + i * 0.45
+            tilt = (i * 35) % 180 - 60
+            speed = (50 - i * 12) * (1 if i % 2 == 0 else -1)
+            phases = [j * (360 / count) for j in range(count)] if count else []
+            new_orbits.append({"radius": radius, "tilt": tilt, "speed": speed, "electrons": phases, "shell": i})
+        self.orbits = new_orbits
+        self.selected_index = None
+
+        shell_parts = [f"{SHELL_NAMES[i] if i < len(SHELL_NAMES) else i+1}:{c}e" for i, c in enumerate(shells)]
+        self.shell_summary = "  ".join(shell_parts)
+
+    def _update_custom_label(self):
+        known = ATOMIC_NUMBER_TO_ELEMENT.get(self.protons)
+        if known:
+            symbol, name = known
+            base = f"{name.upper()} ({symbol})"
+        else:
+            base = "CUSTOM ELEMENT"
+        charge = self.protons - self.electron_count
+        charge_str = f"  charge {charge:+d}" if charge != 0 else ""
+        self.mode_label = f"{base} — {self.protons}p {self.neutrons}n {self.electron_count}e{charge_str}"
+
+    def _ensure_atom_mode(self):
+        if self.mode != "atom":
+            self.mode = "atom"
+            self._rebuild_atom_orbits()
+
+    def add_protons(self, n=1):
+        """Adding/removing protons changes the element itself, and keeps
+        the atom neutral by default (electrons follow along)."""
+        self._ensure_atom_mode()
+        self.protons = max(1, self.protons + n)
+        self.electron_count = max(0, self.electron_count + n)
+        self._rebuild_atom_orbits()
+        self._update_custom_label()
+
+    def add_neutrons(self, n=1):
+        """Neutrons don't affect electron shells — just the isotope."""
+        self._ensure_atom_mode()
+        self.neutrons = max(0, self.neutrons + n)
+        self._update_custom_label()
+
+    def add_electrons(self, n=1):
+        """Electrons alone (protons unchanged) creates an ion."""
+        self._ensure_atom_mode()
+        self.electron_count = max(0, self.electron_count + n)
+        self._rebuild_atom_orbits()
+        self._update_custom_label()
+
+    def load_solar_system(self):
+        self.hide_weather()
+        new_orbits = []
+        for name, radius, speed in PLANETS:
+            new_orbits.append({
+                "radius": radius, "tilt": 2, "speed": speed, "electrons": [0],
+                "label": name,
+            })
+        self.orbits = new_orbits
+        self.selected_index = None
+        self.mode = "solar_system"
+        self.mode_label = "SOLAR SYSTEM"
+        self._trigger_materialize()
+
+    def load_star_system(self, name):
+        """Any star system, real or not: curated real data for well-known
+        ones (TRAPPIST-1, Kepler-90, etc.), a consistent generated layout
+        for anything else. Reuses the solar-system rendering style."""
+        self.hide_weather()
+        key = name.strip().lower()
+        if key in STAR_SYSTEMS:
+            planets = STAR_SYSTEMS[key]
+            label = key.title()
+            generated = False
+        else:
+            planets = _generate_procedural_system(key)
+            label = key.title() if key else "Unknown"
+            generated = True
+
+        key_list = list(STAR_SYSTEMS.keys())
+        if key in STAR_SYSTEMS:
+            self.current_star_index = key_list.index(key)
+
+        new_orbits = []
+        for pname, radius, speed in planets:
+            new_orbits.append({"radius": radius, "tilt": 2, "speed": speed, "electrons": [0], "label": pname})
+        self.orbits = new_orbits
+        self.selected_index = None
+        self.mode = "solar_system"
+        self.mode_label = f"{label.upper()} SYSTEM" + (" (est.)" if generated else "")
+        self._trigger_materialize()
+        return label, len(planets), generated
+
+    def next_star_system(self):
+        keys = list(STAR_SYSTEMS.keys())
+        self.current_star_index = (self.current_star_index + 1) % len(keys)
+        return self.load_star_system(keys[self.current_star_index])
+
+    def previous_star_system(self):
+        keys = list(STAR_SYSTEMS.keys())
+        self.current_star_index = (self.current_star_index - 1) % len(keys)
+        return self.load_star_system(keys[self.current_star_index])
+
+    def load_demo(self):
+        self.hide_weather()
+        self.orbits = [dict(o) for o in DEFAULT_ORBITS]
+        self.selected_index = None
+        self.mode = "demo"
+        self.mode_label = "DEMO DISPLAY"
+        self._trigger_materialize()
+
+    def load_shape(self, shape_name):
+        """Switch to a generic wireframe primitive (sphere, cube, torus,
+        pyramid, cylinder) instead of the orbit/atom display."""
+        if shape_name not in SHAPES:
+            return False
+        self.hide_weather()
+        self.mode = "shape"
+        self.shape_name = shape_name
+        self.mode_label = f"{shape_name.upper()} MODEL"
+        self.selected_index = None
+        self._trigger_materialize()
+        return True
+
+    # ---- orbit editing -----------------------------------------------------
+
+    def select_orbit(self, index):
+        """Select a specific orbit/shell by 0-based index. Returns True on
+        success, False if the index is out of range."""
+        if 0 <= index < len(self.orbits):
+            self.selected_index = index
+            return True
+        return False
+
+    def deselect_orbit(self):
+        self.selected_index = None
+
+    def select_next_orbit(self):
+        if self.selected_index is None:
+            self.selected_index = 0
+        else:
+            self.selected_index += 1
+            if self.selected_index >= len(self.orbits):
+                self.selected_index = None
+
+    def edit_selected_orbit(self, pitch_norm, yaw_norm, dt, rate=2.0):
+        if self.selected_index is None or self.selected_index >= len(self.orbits):
+            return
+        orbit = self.orbits[self.selected_index]
+        orbit["radius"] = max(RADIUS_MIN, min(RADIUS_MAX, orbit["radius"] - pitch_norm * rate * dt * 2.0))
+        orbit["speed"] = max(SPEED_MIN, min(SPEED_MAX, orbit["speed"] + yaw_norm * rate * dt * 60.0))
+
+    def reset_orbits(self):
+        self.load_demo()
+
+    # ---- per-frame update --------------------------------------------------
+
+    def update(self, yaw_norm, pitch_norm, pinch_amount, target_dt=1 / 60):
+        target_y = yaw_norm * 90
+        target_x = pitch_norm * 60
+        self.rotation_y += (target_y - self.rotation_y) * 0.15
+        self.rotation_x += (target_x - self.rotation_x) * 0.15
+
+        self.pulse_phase += target_dt * (4 + pinch_amount * 6)
+        self.sweep_phase += target_dt * 60
+        self.scanline_phase += target_dt * 40
+        self.elapsed += target_dt
+
+        dock_target = -2.4 if self.docked else 0.0
+        self._dock_shift += (dock_target - self._dock_shift) * 0.08
+
+        for orbit in self.orbits:
+            delta = orbit["speed"] * target_dt
+            orbit["electrons"] = [(p + delta) % 360 for p in orbit["electrons"]]
+
+        if self.flash_intensity > 0:
+            self.flash_intensity = max(0.0, self.flash_intensity - target_dt * 2.0)
+
+        now = time.time()
+        frame_dt = now - self._last_time
+        self._last_time = now
+        if frame_dt > 0:
+            self._fps = 0.9 * self._fps + 0.1 * (1.0 / frame_dt)
+
+    # ---- 3D drawing helpers --------------------------------------------------
+
+    def _draw_ring(self, radius, segments=64):
+        glBegin(GL_LINE_LOOP)
+        for i in range(segments):
+            theta = 2.0 * math.pi * i / segments
+            glVertex3f(radius * math.cos(theta), radius * math.sin(theta), 0.0)
+        glEnd()
+
+    def _draw_wireframe_sphere(self, radius, lat_count=5, lon_count=6, segments=48):
+        # Latitude rings: horizontal circles at different heights
+        for i in range(1, lat_count + 1):
+            phi = math.radians(-75 + i * (150 / (lat_count + 1)))
+            y = radius * math.sin(phi)
+            r = radius * math.cos(phi)
+            glPushMatrix()
+            glTranslatef(0, y, 0)
+            self._draw_ring(r, segments)
+            glPopMatrix()
+        # Longitude great circles: vertical circles through the poles,
+        # rotated around Y at even intervals
+        for i in range(lon_count):
+            azimuth = 180.0 * i / lon_count
+            glPushMatrix()
+            glRotatef(azimuth, 0, 1, 0)
+            glBegin(GL_LINE_LOOP)
+            for j in range(segments):
+                theta = 2.0 * math.pi * j / segments
+                glVertex3f(radius * math.cos(theta), radius * math.sin(theta), 0.0)
+            glEnd()
+            glPopMatrix()
+
+    def _draw_wireframe_cube(self, size):
+        s = size
+        verts = [
+            (-s, -s, -s), (s, -s, -s), (s, s, -s), (-s, s, -s),
+            (-s, -s, s), (s, -s, s), (s, s, s), (-s, s, s),
+        ]
+        edges = [(0, 1), (1, 2), (2, 3), (3, 0), (4, 5), (5, 6), (6, 7), (7, 4),
+                 (0, 4), (1, 5), (2, 6), (3, 7)]
+        glBegin(GL_LINES)
+        for a, b in edges:
+            glVertex3f(*verts[a]); glVertex3f(*verts[b])
+        glEnd()
+
+    def _draw_wireframe_torus(self, major_r, minor_r, major_segments=16, minor_segments=12):
+        for i in range(major_segments):
+            theta = 2.0 * math.pi * i / major_segments
+            cx, cz = major_r * math.cos(theta), major_r * math.sin(theta)
+            glPushMatrix()
+            glTranslatef(cx, 0, cz)
+            glRotatef(math.degrees(theta) + 90, 0, 1, 0)
+            glBegin(GL_LINE_LOOP)
+            for j in range(minor_segments):
+                phi = 2.0 * math.pi * j / minor_segments
+                glVertex3f(minor_r * math.cos(phi), minor_r * math.sin(phi), 0.0)
+            glEnd()
+            glPopMatrix()
+
+    def _draw_wireframe_pyramid(self, size):
+        apex = (0, size, 0)
+        base = [(-size, -size, -size), (size, -size, -size),
+                 (size, -size, size), (-size, -size, size)]
+        glBegin(GL_LINE_LOOP)
+        for v in base:
+            glVertex3f(*v)
+        glEnd()
+        glBegin(GL_LINES)
+        for v in base:
+            glVertex3f(*apex); glVertex3f(*v)
+        glEnd()
+
+    def _draw_wireframe_cylinder(self, radius, height, segments=32):
+        glPushMatrix()
+        glTranslatef(0, height / 2, 0)
+        self._draw_ring(radius, segments)
+        glPopMatrix()
+        glPushMatrix()
+        glTranslatef(0, -height / 2, 0)
+        self._draw_ring(radius, segments)
+        glPopMatrix()
+        glBegin(GL_LINES)
+        for i in range(8):
+            theta = 2.0 * math.pi * i / 8
+            x, z = radius * math.cos(theta), radius * math.sin(theta)
+            glVertex3f(x, height / 2, z)
+            glVertex3f(x, -height / 2, z)
+        glEnd()
+
+    def _draw_eiffel_tower(self, size=1.4):
+        """Tapering 4-legged lattice tower with platforms and diagonal
+        bracing at each stage, narrowing to a spike — a stylized, not
+        architecturally exact, Eiffel Tower silhouette."""
+        levels = [
+            (size * 0.9, 0.0), (size * 0.45, size * 0.9),
+            (size * 0.18, size * 1.5), (0.0, size * 2.0),
+        ]
+
+        def corners(half_w, y):
+            return [(half_w, y, half_w), (half_w, y, -half_w),
+                    (-half_w, y, -half_w), (-half_w, y, half_w)]
+
+        for i in range(len(levels) - 1):
+            w0, y0 = levels[i]
+            w1, y1 = levels[i + 1]
+            c0, c1 = corners(w0, y0), corners(w1, y1)
+
+            glBegin(GL_LINES)
+            for j in range(4):
+                glVertex3f(*c0[j]); glVertex3f(*c1[j])
+                glVertex3f(*c0[j]); glVertex3f(*c1[(j + 1) % 4])  # diagonal bracing
+            glEnd()
+
+            if w1 > 0.001:
+                glBegin(GL_LINE_LOOP)
+                for c in c1:
+                    glVertex3f(*c)
+                glEnd()
+
+        glBegin(GL_LINES)
+        glVertex3f(0, size * 2.0, 0)
+        glVertex3f(0, size * 2.35, 0)
+        glEnd()
+
+    def _draw_skyscraper(self, size=1.4):
+        """Tall rectangular tower with floor lines, a setback top section,
+        and a spire — a stylized generic skyscraper silhouette."""
+        hw = size * 0.42
+        height = size * 2.2
+        body_top = height * 0.8
+
+        bottom = [(hw, 0, hw), (hw, 0, -hw), (-hw, 0, -hw), (-hw, 0, hw)]
+        top = [(hw, body_top, hw), (hw, body_top, -hw), (-hw, body_top, -hw), (-hw, body_top, hw)]
+
+        glBegin(GL_LINES)
+        for j in range(4):
+            glVertex3f(*bottom[j]); glVertex3f(*top[j])
+        glEnd()
+        for verts in (bottom, top):
+            glBegin(GL_LINE_LOOP)
+            for v in verts:
+                glVertex3f(*v)
+            glEnd()
+
+        floors = 8
+        for f in range(1, floors):
+            fy = body_top * f / floors
+            glBegin(GL_LINE_LOOP)
+            glVertex3f(hw, fy, hw); glVertex3f(hw, fy, -hw)
+            glVertex3f(-hw, fy, -hw); glVertex3f(-hw, fy, hw)
+            glEnd()
+
+        top2_hw = hw * 0.55
+        top2 = [(top2_hw, height, top2_hw), (top2_hw, height, -top2_hw),
+                (-top2_hw, height, -top2_hw), (-top2_hw, height, top2_hw)]
+        glBegin(GL_LINES)
+        for j in range(4):
+            glVertex3f(*top[j]); glVertex3f(*top2[j])
+        glEnd()
+        glBegin(GL_LINE_LOOP)
+        for v in top2:
+            glVertex3f(*v)
+        glEnd()
+
+        glBegin(GL_LINES)
+        glVertex3f(0, height, 0)
+        glVertex3f(0, height * 1.15, 0)
+        glEnd()
+
+    def _draw_dna_helix(self, height=2.4, radius=0.5, turns=3, rungs=22):
+        """Two intertwined helical strands with connecting rungs — a
+        stylized double-helix, not a biologically accurate base-pair
+        model, but immediately recognizable as DNA."""
+        segments_per_turn = 20
+        total_segments = int(turns * segments_per_turn)
+        strand1, strand2 = [], []
+
+        for i in range(total_segments + 1):
+            frac = i / total_segments
+            y = -height / 2 + frac * height
+            angle = frac * turns * 2 * math.pi
+            strand1.append((radius * math.cos(angle), y, radius * math.sin(angle)))
+            strand2.append((radius * math.cos(angle + math.pi), y, radius * math.sin(angle + math.pi)))
+
+        for strand in (strand1, strand2):
+            glBegin(GL_LINE_STRIP)
+            for p in strand:
+                glVertex3f(*p)
+            glEnd()
+
+        step = max(1, total_segments // rungs)
+        glBegin(GL_LINES)
+        for i in range(0, total_segments + 1, step):
+            glVertex3f(*strand1[i])
+            glVertex3f(*strand2[i])
+        glEnd()
+
+    def _draw_shape(self, name):
+        if name == "sphere":
+            self._draw_wireframe_sphere(1.5)
+        elif name == "cube":
+            self._draw_wireframe_cube(1.1)
+        elif name == "torus":
+            self._draw_wireframe_torus(1.2, 0.5)
+        elif name == "pyramid":
+            self._draw_wireframe_pyramid(1.3)
+        elif name == "cylinder":
+            self._draw_wireframe_cylinder(1.0, 2.0)
+        elif name == "eiffel tower":
+            self._draw_eiffel_tower()
+        elif name == "skyscraper":
+            self._draw_skyscraper()
+        elif name == "dna":
+            self._draw_dna_helix()
+
+    def _draw_node_fan(self, radius, segments=16):
+        glBegin(GL_TRIANGLE_FAN)
+        glVertex3f(0, 0, 0)
+        for i in range(segments + 1):
+            theta = 2.0 * math.pi * i / segments
+            glVertex3f(radius * math.cos(theta), radius * math.sin(theta), 0.0)
+        glEnd()
+
+    def _draw_glow_fan(self, base_radius, r, g, b, passes=4):
+        for i in range(passes, 0, -1):
+            scale = 1.0 + i * 0.5
+            alpha = 0.10 / i
+            glColor4f(r, g, b, alpha)
+            self._draw_node_fan(base_radius * scale)
+
+    NUCLEON_RENDER_CAP = 40
+
+    def _nucleon_positions(self, count, cluster_radius=0.22):
+        """Fibonacci-sphere point distribution — an even, natural-looking
+        packing of points on a sphere surface, used to arrange individual
+        proton/neutron particles into a convincing little cluster."""
+        positions = []
+        if count <= 0:
+            return positions
+        golden_angle = math.pi * (3 - math.sqrt(5))
+        for i in range(count):
+            y = 1 - (i / max(1, count - 1)) * 2
+            radius_at_y = math.sqrt(max(0.0, 1 - y * y))
+            theta = golden_angle * i
+            x = math.cos(theta) * radius_at_y
+            z = math.sin(theta) * radius_at_y
+            positions.append((x * cluster_radius, y * cluster_radius, z * cluster_radius))
+        return positions
+
+    def _draw_nucleus_particles(self, protons, neutrons, brightness):
+        """Real proton/neutron particle cluster instead of a single dot —
+        capped for performance (a gold nucleus is 197 particles; drawing
+        that many every frame on integrated graphics would hurt FPS for
+        no visual benefit past a certain density, so above the cap we
+        render a representative subset at the same proton:neutron ratio)."""
+        total = protons + neutrons
+        if total <= 0:
+            return
+
+        render_total = min(total, self.NUCLEON_RENDER_CAP)
+        if total > 0:
+            render_protons = max(1, round(render_total * protons / total)) if protons > 0 else 0
+            render_neutrons = render_total - render_protons
+        else:
+            render_protons = render_neutrons = 0
+
+        # single shared glow halo behind the whole cluster (much cheaper
+        # than glowing every individual particle)
+        halo_radius = 0.16 + min(0.26, total * 0.0035)
+        self._draw_glow_fan(halo_radius, 1.0 * brightness, 0.65 * brightness, 0.35 * brightness, passes=6)
+
+        positions = self._nucleon_positions(render_total, cluster_radius=min(0.3, 0.16 + total * 0.0022))
+        idx = 0
+        for _ in range(render_protons):
+            x, y, z = positions[idx]; idx += 1
+            glPushMatrix()
+            glTranslatef(x, y, z)
+            glColor4f(1.0 * brightness, 0.3 * brightness, 0.25 * brightness, 1.0)
+            self._draw_node_fan(0.065, segments=10)
+            glPopMatrix()
+        for _ in range(render_neutrons):
+            x, y, z = positions[idx]; idx += 1
+            glPushMatrix()
+            glTranslatef(x, y, z)
+            glColor4f(0.6 * brightness, 0.7 * brightness, 0.9 * brightness, 1.0)
+            self._draw_node_fan(0.065, segments=10)
+            glPopMatrix()
+
+    def _draw_sweep_arc(self, radius, span_deg=50):
+        glPushMatrix()
+        glRotatef(self.sweep_phase, 0, 0, 1)
+        glBegin(GL_LINE_STRIP)
+        segments = 24
+        for i in range(segments + 1):
+            theta = math.radians(i * span_deg / segments)
+            glVertex3f(radius * math.cos(theta), radius * math.sin(theta), 0.0)
+        glEnd()
+        glPopMatrix()
+
+    def _draw_base_plate(self, base_color, brightness):
+        glPushMatrix()
+        glTranslatef(0, -1.9, 0)
+        glColor4f(base_color[0] * brightness, base_color[1] * brightness, base_color[2] * brightness, 0.5)
+        for radius in (1.8, 1.4, 1.0):
+            glPushMatrix()
+            glScalef(1.0, 0.28, 1.0)
+            self._draw_ring(radius, segments=48)
+            glPopMatrix()
+        glPopMatrix()
+
+    # ---- ortho (screen-space) helpers -----------------------------------------
+
+    def _begin_ortho(self):
+        glMatrixMode(GL_PROJECTION)
+        glPushMatrix(); glLoadIdentity()
+        glOrtho(0, self.width, self.height, 0, -1, 1)
+        glMatrixMode(GL_MODELVIEW)
+        glPushMatrix(); glLoadIdentity()
+        glDisable(GL_DEPTH_TEST)
+
+    def _end_ortho(self):
+        glEnable(GL_DEPTH_TEST)
+        glMatrixMode(GL_PROJECTION); glPopMatrix()
+        glMatrixMode(GL_MODELVIEW); glPopMatrix()
+
+    def _draw_starfield(self):
+        for fx, fy, phase, size in self.stars:
+            twinkle = 0.35 + 0.65 * max(0.0, math.sin(self.elapsed * 1.2 + phase))
+            glColor4f(0.8, 0.9, 1.0, 0.55 * twinkle)
+            self._draw_circle_2d(fx * self.width, fy * self.height, size * 0.9)
+
+    def _draw_aurora_background(self):
+        """Flowing aurora borealis backdrop — translucent glowing ribbons
+        that wave across the upper portion of the screen using additive
+        blending for real glow, rather than the standard alpha blend used
+        everywhere else."""
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE)  # additive — makes overlaps glow brighter
+
+        bands = [
+            {"color": (0.15, 0.9, 0.55), "base_y": 0.16, "freq": 1.3, "speed": 0.35, "phase": 0.0, "amp": 0.05},
+            {"color": (0.25, 0.7, 1.0), "base_y": 0.26, "freq": 1.7, "speed": 0.5, "phase": 2.1, "amp": 0.06},
+            {"color": (0.55, 0.35, 0.95), "base_y": 0.10, "freq": 2.1, "speed": 0.28, "phase": 4.2, "amp": 0.04},
+        ]
+        segments = 40
+
+        for band in bands:
+            r, g, b = band["color"]
+            top_pts, bottom_pts = [], []
+            for i in range(segments + 1):
+                xf = i / segments
+                x = xf * self.width
+                wave = math.sin(xf * band["freq"] * 2 * math.pi + self.elapsed * band["speed"] + band["phase"])
+                wave2 = math.sin(xf * band["freq"] * 1.7 * 2 * math.pi + self.elapsed * band["speed"] * 0.6 + band["phase"] * 1.3)
+                cy = (band["base_y"] + band["amp"] * wave + band["amp"] * 0.5 * wave2) * self.height
+                band_h = (0.10 + 0.03 * math.sin(xf * 3 + self.elapsed * 0.4 + band["phase"])) * self.height
+                top_pts.append((x, cy - band_h / 2))
+                bottom_pts.append((x, cy + band_h / 2))
+
+            glBegin(GL_TRIANGLE_STRIP)
+            for i in range(segments + 1):
+                edge_fade = math.sin(i / segments * math.pi)  # fades out at screen edges
+                alpha = 0.09 * edge_fade
+                glColor4f(r, g, b, alpha * 0.25)
+                glVertex2f(*top_pts[i])
+                glColor4f(r, g, b, alpha)
+                glVertex2f(*bottom_pts[i])
+            glEnd()
+
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)  # restore normal blending
+
+    def _draw_rect(self, x, y, w, h, r, g, b, a, filled=True):
+        glBegin(GL_QUADS if filled else GL_LINE_LOOP)
+        glColor4f(r, g, b, a)
+        glVertex2f(x, y); glVertex2f(x + w, y)
+        glVertex2f(x + w, y + h); glVertex2f(x, y + h)
+        glEnd()
+
+    def _materialize_progress(self):
+        t = min(1.0, (self.elapsed - self._materialize_start) / self._materialize_duration)
+        return 1 - (1 - t) ** 3  # ease-out cubic
+
+    def _draw_panel(self, x, y, w, h, accent, chamfer=14, fill_alpha=0.55, alpha_mult=1.0):
+        """A dark backing plate with two chamfered (cut) corners and a
+        thin accent border — gives text somewhere to sit instead of
+        floating directly over the busy 3D scene, and reads as an
+        intentional HUD panel rather than plain text. alpha_mult scales
+        everything for fade-in transitions."""
+        r, g, b = accent
+        pts = [
+            (x + chamfer, y), (x + w, y), (x + w, y + h - chamfer),
+            (x + w - chamfer, y + h), (x, y + h), (x, y + chamfer),
+        ]
+        glColor4f(0.02, 0.05, 0.09, fill_alpha * alpha_mult)
+        glBegin(GL_POLYGON)
+        for px, py in pts:
+            glVertex2f(px, py)
+        glEnd()
+
+        border_pulse = 0.45 + 0.15 * math.sin(self.elapsed * 1.5)
+        glColor4f(r, g, b, border_pulse * alpha_mult)
+        glLineWidth(1.3)
+        glBegin(GL_LINE_LOOP)
+        for px, py in pts:
+            glVertex2f(px, py)
+        glEnd()
+
+        # small bright accent tick at the chamfered corner
+        glColor4f(r, g, b, 0.9 * alpha_mult)
+        glLineWidth(2.0)
+        glBegin(GL_LINES)
+        glVertex2f(x, y + chamfer + 10); glVertex2f(x, y + chamfer)
+        glVertex2f(x, y + chamfer); glVertex2f(x + chamfer, y)
+        glEnd()
+
+    def _draw_segmented_bar(self, x, y, w, h, frac, color, segments=18, gap=2):
+        """Segmented tick-style HUD bar instead of a plain solid fill."""
+        frac = max(0.0, min(1.0, frac))
+        lit = round(frac * segments)
+        seg_w = (w - gap * (segments - 1)) / segments
+        for i in range(segments):
+            sx = x + i * (seg_w + gap)
+            if i < lit:
+                glColor4f(color[0], color[1], color[2], 0.95)
+            else:
+                glColor4f(color[0], color[1], color[2], 0.15)
+            glBegin(GL_QUADS)
+            glVertex2f(sx, y); glVertex2f(sx + seg_w, y)
+            glVertex2f(sx + seg_w, y + h); glVertex2f(sx, y + h)
+            glEnd()
+
+    def _truncate(self, text, max_chars):
+        return text if len(text) <= max_chars else text[:max_chars - 1] + "…"
+
+    def _blit_text(self, font, text, x, y, color=(60, 220, 255)):
+        if not font:
+            return 0
+        try:
+            surf = font.render(text, True, color)
+            w, h = surf.get_size()
+            data = pygame.image.tostring(surf, "RGBA", True)
+            glRasterPos2f(x, y + h)
+            glDrawPixels(w, h, GL_RGBA, GL_UNSIGNED_BYTE, data)
+            return h
+        except Exception:
+            return 0
+
+    def _draw_background_grid(self):
+        cx, cy = self.width / 2, self.height / 2
+        max_dist = math.hypot(cx, cy)
+        step = 80
+        glLineWidth(1.0)
+
+        glBegin(GL_LINES)
+        x = 0
+        while x < self.width:
+            dist = abs(x - cx) / max_dist
+            alpha = max(0.02, 0.10 * (1 - dist))
+            glColor4f(0.15, 0.35, 0.55, alpha)
+            glVertex2f(x, 0); glVertex2f(x, self.height)
+            x += step
+        y = 0
+        while y < self.height:
+            dist = abs(y - cy) / max_dist
+            alpha = max(0.02, 0.10 * (1 - dist))
+            glColor4f(0.15, 0.35, 0.55, alpha)
+            glVertex2f(0, y); glVertex2f(self.width, y)
+            y += step
+        glEnd()
+
+    def _draw_top_bar(self, theme_color):
+        self._draw_panel(16, 12, self.width - 32, 66, theme_color, chamfer=18, fill_alpha=0.45)
+
+        title = "A U R O R A"
+        self._blit_text(self.font_big, title, self.width / 2 - 70, 16, color=(150, 225, 255))
+
+        self._blit_text(self.font_small, time.strftime("%H:%M:%S"), self.width - 120, 20, color=(140, 190, 220))
+        self._blit_text(self.font_small, f"FPS {self._fps:.0f}", self.width - 120, 40, color=(90, 130, 160))
+
+        mode_text = self._truncate(self.mode_label, 42)
+        self._blit_text(self.font_small, "DISPLAYING", 32, 20, color=(90, 130, 160))
+        self._blit_text(self.font, mode_text, 32, 36, color=(200, 235, 255))
+
+    def _get_system_stats(self):
+        """Real system stats via psutil. Falls back to a clearly-labeled
+        'N/A' rather than fake numbers if psutil isn't available."""
+        if not PSUTIL_AVAILABLE:
+            return [("CPU", None), ("MEM", None), ("BATT", None)]
+
+        cpu = psutil.cpu_percent(interval=None) / 100.0
+        self.cpu_history.append(cpu)
+        mem = psutil.virtual_memory().percent / 100.0
+
+        battery = psutil.sensors_battery()
+        if battery is not None:
+            batt_frac = battery.percent / 100.0
+            batt_label = "BATT" if not battery.power_plugged else "BATT (chg)"
+        else:
+            batt_frac = None
+            batt_label = "BATT"
+
+        return [("CPU", cpu), ("MEM", mem), (batt_label, batt_frac)]
+
+    def _draw_sparkline(self, x, y, w, h, values, color):
+        if len(values) < 2:
+            return
+        glColor4f(color[0], color[1], color[2], 0.5)
+        glLineWidth(1.3)
+        glBegin(GL_LINE_STRIP)
+        n = len(values)
+        for i, v in enumerate(values):
+            vx = x + (i / (n - 1)) * w
+            vy = y + h - max(0.0, min(1.0, v)) * h
+            glVertex2f(vx, vy)
+        glEnd()
+        # faint fill under the line for a proper "graph" look
+        glColor4f(color[0], color[1], color[2], 0.12)
+        glBegin(GL_TRIANGLE_STRIP)
+        for i, v in enumerate(values):
+            vx = x + (i / (n - 1)) * w
+            vy = y + h - max(0.0, min(1.0, v)) * h
+            glVertex2f(vx, y + h)
+            glVertex2f(vx, vy)
+        glEnd()
+
+    def _draw_system_panel(self, theme_color):
+        px, py, pw, ph = 16, 92, 230, 180
+        self._draw_panel(px, py, pw, ph, theme_color, chamfer=14)
+
+        x, y, bar_w = px + 18, py + 16, 190
+        self._blit_text(self.font_small, "SYSTEM", x, y, color=(90, 130, 160))
+        y += 24
+        for label, frac in self._get_system_stats():
+            if frac is None:
+                self._blit_text(self.font_small, f"{label}", x, y, color=(150, 200, 230))
+                self._blit_text(self.font_small, "N/A", x + bar_w - 30, y, color=(90, 110, 130))
+                y += 16
+                self._draw_segmented_bar(x, y, bar_w, 7, 0.0, (0.2, 0.3, 0.4))
+                y += 24
+                continue
+            frac = max(0.0, min(1.0, frac))
+            self._blit_text(self.font_small, label, x, y, color=(150, 200, 230))
+            self._blit_text(self.font_small, f"{int(frac*100)}%", x + bar_w - 30, y, color=(200, 235, 255))
+            y += 16
+            self._draw_segmented_bar(x, y, bar_w, 7, frac, theme_color)
+            y += 24
+
+        # live CPU history graph — actual trend over the last ~20 seconds,
+        # not just an instantaneous bar
+        self._blit_text(self.font_small, "CPU HISTORY", x, y, color=(90, 130, 160))
+        y += 16
+        self._draw_sparkline(x, y, bar_w, 26, list(self.cpu_history), theme_color)
+
+    def _draw_event_log(self):
+        pw, ph = 300, 180
+        px, py = self.width - pw - 16, 92
+        self._draw_panel(px, py, pw, ph, (0.3, 0.85, 1.0), chamfer=14)
+
+        x, y = px + 18, py + 16
+        self._blit_text(self.font_small, "EVENT LOG", x, y, color=(90, 130, 160))
+        y += 24
+        with self._event_log_lock:
+            log_snapshot = list(self.event_log)
+        if not log_snapshot:
+            self._blit_text(self.font_small, "-- awaiting input --", x, y, color=(80, 110, 130))
+        for i, line in enumerate(log_snapshot):
+            fade = max(0.35, 1.0 - i * 0.16)
+            base = (170, 220, 245) if i == 0 else (150, 190, 215)
+            color = tuple(int(c * fade) for c in base)
+            self._blit_text(self.font_small, self._truncate(line, 38), x, y, color=color)
+            y += 19
+
+    def _draw_bottom_bar(self, theme_color):
+        state_labels = {"idle": "IDLE", "listening": "LISTENING", "speaking": "SPEAKING"}
+        state_colors = {"idle": theme_color, "listening": COLOR_LISTENING, "speaking": COLOR_SPEAKING}
+        label = state_labels.get(self.state, "IDLE")
+        c = state_colors.get(self.state, theme_color)
+
+        bar_h = 76
+        self._draw_panel(16, self.height - bar_h - 12, self.width - 32, bar_h, c, chamfer=18, fill_alpha=0.45)
+
+        self._blit_text(self.font_small, "STATUS", 34, self.height - bar_h + 4, color=(90, 130, 160))
+
+        dot_pulse = 0.5 + 0.5 * math.sin(self.elapsed * (5 if self.state != "idle" else 2))
+        dot_x, dot_y = 140, self.height - bar_h + 30
+        glColor4f(c[0], c[1], c[2], 0.25 + 0.2 * dot_pulse)
+        self._draw_circle_2d(dot_x, dot_y, 9 + 3 * dot_pulse)
+        glColor4f(c[0], c[1], c[2], 1.0)
+        self._draw_circle_2d(dot_x, dot_y, 4)
+
+        self._blit_text(self.font_big, label, 155, self.height - bar_h + 18,
+                         color=(int(c[0] * 255), int(c[1] * 255), int(c[2] * 255)))
+
+        hint = "Try: \"Aurora, show the Eiffel Tower\" or \"a skyscraper\"   F11 fullscreen   ESC quit"
+        self._blit_text(self.font_small, self._truncate(hint, 68), 34, self.height - 22, color=(100, 140, 165))
+
+        if self.hud_lines:
+            panel_w = 320
+            x = self.width - panel_w - 30
+            y = self.height - bar_h + 8
+            for line in self.hud_lines:
+                self._blit_text(self.font_small, self._truncate(line, 44), x, y, color=(160, 210, 235))
+                y += 17
+
+    def _draw_scanlines(self):
+        glColor4f(0.3, 0.9, 1.0, 0.035)
+        glBegin(GL_LINES)
+        y = self.scanline_phase % self.height
+        while y < self.height:
+            glVertex2f(60, y); glVertex2f(self.width - 60, y); y += 46
+        glEnd()
+
+    def _draw_corner_brackets(self):
+        m, L = 24, 46
+        corners = [
+            (m, m, 1, 1), (self.width - m, m, -1, 1),
+            (m, self.height - m, 1, -1), (self.width - m, self.height - m, -1, -1),
+        ]
+        glColor4f(0.25, 0.85, 1.0, 0.85)
+        glLineWidth(2.0)
+        glBegin(GL_LINES)
+        for x, y, dx, dy in corners:
+            glVertex2f(x, y); glVertex2f(x + dx * L, y)
+            glVertex2f(x, y); glVertex2f(x, y + dy * L)
+        glEnd()
+
+        # thinner inset accent line, offset slightly for a layered look
+        off = 6
+        glColor4f(0.25, 0.85, 1.0, 0.35)
+        glLineWidth(1.0)
+        glBegin(GL_LINES)
+        for x, y, dx, dy in corners:
+            ix, iy = x + dx * off, y + dy * off
+            glVertex2f(ix, iy); glVertex2f(ix + dx * (L - off), iy)
+            glVertex2f(ix, iy); glVertex2f(ix, iy + dy * (L - off))
+        glEnd()
+
+    # ---- weather widget (docks the hologram left, shows this on the right) --
+
+    def _draw_circle_2d(self, cx, cy, radius, segments=24, filled=True):
+        glBegin(GL_TRIANGLE_FAN if filled else GL_LINE_LOOP)
+        if filled:
+            glVertex2f(cx, cy)
+        for i in range(segments + 1):
+            theta = 2.0 * math.pi * i / segments
+            glVertex2f(cx + radius * math.cos(theta), cy + radius * math.sin(theta))
+        glEnd()
+
+    def _draw_cloud_icon(self, cx, cy, scale, color, alpha=0.9):
+        glColor4f(color[0], color[1], color[2], alpha)
+        for dx, dy, r in [(-0.5, 0.1, 0.55), (0.1, -0.15, 0.7), (0.7, 0.1, 0.5), (0, 0.3, 0.6)]:
+            self._draw_circle_2d(cx + dx * scale, cy + dy * scale, r * scale, segments=20)
+
+    def _draw_weather_icon(self, condition, cx, cy, scale, color):
+        if condition == "sunny":
+            glColor4f(1.0, 0.85, 0.3, 0.95)
+            self._draw_circle_2d(cx, cy, 0.55 * scale, segments=28)
+            glLineWidth(3.0)
+            glBegin(GL_LINES)
+            for i in range(8):
+                a = math.radians(i * 45)
+                x1, y1 = cx + math.cos(a) * 0.7 * scale, cy + math.sin(a) * 0.7 * scale
+                x2, y2 = cx + math.cos(a) * 0.95 * scale, cy + math.sin(a) * 0.95 * scale
+                glVertex2f(x1, y1); glVertex2f(x2, y2)
+            glEnd()
+
+        elif condition == "partly_cloudy":
+            glColor4f(1.0, 0.85, 0.3, 0.9)
+            self._draw_circle_2d(cx - 0.4 * scale, cy - 0.35 * scale, 0.4 * scale, segments=24)
+            self._draw_cloud_icon(cx + 0.15 * scale, cy + 0.15 * scale, scale * 0.85, (0.75, 0.85, 0.95))
+
+        elif condition == "cloudy":
+            self._draw_cloud_icon(cx, cy, scale, (0.7, 0.8, 0.9))
+
+        elif condition == "fog":
+            glColor4f(0.7, 0.8, 0.9, 0.7)
+            glLineWidth(3.0)
+            for i, dy in enumerate([-0.4, -0.1, 0.2, 0.5]):
+                glBegin(GL_LINE_STRIP)
+                for j in range(9):
+                    x = -1.0 * scale + j * 0.25 * scale
+                    y = cy + dy * scale + math.sin(j + i) * 0.04 * scale
+                    glVertex2f(cx + x, y)
+                glEnd()
+
+        elif condition == "rain":
+            self._draw_cloud_icon(cx, cy - 0.25 * scale, scale * 0.85, (0.6, 0.7, 0.85))
+            glColor4f(0.3, 0.65, 1.0, 0.9)
+            glLineWidth(3.0)
+            glBegin(GL_LINES)
+            for dx in (-0.5, -0.1, 0.3, 0.7):
+                glVertex2f(cx + dx * scale, cy + 0.35 * scale)
+                glVertex2f(cx + dx * scale - 0.1 * scale, cy + 0.75 * scale)
+            glEnd()
+
+        elif condition == "snow":
+            self._draw_cloud_icon(cx, cy - 0.25 * scale, scale * 0.85, (0.75, 0.8, 0.9))
+            glColor4f(0.9, 0.95, 1.0, 0.95)
+            glLineWidth(2.5)
+            for dx in (-0.5, -0.1, 0.3, 0.7):
+                sx, sy = cx + dx * scale, cy + 0.55 * scale
+                glBegin(GL_LINES)
+                for a in range(3):
+                    ang = math.radians(a * 60)
+                    glVertex2f(sx - math.cos(ang) * 0.1 * scale, sy - math.sin(ang) * 0.1 * scale)
+                    glVertex2f(sx + math.cos(ang) * 0.1 * scale, sy + math.sin(ang) * 0.1 * scale)
+                glEnd()
+
+        elif condition == "storm":
+            self._draw_cloud_icon(cx, cy - 0.3 * scale, scale * 0.85, (0.5, 0.55, 0.65))
+            glColor4f(1.0, 0.9, 0.2, 1.0)
+            glBegin(GL_LINE_STRIP)
+            for x, y in [(-0.05, 0.3), (0.15, 0.35), (-0.02, 0.55), (0.15, 0.6), (-0.1, 0.9)]:
+                glVertex2f(cx + x * scale, cy + y * scale)
+            glEnd()
+
+        else:
+            self._draw_cloud_icon(cx, cy, scale, (0.7, 0.8, 0.9))
+
+    def _draw_us_map(self, x, y, w, h, highlight_key, accent_color):
+        for name, (nx, ny) in US_STATE_POSITIONS.items():
+            if name == highlight_key:
+                continue
+            glColor4f(0.35, 0.5, 0.62, 0.5)
+            self._draw_circle_2d(x + nx * w, y + ny * h, 2.5)
+
+        if highlight_key and highlight_key in US_STATE_POSITIONS:
+            nx, ny = US_STATE_POSITIONS[highlight_key]
+            hx, hy = x + nx * w, y + ny * h
+            pulse = 0.5 + 0.5 * math.sin(self.elapsed * 4)
+
+            glColor4f(accent_color[0], accent_color[1], accent_color[2], 0.22 + 0.1 * pulse)
+            self._draw_circle_2d(hx, hy, 16 + 5 * pulse)
+            glColor4f(1.0, 1.0, 1.0, 1.0)
+            self._draw_circle_2d(hx, hy, 6)
+
+            label = US_STATE_ABBREV.get(highlight_key, highlight_key[:2].upper())
+            self._blit_text(self.font_small, label, hx + 11, hy - 8, color=(230, 240, 255))
+
+    def _draw_weather_panel(self, theme_color):
+        if not self.weather:
+            return
+        w = self.weather
+        pw, ph = self.width * 0.36, self.height - 260
+        px, py = self.width - pw - 40, 130
+        self._draw_panel(px, py, pw, ph, theme_color, chamfer=20, fill_alpha=0.55, alpha_mult=self._materialize_progress())
+
+        cx = px + pw / 2
+        self._blit_text(self.font, w.get("location", "Unknown"), px + 24, py + 22, color=(150, 200, 230))
+        self._blit_text(self.font_small, f"Updated {w.get('updated_at', '')}", px + 24, py + 44, color=(90, 130, 160))
+
+        if self.map_highlight:
+            self._draw_us_map(px + 20, py + 60, pw - 40, 140, self.map_highlight, theme_color)
+        else:
+            self._draw_weather_icon(w.get("condition", "cloudy"), cx, py + 130, 90, theme_color)
+
+        temp = w.get("temp_c")
+        temp_str = f"{round(temp)}°C" if temp is not None else "--"
+        if self.font_huge:
+            surf = self.font_huge.render(temp_str, True, (220, 240, 255))
+            tw = surf.get_size()[0]
+            self._blit_text(self.font_huge, temp_str, cx - tw / 2, py + 210, color=(220, 240, 255))
+
+        desc = w.get("description", "").upper()
+        if self.font:
+            surf = self.font.render(desc, True, (255, 255, 255))
+            dw = surf.get_size()[0]
+            self._blit_text(self.font, desc, cx - dw / 2, py + 275, color=(180, 220, 245))
+
+        stat_y = py + ph - 60
+        humidity = w.get("humidity")
+        wind = w.get("wind_kph")
+        stats = []
+        if humidity is not None:
+            stats.append(f"Humidity {humidity}%")
+        if wind is not None:
+            stats.append(f"Wind {round(wind)} km/h")
+        if stats:
+            line = "   |   ".join(stats)
+            surf = self.font_small.render(line, True, (255, 255, 255)) if self.font_small else None
+            lw = surf.get_size()[0] if surf else 0
+            self._blit_text(self.font_small, line, cx - lw / 2, stat_y, color=(150, 200, 230))
+
+    def _draw_hud_reticle(self, theme_color):
+        """Faint concentric rings + cardinal tick marks centered on the
+        hologram area — a subtle targeting-reticle HUD flourish."""
+        cx, cy = self.width / 2, self.height / 2 + 15
+        r, g, b = theme_color
+
+        for radius in (170, 230):
+            glColor4f(r, g, b, 0.07)
+            glLineWidth(1.0)
+            self._draw_circle_2d(cx, cy, radius, segments=64, filled=False)
+
+        glColor4f(r, g, b, 0.16)
+        glLineWidth(1.5)
+        glBegin(GL_LINES)
+        for angle_deg in (0, 90, 180, 270):
+            a = math.radians(angle_deg)
+            x1, y1 = cx + 230 * math.cos(a), cy + 230 * math.sin(a)
+            x2, y2 = cx + 248 * math.cos(a), cy + 248 * math.sin(a)
+            glVertex2f(x1, y1); glVertex2f(x2, y2)
+        glEnd()
+
+    def _wrap_text(self, font, text, max_width):
+        if not font:
+            return [text]
+        words = text.split()
+        lines, current = [], ""
+        for word in words:
+            test = (current + " " + word).strip()
+            if font.size(test)[0] <= max_width:
+                current = test
+            else:
+                if current:
+                    lines.append(current)
+                current = word
+        if current:
+            lines.append(current)
+        return lines
+
+    def _draw_info_card(self, theme_color):
+        if not self.info_card:
+            return
+        pw = max(500, min(800, self.width - 620))
+        ph = 300
+        px = (self.width - pw) / 2
+        py = (self.height - ph) / 2 + 10
+        self._draw_panel(px, py, pw, ph, theme_color, chamfer=20, fill_alpha=0.6, alpha_mult=self._materialize_progress())
+
+        x, y = px + 24, py + 20
+        self._blit_text(self.font_small, "YOU ASKED", x, y, color=(90, 130, 160))
+        y += 18
+        for line in self._wrap_text(self.font_small, self.info_card["question"], pw - 48)[:2]:
+            self._blit_text(self.font_small, line, x, y, color=(140, 180, 210))
+            y += 16
+
+        y += 14
+        self._blit_text(self.font_small, "AURORA", x, y, color=(90, 130, 160))
+        y += 22
+
+        a_lines = self._wrap_text(self.font, self.info_card["answer"], pw - 48)
+        max_lines = max(1, (py + ph - 20 - y) // 22)
+        for line in a_lines[:max_lines]:
+            self._blit_text(self.font, line, x, y, color=(210, 235, 255))
+            y += 22
+        if len(a_lines) > max_lines:
+            self._blit_text(self.font_small, "...", x, y, color=(120, 150, 175))
+
+    def _draw_idle_indicator(self, theme_color):
+        """Shown only in empty mode — a soft breathing ring so the center
+        of the screen reads as 'idle, ready, listening' rather than a
+        dead void that looks broken."""
+        cx, cy = self.width / 2, self.height / 2 + 15
+        pulse = 0.5 + 0.5 * math.sin(self.elapsed * 1.1)
+        r, g, b = theme_color
+
+        for i, base_r in enumerate((60, 90, 120)):
+            radius = base_r + pulse * 12
+            alpha = (0.22 - i * 0.06) * (0.6 + 0.4 * pulse)
+            glColor4f(r, g, b, alpha)
+            glLineWidth(1.5)
+            self._draw_circle_2d(cx, cy, radius, segments=64, filled=False)
+
+        glColor4f(r, g, b, 0.5 + 0.3 * pulse)
+        self._draw_circle_2d(cx, cy, 5, segments=20)
+
+    def _draw_dashboard(self, theme_color):
+        self._begin_ortho()
+        self._draw_background_grid()
+        self._draw_hud_reticle(theme_color)
+        if self.mode == "empty":
+            self._draw_idle_indicator(theme_color)
+        if self.mode == "info":
+            self._draw_info_card(theme_color)
+        self._draw_top_bar(theme_color)
+        self._draw_system_panel(theme_color)
+        self._draw_event_log()
+        self._draw_weather_panel(theme_color)
+        self._draw_bottom_bar(theme_color)
+        self._draw_scanlines()
+        self._draw_corner_brackets()
+        self._end_ortho()
+
+    # ---- main render ------------------------------------------------------
+
+    def render(self, pinch_amount=0.0):
+        glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+
+        self._begin_ortho()
+        self._draw_starfield()
+        self._draw_aurora_background()
+        self._end_ortho()
+
+        base_color = {
+            "listening": COLOR_LISTENING,
+            "speaking": COLOR_SPEAKING,
+        }.get(self.state, self._current_theme_color())
+        if self.mode == "solar_system":
+            base_color = (1.0, 0.75, 0.2)  # sunlight tint regardless of theme
+
+        pulse = 0.5 + 0.5 * math.sin(self.pulse_phase)
+        brightness = (0.6 + 0.4 * pulse + pinch_amount * 0.3) * self.brightness
+
+        t = self.flash_intensity
+        color = tuple(base_color[i] * (1 - t) + self.flash_color[i] * t for i in range(3))
+
+        if self.mode not in ("empty", "info"):
+            self._draw_base_plate(color, brightness * 0.7)
+
+        glPushMatrix()
+        glTranslatef(self.translate_x + self._dock_shift, self.translate_y, 0.0)
+        glRotatef(self.rotation_x, 1, 0, 0)
+        glRotatef(self.rotation_y, 0, 1, 0)
+        glRotatef(self.roll, 0, 0, 1)
+
+        glLineWidth(2.0)
+        materialize_ease = self._materialize_progress()
+        scale = (1.0 + pinch_amount * 0.15) * self.zoom * materialize_ease
+
+        if self.mode == "shape":
+            glPushMatrix()
+            glScalef(scale, scale, scale)
+            # Bake in a fixed 3/4-view tilt so the shape never looks flat
+            # from directly in front (a cube viewed perfectly face-on, or
+            # a torus viewed edge-on, both look 2D otherwise) — hand
+            # rotation still adds on top of this baseline.
+            glRotatef(25, 1, 0, 0)
+            glRotatef(35, 0, 1, 0)
+            glColor4f(color[0] * brightness, color[1] * brightness, color[2] * brightness, 0.95)
+            self._draw_shape(self.shape_name)
+            glPopMatrix()
+        else:
+            for idx, orbit in enumerate(self.orbits):
+                is_selected = (idx == self.selected_index)
+                glPushMatrix()
+                glRotatef(orbit["tilt"], 1, 1, 0)
+                glScalef(scale, scale, scale)
+
+                if self.mode == "atom" and "shell" in orbit:
+                    shell_color = SHELL_COLORS[orbit["shell"] % len(SHELL_COLORS)]
+                    ring_color = tuple(c * brightness for c in shell_color)
+                else:
+                    ring_color = (color[0] * brightness, color[1] * brightness, color[2] * brightness)
+
+                path_alpha = 1.0 if is_selected else 0.6
+                glColor4f(*ring_color, path_alpha)
+                self._draw_ring(orbit["radius"])
+
+                for phase in orbit["electrons"]:
+                    angle = math.radians(phase)
+                    nx = orbit["radius"] * math.cos(angle)
+                    ny = orbit["radius"] * math.sin(angle)
+                    glColor4f(*ring_color, path_alpha)
+                    glBegin(GL_LINES)
+                    glVertex3f(0, 0, 0)
+                    glVertex3f(nx, ny, 0)
+                    glEnd()
+
+                    glPushMatrix()
+                    glTranslatef(nx, ny, 0)
+                    if is_selected:
+                        self._draw_glow_fan(0.09, 1.0, 1.0, 1.0, passes=3)
+                        glColor4f(1.0, 1.0, 1.0, 1.0)
+                        self._draw_node_fan(0.09 + 0.02 * pulse)
+                        glColor4f(1.0, 1.0, 1.0, 0.9)
+                        glBegin(GL_LINE_LOOP)
+                        for i in range(4):
+                            a = math.radians(45 + i * 90)
+                            glVertex3f(0.16 * math.cos(a), 0.16 * math.sin(a), 0)
+                        glEnd()
+                    else:
+                        nc = tuple(min(1.0, c + 0.2) for c in ring_color)
+                        self._draw_glow_fan(0.07, *nc, passes=2)
+                        glColor4f(*nc, 1.0)
+                        self._draw_node_fan(0.07)
+                    glPopMatrix()
+
+                glPopMatrix()
+
+        if self.mode not in ("shape", "empty", "info"):
+            glPushMatrix()
+            glScalef(scale, scale, scale)
+            self._draw_sweep_arc(1.9)
+            core_color = (min(1.0, color[0] * brightness + 0.3),
+                          min(1.0, color[1] * brightness + 0.3),
+                          min(1.0, color[2] * brightness + 0.3))
+            if self.mode == "atom":
+                self._draw_nucleus_particles(self.protons, self.neutrons, brightness)
+            else:
+                core_radius = 0.22 if self.mode == "solar_system" else 0.14 + 0.05 * pulse
+                self._draw_glow_fan(core_radius, *core_color, passes=5)
+                glColor4f(*core_color, 1.0)
+                self._draw_node_fan(core_radius)
+            glPopMatrix()
+
+        glPopMatrix()
+
+        self._draw_dashboard(color)
+        pygame.display.flip()
+
+    def close(self):
+        pygame.quit()

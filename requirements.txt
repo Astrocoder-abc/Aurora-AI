@@ -1,0 +1,14 @@
+opencv-contrib-python>=4.10.0
+mediapipe>=0.10.30
+PyOpenGL>=3.1.7
+PyOpenGL_accelerate>=3.1.7
+pygame>=2.6.0
+numpy>=1.26.4
+groq>=0.11.0
+SpeechRecognition>=3.10.0
+pyttsx3>=2.90
+pyaudio>=0.2.14
+edge-tts>=6.1.9
+psutil>=5.9.0
+pycaw>=20240210
+comtypes>=1.4.0
