@@ -80,7 +80,7 @@ rasterization remain target-machine checks. No blanket claim that every hardware
 integration works is made by these automated results.
 
 
-## Particle-flow build (`amber-flow-v3`)
+## Particle-flow build (`amber-flow-v4`)
 
 Added checks cover three-dimensional positions, stream heads matching their
 trails, nonzero depth range, outward-moving light packets, bounded vertex arrays,
@@ -93,3 +93,10 @@ sphere, trails fade behind them, and short rays travel outward. Test “reduce
 motion” and “resume animation”, then show weather and return to the core. Capture
 a short screen recording if it still looks static or runs slowly; include the
 `python main.py --diagnose` output. Static preview PNGs cannot establish motion.
+
+
+The v4 tests additionally cover animation-clock frame-rate independence, eased
+voice energy, pause/resume pose continuity, quality-specific particle counts,
+shared positions across quality switches, and voice quality commands. Test
+performance and cinematic modes on the target machine; the CPU/GPU frame rate
+is not established by mocked graphics tests or the software preview.

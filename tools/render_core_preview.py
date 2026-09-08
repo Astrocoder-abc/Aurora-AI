@@ -13,18 +13,19 @@ from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from jarvis_ui.particle_core import ParticleCore
+from jarvis_ui.core_animation import CoreAnimation
 
 CORE = ParticleCore()
 
 
-def render_frame(elapsed=12, width=1200, height=800, state='idle'):
+def render_frame(elapsed=12, width=1200, height=800, state='idle', quality='balanced', energy=None):
     scale = 2
     size = (width * scale, height * scale)
     image = Image.new('RGB', size, (2, 2, 1))
     light = Image.new('RGB', size)
     draw = ImageDraw.Draw(light)
     cx, cy, radius = CORE.layout(width, height)
-    frame = CORE.frame(elapsed, state)
+    frame = CORE.frame(elapsed, state, quality=quality, energy=energy)
     def point(x, y):
         return ((cx + x * radius) * scale, (cy + y * radius) * scale)
     def amber(alpha, head=False):
@@ -64,7 +65,7 @@ def render_frame(elapsed=12, width=1200, height=800, state='idle'):
         draw.text((x*scale, y*scale), content, font=font(size), fill=color,
                   anchor='mt' if centered else 'lt')
     text('A U R O R A', width/2, 30, 16, (210,175,115), True)
-    text('P A R T I C L E   F L O W', width/2, 57, 11, (105,86,61), True)
+    text(f'PARTICLE FLOW / {quality.upper()} / {state.upper()}', width/2, 57, 11, (105,86,61), True)
     text('"Aurora, show me the solar system"', width/2, height-120,
          size=11, color=(160,142,113), centered=True)
     for i in range(41):
@@ -77,17 +78,22 @@ def render_frame(elapsed=12, width=1200, height=800, state='idle'):
     return image.resize((width,height),Image.Resampling.LANCZOS)
 
 
-def render(destination):
+def render(destination, quality="balanced"):
     destination.parent.mkdir(parents=True,exist_ok=True)
-    render_frame().save(destination)
+    render_frame(quality=quality).save(destination)
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--motion', action='store_true')
+    parser.add_argument('--quality', choices=('performance','balanced','cinematic'), default='balanced')
     args = parser.parse_args()
-    render(ROOT/'docs'/'core-preview.png')
+    render(ROOT/'docs'/'core-preview.png', args.quality)
     if args.motion:
-        frames = [render_frame(10+i/15, 720, 540) for i in range(60)]
+        frames, clock = [], CoreAnimation()
+        for i in range(75):
+            state = ('idle' if i < 30 else 'listening' if i < 45 else 'thinking' if i < 60 else 'speaking')
+            t, energy = clock.advance(i/15, state)
+            frames.append(render_frame(t, 720, 540, state, args.quality, energy))
         frames[0].save(ROOT/'docs'/'core-motion.gif', save_all=True, append_images=frames[1:],
                        duration=67, loop=0, optimize=True)

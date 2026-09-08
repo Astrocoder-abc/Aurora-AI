@@ -434,6 +434,14 @@ class VoiceAssistant:
         t = text.lower().strip()
         if "weather" in t:
             return self._handle_weather(t)
+        quality_commands = {"performance mode": "performance", "lower graphics": "performance",
+                            "balanced graphics": "balanced", "balanced quality": "balanced",
+                            "cinematic mode": "cinematic", "higher graphics": "cinematic"}
+        if t in quality_commands:
+            quality = quality_commands[t]
+            self.hologram.set_particle_quality(quality)
+            self._speak(f"Graphics set to {quality}")
+            return True
         if t in ("show diagnostics", "hide diagnostics"):
             self.hologram.show_diagnostics = t.startswith("show")
             self._speak("Diagnostics " + ("shown" if self.hologram.show_diagnostics else "hidden"))

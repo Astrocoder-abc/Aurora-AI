@@ -36,7 +36,7 @@ python main.py
 
 Starts in a normal **960×640 window**, reduced to leave desktop/taskbar space.
 Fullscreen and F11 switching are disabled unless you explicitly pass `--fullscreen`.
-The title bar identifies this build as **Amber Core | amber-flow-v3**.
+The title bar identifies this build as **Amber Core | amber-flow-v4**.
 Camera and voice are attempted; unavailable camera or voice
 setup is reported in the dashboard event log. Missing core dependencies are
 reported in the terminal with a nonzero exit code.
@@ -98,11 +98,11 @@ Paths do not depend on your terminal's current working directory.
 No clickable buttons, toolbar, hover targets, or mouse navigation. Inspired by
 the supplied amber-core reference, the default view is almost black with a
 **glowing gold particle sphere** built from moving three-dimensional positions.
-It contains 3,460 particles, including 40 bright relay heads with short fading
+In balanced mode it contains 3,460 particles, including 40 bright relay heads with short fading
 trails. Near particles appear brighter/larger; far particles recede. Orbit planes
 precess, nearby relays briefly connect, and light packets move outward instead
 of forming fixed center-to-edge spokes. There are no complete decorative orbit
-circles in the core. Seven vertex-array batches draw the particles and trails,
+circles in the core. In balanced mode, seven vertex-array batches draw the particles and trails,
 plus a few small nucleus/glow draws. The seeded model does not accumulate history.
 
 The app generates particle motion every frame; it does **not** load the preview
@@ -110,6 +110,28 @@ image/GIF or play a canned animation. It uses perspective projection and additiv
 particle lighting, **not hardware ray tracing**. Motion uses elapsed time rather
 than frame count, and the particles follow different paths rather than rotating
 a single flat image.
+
+### Particle quality and motion
+
+- **Balanced (default):** 3,460 points and 40 relay trails.
+- **Performance:** 1,230 points, 20 shorter trails, less glow work. Say
+  “Aurora, performance mode” if your laptop struggles.
+- **Cinematic:** 5,460 points, finer trails and an additional wide glow pass.
+  Say “Aurora, cinematic mode” when you have processing headroom.
+- “Aurora, balanced graphics” restores the default without rebuilding the scene.
+
+You can also choose at launch:
+
+```sh
+python main.py --windowed --graphics performance
+python main.py --windowed --graphics cinematic
+```
+
+Voice energy/color changes are eased rather than snapped. “Reduce motion” holds
+the current particle pose; “resume animation” continues from there instead of
+jumping to a different frame. Quality changes retain shared particle positions.
+All quality levels remain procedural, not video/image playback. Actual frame
+rate still depends on camera workload and your graphics driver.
 
 The core stays amber through listening/thinking/speaking; warmth and energy
 change instead of switching the whole screen to cyan. The bottom signal animation
@@ -290,7 +312,7 @@ python main.py --windowed
 Do not pull the Arena branch into `main`. Confirm the switch succeeds before
 continuing. Don't discard local changes to get past an error.
 
-The report must say `Aurora UI build: amber-flow-v3`. It also prints the
+The report must say `Aurora UI build: amber-flow-v4`. It also prints the
 project folder, Python executable, UI file, branch and commit. An unrecognized
 `--diagnose`/`--windowed` option indicates that terminal is still launching an
 older `main.py`. For a low-load visual check, use

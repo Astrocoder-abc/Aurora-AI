@@ -29,6 +29,7 @@ from collections import deque, OrderedDict
 import threading
 
 from jarvis_ui.particle_core import ParticleCore
+from jarvis_ui.core_animation import CoreAnimation
 from jarvis_ui.particle_buffers import build_buffers
 from jarvis_ui.overlays import overlay_rect, visible_page
 from jarvis_ui.runtime import UI_BUILD, window_size
@@ -293,6 +294,8 @@ class Hologram:
             pass  # Audio is optional; keep the visual dashboard available.
         self.clock = pygame.time.Clock()
         self.particle_core = ParticleCore()
+        self.core_animation = CoreAnimation()
+        self.particle_quality = "balanced"
         self._core_dock = 0.0
         self._text_cache = OrderedDict()
         self.show_diagnostics = False
@@ -610,6 +613,12 @@ class Hologram:
 
     def hide_info_card(self):
         self.info_card = None
+
+    def set_particle_quality(self, quality):
+        if quality not in ("performance", "balanced", "cinematic"):
+            raise ValueError("Unknown particle quality")
+        self.particle_quality = quality
+        self.log_event(f"GRAPHICS: {quality} quality")
 
     def scroll_info(self, direction):
         if self.info_card:
@@ -1486,7 +1495,7 @@ class Hologram:
         # Preserve the reference's amber palette through voice states. States change
         # energy and warmth, rather than abruptly switching the entire core to cyan.
         color = self._current_theme_color()
-        warmth = {"idle": 0, "listening": .08, "thinking": .02, "speaking": .16}.get(self.state, 0)
+        warmth = max(0, self.core_animation.energy - .24) * .21
         return tuple(min(1, channel + warmth) for channel in color)
 
     def _draw_bottom_bar(self, theme_color):
@@ -1819,7 +1828,9 @@ class Hologram:
         free = ParticleCore.layout(self.width, self.height, False)
         side = ParticleCore.layout(self.width, self.height, True)
         cx, cy, radius = tuple(a + (b - a) * self._core_dock for a, b in zip(free, side))
-        frame = self.particle_core.frame(self.elapsed, self.state, self.reduced_motion)
+        motion_time, energy = self.core_animation.advance(self.elapsed, self.state, self.reduced_motion)
+        frame = self.particle_core.frame(motion_time, self.state,
+                                         quality=self.particle_quality, energy=energy)
         color = self._voice_color()
         glBlendFunc(GL_SRC_ALPHA, GL_ONE)
         try:
@@ -1842,9 +1853,16 @@ class Hologram:
                     halo = colors[:]
                     for index in range(3, len(halo), 4):
                         halo[index] *= .075
-                    glPointSize(size * 2.5 + 1)
-                    draw_batch(vertices, halo, GL_POINTS)
-                    glPointSize(size)
+                    point_scale = max(.75, min(1.25, math.sqrt(radius / 200)))
+                    if self.particle_quality != "performance" or size == 3:
+                        glPointSize((size * 2.5 + 1) * point_scale)
+                        draw_batch(vertices, halo, GL_POINTS)
+                    if self.particle_quality == "cinematic":
+                        for index in range(3, len(halo), 4):
+                            halo[index] *= .45
+                        glPointSize((size * 4 + 2) * point_scale)
+                        draw_batch(vertices, halo, GL_POINTS)
+                    glPointSize(size * point_scale)
                     draw_batch(vertices, colors, GL_POINTS)
                 glLineWidth(1.2)
                 draw_batch(*line_batch, GL_LINES)

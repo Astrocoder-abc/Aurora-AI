@@ -138,6 +138,15 @@ class LocalCommandTests(unittest.TestCase):
         self.assertFalse(self.hud.show_diagnostics)
         self.assertFalse(self.hud.reduced_motion)
 
+    def test_quality_can_be_changed_by_voice_without_reseeding(self):
+        original = self.hud.particle_core
+        for phrase, expected in [('performance mode', 'performance'),
+                                  ('cinematic mode', 'cinematic'),
+                                  ('balanced graphics', 'balanced')]:
+            self.assertTrue(self.voice._handle_local_command(phrase))
+            self.assertEqual(self.hud.particle_quality, expected)
+            self.assertIs(self.hud.particle_core, original)
+
     def test_edit_numeric_counts_above_ten(self):
         self.hud.load_atom('carbon')
         self.voice._handle_local_command('add 12 electrons')

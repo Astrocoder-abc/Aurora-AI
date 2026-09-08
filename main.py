@@ -130,6 +130,8 @@ def main():
     display_mode.add_argument("--fullscreen", action="store_true", help="Explicitly allow fullscreen/F11")
     display_mode.add_argument("--windowed", action="store_true", help="Normal window; fullscreen/F11 disabled (default)")
     parser.add_argument("--diagnose", action="store_true", help="Print UI build, loaded paths and Git revision, then exit")
+    parser.add_argument("--graphics", choices=("performance", "balanced", "cinematic"), default="balanced",
+                        help="Particle density and glow quality (default: balanced)")
     parser.add_argument("--no-camera", action="store_true")
     parser.add_argument("--no-voice", action="store_true")
     parser.add_argument("--debug-camera", action="store_true")
@@ -158,6 +160,7 @@ def main():
     display_bridge = face_bridge = None
     try:
         hologram = Hologram(fullscreen=args.fullscreen, windowed_only=not args.fullscreen)
+        hologram.set_particle_quality(args.graphics)
         display_bridge = DisplayBridge(hologram)
         if not args.no_camera:
             try:

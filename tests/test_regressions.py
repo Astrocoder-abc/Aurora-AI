@@ -78,6 +78,9 @@ class DashboardTests(unittest.TestCase):
 
     def test_particle_render_is_batched_and_restores_blending(self):
         from jarvis_ui.particle_core import ParticleCore
+        from jarvis_ui.core_animation import CoreAnimation
+        self.hud.core_animation = CoreAnimation()
+        self.hud.particle_quality = "balanced"
         self.hud.particle_core = ParticleCore(count=20)
         self.hud.width, self.hud.height = 1200, 800
         self.hud.weather = self.hud.weather_status = self.hud.info_card = None
@@ -209,7 +212,7 @@ class StartupTests(unittest.TestCase):
         result = subprocess.run([sys.executable, str(ROOT / 'main.py'), '--diagnose'],
                                 cwd='/tmp', capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('amber-flow-v3', result.stdout)
+        self.assertIn('amber-flow-v4', result.stdout)
         self.assertIn(str(ROOT / 'jarvis_ui' / 'hologram.py'), result.stdout)
 
     def test_window_fits_desktop_without_minimum_size_overflow(self):

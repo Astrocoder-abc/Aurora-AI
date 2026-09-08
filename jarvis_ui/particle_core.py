@@ -33,6 +33,11 @@ class ParticleCore:
         self.ray_seeds = tuple((rng.random() * math.tau, rng.uniform(-.8, .8),
                                rng.random(), rng.uniform(.15, .3)) for _ in range(14))
 
+        # Extra points are generated once; changing quality never reseeds the scene.
+        self.detail_seeds = tuple((rng.uniform(-.995, .995), rng.random() * math.tau,
+                                   rng.uniform(.86, 1.03), rng.uniform(.16, .42),
+                                   rng.random() * math.tau) for _ in range(2000))
+
     @staticmethod
     def layout(width, height, docked=False):
         return (width * (.26 if docked else .5), height * .46,
@@ -56,9 +61,13 @@ class ParticleCore:
         cr, sr = math.cos(rotation), math.sin(rotation)
         return x * cr + z * sr, y, -x * sr + z * cr
 
-    def frame(self, elapsed, state='idle', reduced_motion=False):
+    def frame(self, elapsed, state='idle', reduced_motion=False, quality='balanced', energy=None):
         t = 0.0 if reduced_motion else elapsed
-        energy = {'idle': .24, 'listening': .52, 'thinking': .78, 'speaking': 1}.get(state, .24)
+        if quality not in ('performance', 'balanced', 'cinematic'):
+            raise ValueError('Unknown particle quality')
+        if energy is None:
+            energy = {'idle': .24, 'listening': .52, 'thinking': .78, 'speaking': 1}.get(state, .24)
+        energy = max(0, min(1, energy))
         yaw, tilt = t * .11, .44 + .12 * math.sin(t * .13)
         ca, sa, ct, st = math.cos(yaw), math.sin(yaw), math.cos(tilt), math.sin(tilt)
         def view(point):
@@ -68,10 +77,12 @@ class ParticleCore:
         def depth_alpha(z):
             return .12 + .82 * max(0, min(1, (z + 1.2) / 2.4))**1.5
         points, world = [], []
-        for latitude, phase, shell, speed, flicker in self.seeds:
+        seeds = (self.seeds[::3] if quality == 'performance' else
+                 self.seeds + self.detail_seeds if quality == 'cinematic' else self.seeds)
+        for latitude, phase, shell, speed, flicker in seeds:
             u = max(-.999, min(.999, latitude + .025 * math.sin(t * .6 + flicker)))
             azimuth = phase + t * speed * (1 - .35 * abs(u))
-            r = shell + .012 * math.sin(t * 2 + flicker)
+            r = shell + (.009 + .014 * energy) * math.sin(t * 2 + flicker)
             ring = math.sqrt(1 - u*u)
             position = view((r * ring * math.cos(azimuth), r * u, r * ring * math.sin(azimuth)))
             x, y = self._project(position)
@@ -79,7 +90,7 @@ class ParticleCore:
             alpha = depth_alpha(position[2]) * twinkle
             points.append((x, y, alpha, 2 if position[2] > .7 else 1))
             world.append(position)
-        for phase, latitude, radius, speed in self.embers:
+        for phase, latitude, radius, speed in (self.embers[::2] if quality == 'performance' else self.embers):
             angle = phase + t * speed
             r = math.sqrt(1 - latitude * latitude) * radius
             position = view((r * math.cos(angle), radius * latitude, r * math.sin(angle)))
@@ -87,7 +98,9 @@ class ParticleCore:
             points.append((x, y, depth_alpha(position[2]) * .3, 1))
             world.append(position)
         trails, heads = [], []
-        for index, stream in enumerate(self.streams):
+        streams = self.streams[::2] if quality == 'performance' else self.streams
+        samples = {'performance': 12, 'balanced': 18, 'cinematic': 26}[quality]
+        for index, stream in enumerate(streams):
             head = view(self._orbit(stream, t))
             hx, hy = self._project(head)
             alpha = min(1, depth_alpha(head[2]) + .15)
@@ -95,8 +108,8 @@ class ParticleCore:
             world.append(head)
             heads.append((head, hx, hy))
             trail = []
-            for sample in range(18):
-                age = (17 - sample) / 17
+            for sample in range(samples):
+                age = (samples - 1 - sample) / (samples - 1)
                 # Trail length changes gently with activity, but the head never teleports.
                 old = view(self._orbit(stream, t - age * (.38 + .25 * energy)))
                 x, y = self._project(old)
@@ -123,5 +136,7 @@ class ParticleCore:
                 distance = math.sqrt(sum((u-v)**2 for u, v in zip(a, b)))
                 if .05 < distance < .48:
                     alpha = (1 - distance / .48) * min(depth_alpha(a[2]), depth_alpha(b[2])) * .5
+                    alpha *= min(1, (distance - .05) / .06)
+                    alpha *= .5 + .5 * math.sin(t * 1.3 + i)**2
                     links.append((ax, ay, bx, by, alpha))
         return CoreFrame(tuple(points), tuple(trails), tuple(rays), energy, tuple(world), tuple(links))
