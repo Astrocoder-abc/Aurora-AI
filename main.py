@@ -1,7 +1,7 @@
 """
 Aurora Project — Editable Holographic Element Display
 
-Launches FULLSCREEN by default. Press F11 to toggle windowed mode, ESC to
+Launches windowed by default; use --fullscreen for fullscreen. Press F11 to toggle windowed mode, ESC to
 quit (or close the debug window / press 'q' there).
 
 Two windows open:
@@ -90,54 +90,97 @@ import os
 import sys
 import time
 
-import cv2
-
-from jarvis_ui.hand_tracker import HandTracker
-from jarvis_ui.hologram import Hologram
-from jarvis_ui.voice_assistant import VoiceAssistant
-from jarvis_ui.face_id import FaceID
-from jarvis_ui import system_control
-
 GESTURE_TO_STATE = {
     "open_palm": "listening",
     "fist": "speaking",
 }
 
-SNAPSHOT_DIR = "snapshots"
+SNAPSHOT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "snapshots")
 
 
 def save_snapshot(frame):
     os.makedirs(SNAPSHOT_DIR, exist_ok=True)
-    filename = os.path.join(SNAPSHOT_DIR, f"jarvis_{int(time.time())}.png")
-    cv2.imwrite(filename, frame)
+    filename = os.path.join(SNAPSHOT_DIR, f"aurora_{time.time_ns()}.png")
+    if not cv2.imwrite(filename, frame):
+        raise OSError(f"Could not save snapshot: {filename}")
     print(f"Snapshot saved: {filename}")
 
 
-def main():
-    tracker = HandTracker(camera_index=0)
-    hologram = Hologram()
-    face_id = FaceID(on_log=hologram.log_event)
+class DisabledVoice:
+    state = "idle"
+    enabled = False
+    pending_enrollment_name = None
 
-    print("DEBUG: about to construct VoiceAssistant...", flush=True)
+    def stop(self):
+        pass
+
+    def speak_now(self, text):
+        print(text)
+
+
+class DisabledTracker:
+    def read(self):
+        return TrackerResult(), None
+
+    def close(self):
+        pass
+
+
+def main():
+    import argparse
+    import traceback
+    parser = argparse.ArgumentParser(description="Aurora holographic assistant")
+    parser.add_argument("--fullscreen", action="store_true")
+    parser.add_argument("--no-camera", action="store_true")
+    parser.add_argument("--no-voice", action="store_true")
+    parser.add_argument("--debug-camera", action="store_true")
+    parser.add_argument("--camera-index", type=int, default=0)
+    args = parser.parse_args()
+    global cv2, TrackerResult
     try:
-        voice = VoiceAssistant(hologram, face_id, on_log=hologram.log_event)
-        print(f"DEBUG: VoiceAssistant constructed OK, client={voice.client is not None}, "
-              f"mic={voice.microphone is not None}", flush=True)
-        voice.start()
-        print(f"DEBUG: voice.start() returned, enabled={voice.enabled}", flush=True)
-    except Exception as e:
-        import traceback
-        print("DEBUG: VoiceAssistant setup raised an exception:", flush=True)
+        import cv2
+        from jarvis_ui.hand_tracker import HandTracker, TrackerResult
+        from jarvis_ui.hologram import Hologram
+        from jarvis_ui.face_id import FaceID
+        from jarvis_ui import system_control
+        from jarvis_ui.display_bridge import DisplayBridge
+    except (ImportError, OSError) as exc:
+        print(f"Startup dependency error: {exc}\n"
+              "Install requirements.txt in your virtual environment. "
+              "Linux also needs OpenGL system libraries (see README).", file=sys.stderr)
+        return 1
+    tracker, hologram, voice = DisabledTracker(), None, DisabledVoice()
+    display_bridge = face_bridge = None
+    try:
+        hologram = Hologram(fullscreen=args.fullscreen)
+        display_bridge = DisplayBridge(hologram)
+        if not args.no_camera:
+            try:
+                tracker = HandTracker(camera_index=args.camera_index)
+            except Exception as exc:
+                hologram.log_event(f"CAMERA OFF: {exc}")
+        face_id = FaceID(on_log=hologram.log_event)
+        face_bridge = DisplayBridge(face_id)
+        if not args.no_voice:
+            try:
+                from jarvis_ui.voice_assistant import VoiceAssistant
+                voice = VoiceAssistant(display_bridge, face_bridge, on_log=hologram.log_event)
+                voice.start()
+            except Exception as exc:
+                voice.stop()
+                voice = DisabledVoice()
+                hologram.log_event(f"VOICE OFF: {exc}")
+    except Exception:
         traceback.print_exc()
-        voice = VoiceAssistant.__new__(VoiceAssistant)
-        voice.state = "idle"
-        voice.enabled = False
-        voice.pending_enrollment_name = None
+        tracker.close()
+        if hologram is not None:
+            hologram.close()
+        return 1
 
     print(__doc__)
 
     last_debug_frame = None
-    prev_time = time.time()
+    prev_time = time.monotonic()
     volume_drag_prev_pitch = None
 
     enrollment_samples = []
@@ -150,10 +193,12 @@ def main():
 
     try:
         while True:
-            now = time.time()
-            dt = max(1e-4, now - prev_time)
+            now = time.monotonic()
+            dt = min(0.1, max(1e-4, now - prev_time))
             prev_time = now
 
+            display_bridge.pump()
+            face_bridge.pump()
             hologram.process_events()
             if hologram.should_quit:
                 break
@@ -165,16 +210,21 @@ def main():
                 gray = cv2.cvtColor(debug_frame, cv2.COLOR_BGR2GRAY)
                 faces = face_id.detect_faces(gray)
 
+                if not voice.pending_enrollment_name or len(faces) != 1:
+                    enrollment_samples.clear()
+                if not len(faces):
+                    recognized_person = None
+
                 # ---- enrollment: collect samples while a request is pending ----
                 if voice.pending_enrollment_name and len(faces) == 1:
                     x, y, w, h = faces[0]
                     enrollment_samples.append(gray[y:y + h, x:x + w])
                     if len(enrollment_samples) >= ENROLLMENT_TARGET_SAMPLES:
                         name = voice.pending_enrollment_name
-                        face_id.enroll(enrollment_samples, name)
+                        enrolled = face_id.enroll(enrollment_samples, name)
                         enrollment_samples = []
                         voice.pending_enrollment_name = None
-                        voice.speak_now(f"Got it, I'll recognize you as {name} from now on.")
+                        voice.speak_now(f"Enrolled {name}." if enrolled else "Face enrollment unavailable.")
 
                 # ---- recognition: throttled, greets + personalizes on a new match ----
                 elif not voice.pending_enrollment_name and len(faces) >= 1 and \
@@ -230,7 +280,10 @@ def main():
             # Voice state takes priority over gesture state when active —
             # you don't want the hologram flipping to "idle" mid-reply just
             # because your hand dropped out of frame.
-            hologram.set_state(voice.state if voice.state != "idle" else gesture_state)
+            hologram.voice_available = voice.enabled
+            hologram.last_heard = getattr(voice, "last_heard", "")
+            # Voice HUD states must not pretend a hand gesture is microphone activity.
+            hologram.set_state(voice.state)
 
             if result.zoom_delta:
                 hologram.apply_zoom_delta(result.zoom_delta)
@@ -283,10 +336,10 @@ def main():
 
             hologram.render(pinch_amount=pinch_for_pulse)
 
-            if debug_frame is not None:
+            if args.debug_camera and debug_frame is not None:
                 cv2.imshow("Aurora - hand tracking debug", debug_frame)
 
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            if args.debug_camera and cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
     except KeyboardInterrupt:
@@ -295,14 +348,17 @@ def main():
         import traceback
         print("MAIN LOOP CRASHED:", flush=True)
         traceback.print_exc()
-        input("Press Enter to close...")
+        return 1
     finally:
-        voice.stop()
-        tracker.close()
-        hologram.close()
-        cv2.destroyAllWindows()
-        sys.exit(0)
+        display_bridge.close()
+        face_bridge.close()
+        for cleanup in (voice.stop, tracker.close, hologram.close, cv2.destroyAllWindows):
+            try:
+                cleanup()
+            except Exception:
+                traceback.print_exc()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

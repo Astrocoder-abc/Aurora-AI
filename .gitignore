@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+api_key.txt
+.env
+phone_pin.txt
+contacts.json
+face_data/
+snapshots/
+*.log
+mic_index.txt
+energy_threshold.txt

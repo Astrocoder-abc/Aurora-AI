@@ -1,119 +1,257 @@
-# Jarvis Project — Laptop-Only Build (Phase 1: Hologram UI)
+# Aurora AI
 
-No external hardware needed — everything runs on your Inspiron 5567 using
-its built-in webcam. Your hand's position rotates an on-screen wireframe
-"hologram" HUD, pinching makes it glow/pulse, and later phases will hook
-voice + the LLM brain into the same UI.
+A local Python desktop assistant with a holographic OpenGL dashboard,
+webcam hand gestures, optional voice AI, and opt-in local face enrollment.
+The dashboard runs in **a desktop window**, not a browser.
 
-## 1. Install Python dependencies
+## Install
 
-Open a terminal in this folder and run:
+Use Python 3.11 or 3.12 and a virtual environment:
 
-```
-python -m venv venv
-```
-
-Activate it:
-- Windows: `venv\Scripts\activate`
-- Mac/Linux: `source venv/bin/activate`
-
-Then install requirements:
-```
+```sh
+python -m venv .venv
+# Windows:
+.venv\Scripts\activate
+# macOS / Linux:
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-> Note: mediapipe is CPU-friendly and does not need a dedicated GPU — the
-> Inspiron 5567's integrated graphics (or the optional Radeon R7 M445 on
-> some configs) is more than enough for this.
+Linux additionally needs desktop OpenGL and PortAudio libraries. On Debian/Ubuntu:
 
-## 2. Run it
-
+```sh
+sudo apt install libgl1 libglu1-mesa portaudio19-dev python3-dev
 ```
+
+PyAudio requires a compatible wheel or PortAudio development headers.
+`pycaw` and `comtypes` are installed only on Windows; system volume/media
+integration is Windows-specific. Don't install multiple OpenCV variants in
+the same environment; this project uses `opencv-contrib-python` for LBPH.
+
+## Run
+
+```sh
 python main.py
 ```
 
-Two windows should open:
-1. **Hologram window** — the rotating wireframe HUD
-2. **Debug window** — your webcam feed with hand landmarks drawn on it,
-   so you can confirm tracking is working
+Starts windowed. Camera and voice are attempted; unavailable camera or voice
+setup is reported in the dashboard event log. Missing core dependencies are
+reported in the terminal with a nonzero exit code.
 
-## 3. Try it
+```sh
+python main.py --no-camera --no-voice  # visual-only troubleshooting
+python main.py --fullscreen
+python main.py --debug-camera         # optional webcam preview window
+python main.py --camera-index 1       # choose another camera
+python main.py --help
+```
 
-- Move your hand left/right and up/down in front of the webcam — the
-  hologram should rotate to follow.
-- Pinch your thumb and index finger together — the hologram glows
-  brighter and pulses faster.
-- Open your palm fully — hologram turns cyan ("listening" demo state).
-- Make a fist — hologram turns green ("speaking" demo state).
-- Press `q` in the debug window to quit.
+## Project layout
 
-## Troubleshooting
+```text
+Aurora-AI/
+├── main.py                  # entry point
+├── jarvis_ui/
+│   ├── __init__.py
+│   ├── paths.py             # shared project-root paths
+│   ├── hologram.py          # OpenGL dashboard and interaction
+│   ├── particle_core.py     # deterministic amber-core animation
+│   ├── overlays.py          # responsive overlay layout
+│   ├── display_bridge.py    # main-thread command dispatch
+│   ├── timers.py            # cancellable timer service
+│   ├── hand_tracker.py
+│   ├── voice_assistant.py
+│   ├── weather.py           # structured Open-Meteo client
+│   ├── face_id.py
+│   ├── system_control.py
+│   └── phone_control.py
+├── hand_landmarker.task
+├── requirements.txt
+└── tests/
+```
 
-- **Webcam doesn't open / black debug window:** another app (Zoom, Teams,
-  browser tab) may be holding the camera. Close those and rerun.
-- **Low frame rate / laggy tracking:** lower the resolution further in
-  `hand_tracker.py` (e.g. 480x360), or make sure no other heavy apps are
-  running in the background.
-- **Hand not detected reliably:** make sure there's decent lighting facing
-  your hand, and keep your hand roughly centered in frame while testing.
-- **`ImportError` on mediapipe/OpenGL:** double check you activated the
-  virtual environment before running `pip install`.
+Run `main.py`, not the individual package modules. Keys, model, device
+configuration, logs, snapshots, and face data remain at the **project root**.
+Paths do not depend on your terminal's current working directory.
 
-## What's next
+## Dashboard controls
 
-This phase proves the gesture-to-visual pipeline works end-to-end. Next
-phases will add, without touching this hologram code much:
-- Wake word detection + speech-to-text (mic input)
-- The LLM brain (Claude API or local model) for actual conversation/tasks
-- Text-to-speech output
-- Wiring `hologram.set_state(...)` to real conversation events instead of
-  the demo palm/fist mapping used here
+| Key | Action |
+| --- | --- |
+| `1` | Demo hologram |
+| `2` | Carbon atom |
+| `3` | Solar system |
+| `Tab` | Cycle color theme |
+| `R` | Reset zoom, pan and roll |
+| `F11` | Toggle fullscreen |
+| `H` | Toggle help overlay |
+| `Esc` | Close help first, otherwise exit |
+| `q` in webcam preview | Exit when `--debug-camera` is enabled |
 
-## Voice AI setup (talk to it, it can search the web and reply out loud) — FREE
+### Voice-first HUD
 
-Uses Groq's API, which is genuinely free — no credit card required, no
-trial period that expires.
+No clickable buttons, toolbar, hover targets, or mouse navigation. Inspired by
+the supplied amber-core reference, the default view is almost black with a
+**glowing gold particle sphere**, elliptical orbital filaments, scattered embers,
+radial streaks, and a white-hot nucleus. Roughly 4,700 points are batched into a
+few draw calls. The particle model is seeded once and does not grow over time.
 
-1. **Get a free Groq API key**: https://console.groq.com/keys — sign in
-   with email or Google, click "Create API Key". No billing info needed.
-2. **Install the new dependencies**:
-   ```
-   python -m pip install --user -r requirements.txt
-   ```
-   `pyaudio` occasionally fails to install on Windows because it needs a
-   prebuilt wheel for your exact Python version. If `pip install pyaudio`
-   errors out, try:
-   ```
-   python -m pip install --user pipwin
-   python -m pipwin install pyaudio
-   ```
-3. **Add your API key**: rename `api_key.txt.example` to `api_key.txt`
-   and replace its contents with just your key (no quotes, no extra
-   text). Keep this file private — don't share it or commit it anywhere.
-4. **Run it**: `python main.py` as usual. If the key and mic are both
-   set up correctly, you'll see `VOICE: listening for wake word 'Jarvis'`
-   printed and logged to the dashboard's event log panel.
-5. **Talk to it**: say "Jarvis" followed by your question, e.g.
-   - "Jarvis, what's the weather in Tokyo right now?" (the model has
-     built-in web search — groq/compound — and decides on its own when
-     to look something up vs. answer from what it already knows)
-   - "Jarvis, what time is it?" (answered instantly, no API call)
-   - "Jarvis, open youtube" (actually opens it in your browser)
-   - "Jarvis, who won the last F1 race?" (web search again)
+The core stays amber through listening/thinking/speaking; warmth and energy
+change instead of switching the whole screen to cyan. The bottom signal animation
+reflects assistant state, **not measured microphone amplitude**. The HUD labels
+voice as offline if it cannot start. Grid, corner frames, and large telemetry
+panels are hidden by default. Weather docks beside the core; existing atoms,
+shapes, and solar-system displays remain available.
 
-While it's listening or replying, the hologram's state (and color) will
-switch to reflect that — same visual language as the gesture-driven
-open-palm/fist states, just driven by voice instead.
+![Software-rendered design preview of the amber particle core](docs/core-preview.png)
 
-**Free tier limits worth knowing**: Groq's free tier is rate-limited
-(not a token/dollar cap) — currently around 30 requests/minute and a
-per-day cap on the compound model specifically (in the low hundreds of
-requests/day, since it's the most capable option). For a personal voice
-assistant that's more than enough; if you ever hit the daily cap you'll
-see the error message spoken back to you, and it resets the next day.
+This is a **software design preview**, produced from the same particle geometry,
+not a captured OpenGL window. Glow/point rasterization may differ on your GPU.
+To regenerate it (optional development dependency):
 
-**If voice doesn't activate:** the dashboard's event log will tell you
-why — most commonly a missing/invalid API key, a missing microphone, or
-a `pyaudio` install failure. The rest of the app (gestures, hologram)
-keeps working fine even if voice can't start.
+```sh
+pip install Pillow
+python tools/render_core_preview.py
+```
 
+Say **“Aurora”** and your request together, or say the wake word alone and then
+speak during the five-second follow-up listening window.
+
+- “Aurora, show me a carbon atom.”
+- “Aurora, show me the solar system.”
+- “Aurora, change theme.”
+- “Aurora, show core.” — return from a diagram to the particle sphere.
+- “Aurora, show diagnostics.” / “Aurora, hide diagnostics.”
+- “Aurora, reduce motion.” / “Aurora, resume animation.” — freeze/resume the particle core.
+- “Aurora, show help.” / “Aurora, close help.”
+- “Aurora, read more.” / “Aurora, scroll up.” — navigate long answers.
+
+### Refined overlays and function checks
+
+Weather, answers and the guide use consistent charcoal/amber cards. Wide windows
+dock cards beside the core; smaller windows center them without squeezing text
+against the particle sphere. Weather includes separate humidity/wind readouts,
+loading/error states, source and update time. Answers have numbered pages and a
+progress indicator; “read more” advances by the visible page size. “Close answer”
+returns to the core. The core eases into its docked position.
+
+![Software overlay preview with sample weather, an answer, and a network error](docs/overlays-preview.png)
+
+Voice display/face-data operations are dispatched between frames on the main
+thread. Timer cancellation now cancels the underlying callback; speech notices
+are queued so greetings and timer notifications do not block rendering. Text
+rasterization uses a bounded cache that survives fullscreen context changes.
+See [validation and local smoke tests](docs/VALIDATION.md) for the tested scope
+and checks that still need your hardware.
+
+Keyboard shortcuts above remain as troubleshooting fallbacks, not on-screen
+buttons. Optional diagnostics (also toggled with F3) appear only on larger windows. Rendering is capped
+at 60 FPS; unsupported multisampling is retried without MSAA.
+
+### Weather
+
+Weather uses Open-Meteo geocoding and current-condition JSON, **not an LLM's
+formatted answer**. It does not need a Groq key (speech recognition still needs
+internet access). Try:
+
+- “Aurora, weather in Ghaziabad.”
+- “Aurora, what's the weather like in Delhi today?”
+- “Aurora, close the weather.”
+
+No city is silently guessed. For “weather here” or a request without a city,
+optionally configure a default before starting:
+
+```powershell
+# Windows PowerShell
+$env:AURORA_WEATHER_CITY = "Ghaziabad"
+python main.py
+```
+
+```sh
+# macOS / Linux
+AURORA_WEATHER_CITY="Ghaziabad" python main.py
+```
+
+Without a configured default, Aurora asks you to repeat the request with a city.
+Ambiguous names use the provider's ranked result, whose resolved location is
+shown and spoken; use a city and country (e.g. “Paris, France”) to qualify it.
+Temperature is Celsius, wind is km/h, and the card displays the provider timestamp
+and location timezone. These are provider current-condition estimates, not a
+measurement from your laptop. Forecast requests are explicitly declined rather
+than passed off as current readings.
+
+Loading and errors replace old readings, so stale data is not displayed as a
+successful new lookup. Showing weather dismisses a prior answer card. Errors
+cover missing/unknown locations, invalid data, connectivity, and rate limits.
+The API receives the city name and resolved coordinates; no device GPS/IP
+geolocation lookup is performed.
+
+### Gestures
+
+- Move your hand to rotate; twist your wrist to roll.
+- Point to select an orbit; pinch and move to edit it (or pan with no selection).
+- Hold a fist and move closer/further to zoom; two-hand spreading also zooms.
+- Swipe left/right to change theme; up/down to change brightness.
+- Peace sign saves a webcam snapshot in `snapshots/`.
+- Thumbs down resets the display; OK sign toggles media playback on Windows.
+
+## Voice and optional general chat
+
+For general AI conversation, get a Groq API key from https://console.groq.com/keys. Set `GROQ_API_KEY` in
+your environment, or copy `api_key.txt.example` to `api_key.txt` and replace
+its contents with your key. Never commit or share this file.
+
+Say **“Aurora”** followed by a request, for example:
+
+- “Aurora, show me a carbon atom.”
+- “Aurora, show me the solar system.”
+- “Aurora, what's the weather in Tokyo?”
+- “Aurora, set a timer for five minutes.”
+
+Microphone overrides go in `mic_index.txt` beside `main.py` (device number
+from startup logs). Optional energy override: `energy_threshold.txt`.
+Voice diagnostics are written to `voice_debug.log`, which can contain spoken
+requests and replies. Voice uses external services: Google speech recognition,
+Groq for general chat, Open-Meteo for weather, and optionally Edge TTS. Service availability and API limits can change.
+
+## Privacy and optional device features
+
+Face enrollment is explicit: “Aurora, remember my face as Sam.” Data stays in
+`face_data/`. This is convenience recognition, **not secure authentication**.
+The existing “forget” feature removes the name mapping but does not erase its
+histograms from LBPH; to erase all enrollments, close the app and delete
+`face_data/`. Forgotten model labels are not reused for new people.
+
+Android integration requires an authorized ADB connection; see
+`jarvis_ui/phone_control.py`. `phone_pin.txt` stores a PIN in plaintext and is optional.
+Keep it private. `contacts.json`, keys, PINs, face data, snapshots, and logs
+are excluded from Git by `.gitignore`.
+
+## Troubleshooting / validation
+
+- Camera unavailable: close apps using it, check permissions, try
+  `--camera-index 1`, or use `--no-camera`.
+- Audio setup fails: try `--no-voice`; the visual dashboard does not require
+  an audio output device.
+- OpenGL startup fails: install/update GPU drivers and system libraries.
+  A real desktop/display is required; a headless server is not sufficient.
+- Unexpected runtime failure: run from a terminal and retain the traceback.
+  The app no longer blocks on an input prompt or forcibly reports success.
+
+Run hardware-free regression tests:
+
+```sh
+python -m unittest discover -s tests -v
+python -m compileall -q main.py jarvis_ui
+```
+
+Tests cover keyboard fallbacks, ignored mouse clicks, help dismissal, answer
+scrolling/wrapping, package paths, selection, zoom, MSAA retry, CLI help, and
+weather fixtures (location extraction, measurements, conditions, errors, voice
+routing, and display transitions).
+
+Desktop rendering, microphone recognition, live weather connectivity and
+Windows/ADB integration still need testing on your machine. The sandbox lacks
+OpenGL system support and its live Open-Meteo request failed with a network
+error; no successful live reading or OpenGL screenshot is claimed here. The
+software preview above is for design review only.

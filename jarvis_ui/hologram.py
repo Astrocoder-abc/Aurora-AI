@@ -10,21 +10,25 @@ grid, glow). The central display can show:
 EDITABLE: point to select the next orbit/shell, pinch + move to reshape
 it (vertical = radius, horizontal = spin speed).
 
-FULLSCREEN: launches fullscreen by default. Press F11 to toggle back to
+FULLSCREEN: launches windowed by default. Press F11 to toggle back to
 a windowed view, ESC to quit. (Previous versions never processed pygame's
 window events at all, which is almost certainly why the window sometimes
 showed "Not Responding" in Windows — fixed here.)
 """
 
 import math
+from copy import deepcopy
 import random
 import time
 import pygame
 from pygame.locals import DOUBLEBUF, OPENGL, FULLSCREEN
 from OpenGL.GL import *
 from OpenGL.GLU import gluPerspective
-from collections import deque
+from collections import deque, OrderedDict
 import threading
+
+from jarvis_ui.particle_core import ParticleCore
+from jarvis_ui.overlays import overlay_rect, visible_page
 
 try:
     import psutil
@@ -33,12 +37,13 @@ except ImportError:
     PSUTIL_AVAILABLE = False
 
 COLOR_LISTENING = (0.1, 1.0, 0.9)
-COLOR_SPEAKING = (0.2, 1.0, 0.3)
+COLOR_SPEAKING = (0.35, 0.85, 1.0)
+COLOR_THINKING = (0.65, 0.4, 1.0)
 
 THEMES = [
+    (1.0, 0.56, 0.06),
     (0.1, 0.6, 1.0),
     (0.8, 0.2, 1.0),
-    (1.0, 0.55, 0.05),
     (1.0, 0.2, 0.4),
 ]
 
@@ -276,12 +281,27 @@ SPEED_MIN, SPEED_MAX = -180, 180
 
 
 class Hologram:
-    def __init__(self, fullscreen=True, windowed_size=(1200, 800)):
+    def __init__(self, fullscreen=False, windowed_size=(1200, 800)):
         pygame.init()
-        if not pygame.mixer.get_init():
-            pygame.mixer.init()  # init on the main thread — doing this from
-                                  # the background voice thread caused
-                                  # intermittent crashes
+        try:
+            if not pygame.mixer.get_init():
+                pygame.mixer.init()
+        except pygame.error:
+            pass  # Audio is optional; keep the visual dashboard available.
+        self.clock = pygame.time.Clock()
+        self.particle_core = ParticleCore()
+        self._core_dock = 0.0
+        self._text_cache = OrderedDict()
+        self.show_diagnostics = False
+        self.reduced_motion = False
+        self.voice_available = False
+        self.last_heard = ""
+        self.weather_status = None
+        self.show_help = False
+        self.info_scroll = 0
+        self._info_page_lines = 5
+        self._stats_sample_time = -1.0
+        self._stats_cache = []
         self.windowed_size = windowed_size
         self.fullscreen = fullscreen
         self._set_display_mode(fullscreen)
@@ -290,17 +310,19 @@ class Hologram:
         # to sci-fi interfaces than a plain monospace font — both ship
         # with Windows, so this is a free upgrade with no install needed.
         # Falls back gracefully through the list, ending at Consolas.
-        font_candidates = ["bahnschrift", "agencyfb", "eurostile", "consolas"]
+        font_candidates = ["segoeui", "dejavusans", "bahnschrift", "arial"]
 
         def _pick_font(size, bold=False):
             for name in font_candidates:
                 try:
+                    if not pygame.font.match_font(name):
+                        continue
                     f = pygame.font.SysFont(name, size, bold=bold)
                     if f:
                         return f
                 except Exception:
                     continue
-            return None
+            return pygame.font.Font(None, size)
 
         try:
             self.font = _pick_font(16)
@@ -385,7 +407,9 @@ class Hologram:
             self.width, self.height = info.current_w, info.current_h
             flags = DOUBLEBUF | OPENGL | FULLSCREEN
         else:
-            self.width, self.height = self.windowed_size
+            info = pygame.display.Info()
+            self.width = min(self.windowed_size[0], max(640, info.current_w - 80))
+            self.height = min(self.windowed_size[1], max(480, info.current_h - 100))
             flags = DOUBLEBUF | OPENGL
 
         try:
@@ -394,12 +418,18 @@ class Hologram:
         except Exception:
             pass  # MSAA unsupported on this GPU/driver — fine, just less smooth
 
-        pygame.display.set_mode((self.width, self.height), flags)
+        try:
+            pygame.display.set_mode((self.width, self.height), flags)
+        except pygame.error:
+            # Unsupported MSAA usually fails at set_mode, not gl_set_attribute.
+            pygame.display.gl_set_attribute(pygame.GL_MULTISAMPLEBUFFERS, 0)
+            pygame.display.gl_set_attribute(pygame.GL_MULTISAMPLESAMPLES, 0)
+            pygame.display.set_mode((self.width, self.height), flags)
         pygame.display.set_caption("AURORA")
         self._init_gl_state()
 
     def _init_gl_state(self):
-        glClearColor(0.01, 0.02, 0.045, 1.0)
+        glClearColor(0.006, 0.005, 0.004, 1.0)
         glEnable(GL_DEPTH_TEST)
         glEnable(GL_LINE_SMOOTH)
         glEnable(GL_BLEND)
@@ -417,7 +447,7 @@ class Hologram:
         try:
             glEnable(GL_FOG)
             glFogi(GL_FOG_MODE, GL_LINEAR)
-            glFogfv(GL_FOG_COLOR, (0.01, 0.02, 0.045, 1.0))
+            glFogfv(GL_FOG_COLOR, (0.006, 0.005, 0.004, 1.0))
             glFogf(GL_FOG_START, 4.0)
             glFogf(GL_FOG_END, 11.0)
             glHint(GL_FOG_HINT, GL_NICEST)
@@ -441,14 +471,33 @@ class Hologram:
         Windows will mark the window 'Not Responding' even while it's
         rendering fine. Also handles F11 (toggle fullscreen), ESC/window
         close (quit)."""
+        self.clock.tick(60)
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self.should_quit = True
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_F11:
                     self.toggle_fullscreen()
+                elif event.key == pygame.K_1:
+                    self.reset_orbits()
+                elif event.key == pygame.K_2:
+                    self.load_atom("carbon")
+                elif event.key == pygame.K_3:
+                    self.load_solar_system()
+                elif event.key == pygame.K_TAB:
+                    self.cycle_theme(1)
+                elif event.key == pygame.K_r:
+                    self.zoom = 1.0
+                    self.translate_x = self.translate_y = self.roll = 0.0
+                elif event.key == pygame.K_F3:
+                    self.show_diagnostics = not self.show_diagnostics
+                elif event.key == pygame.K_h:
+                    self.show_help = not self.show_help
                 elif event.key == pygame.K_ESCAPE:
-                    self.should_quit = True
+                    if self.show_help:
+                        self.show_help = False
+                    else:
+                        self.should_quit = True
 
     # ---- external control API -------------------------------------------
 
@@ -514,13 +563,27 @@ class Hologram:
         humidity, wind_kph, updated_at, and optionally 'state' (a US state
         name key into US_STATE_POSITIONS) to show a map instead of the
         generic weather icon. Automatically docks the hologram left."""
+        self.weather_status = None
+        self.info_card = None
+        if self.mode == "info":
+            self.mode = "empty"
         self.weather = data
         state = data.get("state")
         self.map_highlight = state if state in US_STATE_POSITIONS else None
         self.dock_left()
         self._trigger_materialize()
 
+    def set_weather_status(self, status, message):
+        self.info_card = None
+        if self.mode == "info":
+            self.mode = "empty"
+        self.weather = None  # Never leave old readings looking like a fresh lookup.
+        self.weather_status = {"status": status, "message": message}
+        self.show_help = False
+        self.dock_left()
+
     def hide_weather(self):
+        self.weather_status = None
         self.weather = None
         self.map_highlight = None
         self.undock()
@@ -532,6 +595,7 @@ class Hologram:
         self.hide_weather()
         self.mode = "info"
         self.mode_label = "RESPONSE"
+        self.info_scroll = 0
         self.info_card = {"question": question, "answer": answer}
         self.orbits = []
         self.selected_index = None
@@ -540,7 +604,34 @@ class Hologram:
     def hide_info_card(self):
         self.info_card = None
 
+    def scroll_info(self, direction):
+        if self.info_card:
+            self.info_scroll = max(0, self.info_scroll + direction * self._info_page_lines)
+
+    def show_core(self):
+        self.hide_weather()
+        self.info_card = None
+        self.show_help = False
+        self.mode = "empty"
+        self.mode_label = "VOICE CORE"
+        self.orbits = []
+        self.selected_index = None
+        self._trigger_materialize()
+
+    def new_element(self):
+        self.hide_weather()
+        self.info_card = None
+        self.protons, self.neutrons, self.electron_count = 1, 0, 1
+        self.current_element_z = 1
+        self.mode = "atom"
+        self._rebuild_atom_orbits()
+        self._update_custom_label()
+        self._trigger_materialize()
+
     def _trigger_materialize(self):
+        if self.mode not in ("empty", "info"):
+            self.info_card = None
+        self.show_help = False
         self._materialize_start = self.elapsed
 
     # ---- content: atom / solar system / demo ------------------------------
@@ -614,6 +705,8 @@ class Hologram:
         self.mode_label = f"{base} — {self.protons}p {self.neutrons}n {self.electron_count}e{charge_str}"
 
     def _ensure_atom_mode(self):
+        self.hide_weather()
+        self.info_card = None
         if self.mode != "atom":
             self.mode = "atom"
             self._rebuild_atom_orbits()
@@ -622,23 +715,30 @@ class Hologram:
         """Adding/removing protons changes the element itself, and keeps
         the atom neutral by default (electrons follow along)."""
         self._ensure_atom_mode()
-        self.protons = max(1, self.protons + n)
-        self.electron_count = max(0, self.electron_count + n)
+        previous = self.protons
+        self.protons = max(1, min(118, self.protons + n))
+        self.current_element_z = self.protons
+        self.electron_count = max(0, min(118, self.electron_count + self.protons - previous))
         self._rebuild_atom_orbits()
         self._update_custom_label()
+        return self.protons - previous
 
     def add_neutrons(self, n=1):
         """Neutrons don't affect electron shells — just the isotope."""
         self._ensure_atom_mode()
-        self.neutrons = max(0, self.neutrons + n)
+        previous = self.neutrons
+        self.neutrons = max(0, min(300, self.neutrons + n))
         self._update_custom_label()
+        return self.neutrons - previous
 
     def add_electrons(self, n=1):
         """Electrons alone (protons unchanged) creates an ion."""
         self._ensure_atom_mode()
-        self.electron_count = max(0, self.electron_count + n)
+        previous = self.electron_count
+        self.electron_count = max(0, min(118, self.electron_count + n))
         self._rebuild_atom_orbits()
         self._update_custom_label()
+        return self.electron_count - previous
 
     def load_solar_system(self):
         self.hide_weather()
@@ -695,7 +795,7 @@ class Hologram:
 
     def load_demo(self):
         self.hide_weather()
-        self.orbits = [dict(o) for o in DEFAULT_ORBITS]
+        self.orbits = deepcopy(DEFAULT_ORBITS)
         self.selected_index = None
         self.mode = "demo"
         self.mode_label = "DEMO DISPLAY"
@@ -708,6 +808,7 @@ class Hologram:
             return False
         self.hide_weather()
         self.mode = "shape"
+        self.orbits = []
         self.shape_name = shape_name
         self.mode_label = f"{shape_name.upper()} MODEL"
         self.selected_index = None
@@ -728,6 +829,9 @@ class Hologram:
         self.selected_index = None
 
     def select_next_orbit(self):
+        if not self.orbits:
+            self.selected_index = None
+            return
         if self.selected_index is None:
             self.selected_index = 0
         else:
@@ -1166,13 +1270,13 @@ class Hologram:
             (x + chamfer, y), (x + w, y), (x + w, y + h - chamfer),
             (x + w - chamfer, y + h), (x, y + h), (x, y + chamfer),
         ]
-        glColor4f(0.02, 0.05, 0.09, fill_alpha * alpha_mult)
+        glColor4f(0.035, 0.027, 0.017, fill_alpha * alpha_mult)
         glBegin(GL_POLYGON)
         for px, py in pts:
             glVertex2f(px, py)
         glEnd()
 
-        border_pulse = 0.45 + 0.15 * math.sin(self.elapsed * 1.5)
+        border_pulse = 0.28
         glColor4f(r, g, b, border_pulse * alpha_mult)
         glLineWidth(1.3)
         glBegin(GL_LINE_LOOP)
@@ -1207,13 +1311,22 @@ class Hologram:
     def _truncate(self, text, max_chars):
         return text if len(text) <= max_chars else text[:max_chars - 1] + "…"
 
-    def _blit_text(self, font, text, x, y, color=(60, 220, 255)):
+    def _blit_text(self, font, text, x, y, color=(235, 216, 182)):
         if not font:
             return 0
         try:
-            surf = font.render(text, True, color)
-            w, h = surf.get_size()
-            data = pygame.image.tostring(surf, "RGBA", True)
+            # Cache CPU glyph pixels, not context-bound GL textures. Safe across F11.
+            key = (id(font), str(text), tuple(color))
+            pixels = self._text_cache.get(key)
+            if pixels is None:
+                surface = font.render(str(text), True, color)
+                w, h = surface.get_size()
+                pixels = (w, h, pygame.image.tostring(surface, "RGBA", True))
+                self._text_cache[key] = pixels
+                if len(self._text_cache) > 256:
+                    self._text_cache.popitem(last=False)
+            self._text_cache.move_to_end(key)
+            w, h, data = pixels
             glRasterPos2f(x, y + h)
             glDrawPixels(w, h, GL_RGBA, GL_UNSIGNED_BYTE, data)
             return h
@@ -1243,18 +1356,31 @@ class Hologram:
             y += step
         glEnd()
 
+    def _fit_text(self, font, text, width):
+        """Pixel-based clipping for labels, including long activity messages."""
+        if not font:
+            return text
+        if font.size(text)[0] <= width:
+            return text
+        while text and font.size(text + "...")[0] > width:
+            text = text[:-1]
+        return text + "..." if text else ""
+
+    def _center_text(self, font, text, cx, y, color=(215, 235, 245)):
+        width = font.size(text)[0] if font else 0
+        self._blit_text(font, text, cx - width / 2, y, color=color)
+
     def _draw_top_bar(self, theme_color):
-        self._draw_panel(16, 12, self.width - 32, 66, theme_color, chamfer=18, fill_alpha=0.45)
-
-        title = "A U R O R A"
-        self._blit_text(self.font_big, title, self.width / 2 - 70, 16, color=(150, 225, 255))
-
-        self._blit_text(self.font_small, time.strftime("%H:%M:%S"), self.width - 120, 20, color=(140, 190, 220))
-        self._blit_text(self.font_small, f"FPS {self._fps:.0f}", self.width - 120, 40, color=(90, 130, 160))
-
-        mode_text = self._truncate(self.mode_label, 42)
-        self._blit_text(self.font_small, "DISPLAYING", 32, 20, color=(90, 130, 160))
-        self._blit_text(self.font, mode_text, 32, 36, color=(200, 235, 255))
+        self._center_text(self.font, "A U R O R A", self.width / 2, 30,
+                          color=(210, 175, 115))
+        self._center_text(self.font_small, "P E R S O N A L   I N T E L L I G E N C E",
+                          self.width / 2, 57, color=(105, 86, 61))
+        if self.width >= 900:
+            label = "CORE / VOICE" if self.mode == "empty" else self.mode_label
+            self._blit_text(self.font_small, self._fit_text(self.font_small, label, self.width / 2 - 235),
+                            36, 38, color=(118, 95, 65))
+            self._blit_text(self.font_small, time.strftime("%H:%M"), self.width - 83, 38,
+                            color=(145, 120, 85))
 
     def _get_system_stats(self):
         """Real system stats via psutil. Falls back to a clearly-labeled
@@ -1262,6 +1388,9 @@ class Hologram:
         if not PSUTIL_AVAILABLE:
             return [("CPU", None), ("MEM", None), ("BATT", None)]
 
+        if self.elapsed - self._stats_sample_time < 0.5 and self._stats_cache:
+            return self._stats_cache
+        self._stats_sample_time = self.elapsed
         cpu = psutil.cpu_percent(interval=None) / 100.0
         self.cpu_history.append(cpu)
         mem = psutil.virtual_memory().percent / 100.0
@@ -1274,7 +1403,8 @@ class Hologram:
             batt_frac = None
             batt_label = "BATT"
 
-        return [("CPU", cpu), ("MEM", mem), (batt_label, batt_frac)]
+        self._stats_cache = [("CPU", cpu), ("MEM", mem), (batt_label, batt_frac)]
+        return self._stats_cache
 
     def _draw_sparkline(self, x, y, w, h, values, color):
         if len(values) < 2:
@@ -1299,11 +1429,11 @@ class Hologram:
         glEnd()
 
     def _draw_system_panel(self, theme_color):
-        px, py, pw, ph = 16, 92, 230, 180
-        self._draw_panel(px, py, pw, ph, theme_color, chamfer=14)
+        px, py, pw, ph = 20, 110, 220, 242
+        self._draw_rect(px, py, 2, ph, *theme_color, 0.4)
 
-        x, y, bar_w = px + 18, py + 16, 190
-        self._blit_text(self.font_small, "SYSTEM", x, y, color=(90, 130, 160))
+        x, y, bar_w = px + 18, py + 18, 184
+        self._blit_text(self.font_small, "SYSTEM / LIVE", x, y, color=(90, 130, 160))
         y += 24
         for label, frac in self._get_system_stats():
             if frac is None:
@@ -1327,58 +1457,87 @@ class Hologram:
         self._draw_sparkline(x, y, bar_w, 26, list(self.cpu_history), theme_color)
 
     def _draw_event_log(self):
-        pw, ph = 300, 180
-        px, py = self.width - pw - 16, 92
-        self._draw_panel(px, py, pw, ph, (0.3, 0.85, 1.0), chamfer=14)
+        pw, ph = 260, 242
+        px, py = self.width - pw - 20, 110
+        self._draw_rect(px, py, 2, ph, 0.3, 0.85, 1.0, 0.25)
 
         x, y = px + 18, py + 16
-        self._blit_text(self.font_small, "EVENT LOG", x, y, color=(90, 130, 160))
+        self._blit_text(self.font_small, "RECENT ACTIVITY", x, y, color=(90, 130, 160))
         y += 24
         with self._event_log_lock:
             log_snapshot = list(self.event_log)
         if not log_snapshot:
-            self._blit_text(self.font_small, "-- awaiting input --", x, y, color=(80, 110, 130))
+            self._blit_text(self.font_small, "Your session starts here.", x, y, color=(80, 110, 130))
         for i, line in enumerate(log_snapshot):
             fade = max(0.35, 1.0 - i * 0.16)
             base = (170, 220, 245) if i == 0 else (150, 190, 215)
             color = tuple(int(c * fade) for c in base)
-            self._blit_text(self.font_small, self._truncate(line, 38), x, y, color=color)
-            y += 19
+            self._blit_text(self.font_small, self._fit_text(self.font_small, line, pw - 36), x, y, color=color)
+            y += 27
+
+    def _voice_color(self):
+        # Preserve the reference's amber palette through voice states. States change
+        # energy and warmth, rather than abruptly switching the entire core to cyan.
+        color = self._current_theme_color()
+        warmth = {"idle": 0, "listening": .08, "thinking": .02, "speaking": .16}.get(self.state, 0)
+        return tuple(min(1, channel + warmth) for channel in color)
 
     def _draw_bottom_bar(self, theme_color):
-        state_labels = {"idle": "IDLE", "listening": "LISTENING", "speaking": "SPEAKING"}
-        state_colors = {"idle": theme_color, "listening": COLOR_LISTENING, "speaking": COLOR_SPEAKING}
-        label = state_labels.get(self.state, "IDLE")
-        c = state_colors.get(self.state, theme_color)
+        # State-driven animation, deliberately not presented as microphone amplitude.
+        color = self._voice_color()
+        cx, y = self.width / 2, self.height - 80
+        active = self.voice_available and self.state != "idle"
+        for i in range(49):
+            envelope = math.sin(math.pi * i / 48) ** 2
+            wave = abs(math.sin(self.elapsed * (5 if active else 1.3) + i * 0.48))
+            h = 3 + envelope * (24 if active else 6) * wave
+            self._draw_rect(cx + (i - 24) * 5, y - h / 2, 2, h, *color, 0.45 + envelope * 0.5)
+        label = ({"idle": 'SAY "AURORA" TO BEGIN', "listening": "LISTENING",
+                  "thinking": "PROCESSING YOUR REQUEST", "speaking": "AURORA IS SPEAKING"}
+                 .get(self.state, "STANDBY") if self.voice_available else "VOICE OFFLINE / CHECK MICROPHONE SETUP")
+        self._center_text(self.font_small, label, cx, y + 25, color=(195, 158, 100))
+        if self.width >= 1000:
+            self._blit_text(self.font_small, "VOICE INTERFACE / " + ("READY" if self.voice_available else "OFFLINE"),
+                            32, self.height - 40, color=(90, 77, 57))
+            self._blit_text(self.font_small, "F11 FULLSCREEN  /  ESC EXIT", self.width - 255,
+                            self.height - 40, color=(90, 77, 57))
+        transcript = self.last_heard or '"Aurora, show me the solar system"'
+        self._center_text(self.font_small, self._fit_text(self.font_small, transcript, self.width - 100),
+                          cx, self.height - 132, color=(160, 142, 113))
 
-        bar_h = 76
-        self._draw_panel(16, self.height - bar_h - 12, self.width - 32, bar_h, c, chamfer=18, fill_alpha=0.45)
+    def _overlay_frame(self, rect, theme_color, label, hint):
+        x, y, w, h = rect.x, rect.y, rect.width, rect.height
+        self._draw_panel(x, y, w, h, theme_color, chamfer=12, fill_alpha=.96)
+        self._draw_rect(x + 24, y + 48, w - 48, 1, *theme_color, .18)
+        self._blit_text(self.font_small, self._fit_text(self.font_small, label, w - 48),
+                        x + 24, y + 20, color=(209, 163, 84))
+        self._draw_rect(x + 24, y + h - 43, w - 48, 1, *theme_color, .12)
+        self._blit_text(self.font_small, self._fit_text(self.font_small, hint, w - 48),
+                        x + 24, y + h - 29, color=(153, 130, 94))
 
-        self._blit_text(self.font_small, "STATUS", 34, self.height - bar_h + 4, color=(90, 130, 160))
-
-        dot_pulse = 0.5 + 0.5 * math.sin(self.elapsed * (5 if self.state != "idle" else 2))
-        dot_x, dot_y = 140, self.height - bar_h + 30
-        glColor4f(c[0], c[1], c[2], 0.25 + 0.2 * dot_pulse)
-        self._draw_circle_2d(dot_x, dot_y, 9 + 3 * dot_pulse)
-        glColor4f(c[0], c[1], c[2], 1.0)
-        self._draw_circle_2d(dot_x, dot_y, 4)
-
-        self._blit_text(self.font_big, label, 155, self.height - bar_h + 18,
-                         color=(int(c[0] * 255), int(c[1] * 255), int(c[2] * 255)))
-
-        hint = "Try: \"Aurora, show the Eiffel Tower\" or \"a skyscraper\"   F11 fullscreen   ESC quit"
-        self._blit_text(self.font_small, self._truncate(hint, 68), 34, self.height - 22, color=(100, 140, 165))
-
-        if self.hud_lines:
-            panel_w = 320
-            x = self.width - panel_w - 30
-            y = self.height - bar_h + 8
-            for line in self.hud_lines:
-                self._blit_text(self.font_small, self._truncate(line, 44), x, y, color=(160, 210, 235))
-                y += 17
+    def _draw_help(self, theme_color):
+        self._draw_rect(0, 0, self.width, self.height, .006, .005, .004, .9)
+        rect = overlay_rect(self.width, self.height, 'help')
+        self._overlay_frame(rect, theme_color, "VOICE GUIDE / NO BUTTONS REQUIRED",
+                            'Say "Aurora, close help"  /  ESC')
+        rows = [("EXPLORE", '"Show me a carbon atom"'),
+                ("WEATHER", '"Weather in Ghaziabad"'),
+                ("PERSONALIZE", '"Change theme" / "Reduce motion"'),
+                ("READ", '"Read more" / "Scroll up"'),
+                ("RETURN", '"Show core" / "Close answer"')]
+        available = rect.height - 116
+        spacing = available / len(rows)
+        for i, (label, phrase) in enumerate(rows):
+            y = rect.y + 65 + i * spacing
+            if spacing >= 38:
+                self._blit_text(self.font_small, label, rect.x + 24, y, color=(183, 143, 78))
+                self._blit_text(self.font, phrase, rect.x + 24, y + 20, color=(238, 220, 187))
+            else:
+                self._blit_text(self.font_small, self._fit_text(self.font_small, phrase, rect.width - 48),
+                                rect.x + 24, y, color=(238, 220, 187))
 
     def _draw_scanlines(self):
-        glColor4f(0.3, 0.9, 1.0, 0.035)
+        glColor4f(0.3, 0.9, 1.0, 0.012)
         glBegin(GL_LINES)
         y = self.scanline_phase % self.height
         while y < self.height:
@@ -1513,48 +1672,69 @@ class Hologram:
             self._blit_text(self.font_small, label, hx + 11, hy - 8, color=(230, 240, 255))
 
     def _draw_weather_panel(self, theme_color):
-        if not self.weather:
+        data, status = self.weather, self.weather_status
+        if not data and not status:
             return
-        w = self.weather
-        pw, ph = self.width * 0.36, self.height - 260
-        px, py = self.width - pw - 40, 130
-        self._draw_panel(px, py, pw, ph, theme_color, chamfer=20, fill_alpha=0.55, alpha_mult=self._materialize_progress())
-
-        cx = px + pw / 2
-        self._blit_text(self.font, w.get("location", "Unknown"), px + 24, py + 22, color=(150, 200, 230))
-        self._blit_text(self.font_small, f"Updated {w.get('updated_at', '')}", px + 24, py + 44, color=(90, 130, 160))
-
-        if self.map_highlight:
-            self._draw_us_map(px + 20, py + 60, pw - 40, 140, self.map_highlight, theme_color)
+        rect = overlay_rect(self.width, self.height, 'weather')
+        x, y, w, h = rect.x, rect.y, rect.width, rect.height
+        self._overlay_frame(rect, theme_color, "ATMOSPHERE / CURRENT CONDITIONS",
+                            'Say "Aurora, close weather"')
+        expanded = h >= 440
+        if status:
+            loading = status['status'] == 'loading'
+            label = "Acquiring conditions" if loading else "Unable to update weather"
+            self._blit_text(self.font, self._fit_text(self.font, label, w - 48), x + 24, y + 68,
+                            color=(241, 221, 184))
+            if loading:
+                phase = 0 if self.reduced_motion else (self.elapsed * .35) % 1
+                self._draw_rect(x + 24, y + 101, w - 48, 2, *theme_color, .15)
+                self._draw_rect(x + 24 + phase * (w - 80), y + 100, 32, 3, *theme_color, .8)
+            lines = self._wrap_text(self.font_small, status['message'], w - 48)
+            _, _, visible = visible_page(lines, 0, h - 172, 19)
+            for i, line in enumerate(visible):
+                self._blit_text(self.font_small, line, x + 24, y + 118 + i * 19,
+                                color=(197, 176, 142))
+            return
+        # A single clipped location keeps small overlays inside their bounds.
+        self._blit_text(self.font, self._fit_text(self.font, data['location'], w - 48),
+                        x + 24, y + 64, color=(241, 226, 202))
+        if expanded:
+            icon_x, icon_y = x + w - 78, y + 158
+            if data['condition'] == 'clear_night':
+                glColor4f(.96, .8, .48, .9)
+                self._draw_circle_2d(icon_x, icon_y, 25, segments=48)
+                glColor4f(.035, .027, .017, 1)
+                self._draw_circle_2d(icon_x + 12, icon_y - 8, 23, segments=48)
+            else:
+                bob = 0 if self.reduced_motion else math.sin(self.elapsed * .7) * 2
+                self._draw_weather_icon(data['condition'], icon_x, icon_y + bob, 34, theme_color)
+        temp_y = y + (119 if expanded else 93)
+        self._blit_text(self.font_huge if expanded else self.font_big,
+                        f"{round(data['temp_c'])}°C", x + 24, temp_y, color=(255, 223, 157))
+        description = self._fit_text(self.font_small, data['description'].upper(), w - 48)
+        self._blit_text(self.font_small, description, x + 24, temp_y + (68 if expanded else 36),
+                        color=(199, 170, 118))
+        humidity = '--' if data['humidity'] is None else f"{round(data['humidity'])}%"
+        wind = '--' if data['wind_kph'] is None else f"{round(data['wind_kph'])} km/h"
+        if expanded:
+            metrics_y = y + 238
+            for i, (label, value) in enumerate((("HUMIDITY", humidity), ("WIND", wind))):
+                mx = x + 24 + i * (w - 48) / 2
+                self._draw_rect(mx, metrics_y, (w - 64) / 2, 72, *theme_color, .045)
+                self._blit_text(self.font_small, label, mx + 12, metrics_y + 12, color=(156, 127, 81))
+                self._blit_text(self.font_big, value, mx + 12, metrics_y + 32, color=(230, 213, 180))
+            source_y = y + h - 95
+            self._blit_text(self.font_small, self._fit_text(self.font_small,
+                f"{data['source']} / {data['updated_at']}", w - 48), x + 24, source_y, color=(158, 137, 101))
+            self._blit_text(self.font_small, self._fit_text(self.font_small,
+                data.get('timezone', ''), w - 48), x + 24, source_y + 19, color=(126, 111, 86))
         else:
-            self._draw_weather_icon(w.get("condition", "cloudy"), cx, py + 130, 90, theme_color)
-
-        temp = w.get("temp_c")
-        temp_str = f"{round(temp)}°C" if temp is not None else "--"
-        if self.font_huge:
-            surf = self.font_huge.render(temp_str, True, (220, 240, 255))
-            tw = surf.get_size()[0]
-            self._blit_text(self.font_huge, temp_str, cx - tw / 2, py + 210, color=(220, 240, 255))
-
-        desc = w.get("description", "").upper()
-        if self.font:
-            surf = self.font.render(desc, True, (255, 255, 255))
-            dw = surf.get_size()[0]
-            self._blit_text(self.font, desc, cx - dw / 2, py + 275, color=(180, 220, 245))
-
-        stat_y = py + ph - 60
-        humidity = w.get("humidity")
-        wind = w.get("wind_kph")
-        stats = []
-        if humidity is not None:
-            stats.append(f"Humidity {humidity}%")
-        if wind is not None:
-            stats.append(f"Wind {round(wind)} km/h")
-        if stats:
-            line = "   |   ".join(stats)
-            surf = self.font_small.render(line, True, (255, 255, 255)) if self.font_small else None
-            lw = surf.get_size()[0] if surf else 0
-            self._blit_text(self.font_small, line, cx - lw / 2, stat_y, color=(150, 200, 230))
+            stats = f"Humidity {humidity}  /  Wind {wind}"
+            self._blit_text(self.font_small, stats, x + 24, y + 154, color=(197, 177, 144))
+            # Source stays visible in compact view; timestamp is clipped by pixels.
+            self._blit_text(self.font_small, self._fit_text(self.font_small,
+                f"{data['source']} / {data['updated_at']}", w - 48),
+                x + 24, y + h - 63, color=(148, 126, 91))
 
     def _draw_hud_reticle(self, theme_color):
         """Faint concentric rings + cardinal tick marks centered on the
@@ -1580,81 +1760,121 @@ class Hologram:
     def _wrap_text(self, font, text, max_width):
         if not font:
             return [text]
-        words = text.split()
         lines, current = [], ""
-        for word in words:
-            test = (current + " " + word).strip()
-            if font.size(test)[0] <= max_width:
-                current = test
-            else:
-                if current:
+        for word in text.split():
+            candidate = (current + " " + word).strip()
+            if font.size(candidate)[0] <= max_width:
+                current = candidate
+                continue
+            if current:
+                lines.append(current)
+            current = ""
+            # Break long URLs/tokens too; word-only wrapping lets these escape cards.
+            for char in word:
+                if current and font.size(current + char)[0] > max_width:
                     lines.append(current)
-                current = word
+                    current = ""
+                current += char
         if current:
             lines.append(current)
         return lines
 
     def _draw_info_card(self, theme_color):
-        if not self.info_card:
+        card = self.info_card
+        if not card:
             return
-        pw = max(500, min(800, self.width - 620))
-        ph = 300
-        px = (self.width - pw) / 2
-        py = (self.height - ph) / 2 + 10
-        self._draw_panel(px, py, pw, ph, theme_color, chamfer=20, fill_alpha=0.6, alpha_mult=self._materialize_progress())
-
-        x, y = px + 24, py + 20
-        self._blit_text(self.font_small, "YOU ASKED", x, y, color=(90, 130, 160))
-        y += 18
-        for line in self._wrap_text(self.font_small, self.info_card["question"], pw - 48)[:2]:
-            self._blit_text(self.font_small, line, x, y, color=(140, 180, 210))
-            y += 16
-
-        y += 14
-        self._blit_text(self.font_small, "AURORA", x, y, color=(90, 130, 160))
-        y += 22
-
-        a_lines = self._wrap_text(self.font, self.info_card["answer"], pw - 48)
-        max_lines = max(1, (py + ph - 20 - y) // 22)
-        for line in a_lines[:max_lines]:
-            self._blit_text(self.font, line, x, y, color=(210, 235, 255))
-            y += 22
-        if len(a_lines) > max_lines:
-            self._blit_text(self.font_small, "...", x, y, color=(120, 150, 175))
+        rect = overlay_rect(self.width, self.height, 'answer')
+        x, y, w, h = rect.x, rect.y, rect.width, rect.height
+        lines = self._wrap_text(self.font, card['answer'], w - 56)
+        start_y = y + 128
+        self.info_scroll, self._info_page_lines, visible = visible_page(
+            lines, self.info_scroll, h - 190)
+        page = self.info_scroll // self._info_page_lines + 1
+        pages = max(1, math.ceil(len(lines) / self._info_page_lines))
+        hint = '"Aurora, read more" / "Scroll up"' if pages > 1 else '"Aurora, close answer"'
+        self._overlay_frame(rect, theme_color, f"AURORA / RESPONSE   {page:02d} / {pages:02d}", hint)
+        question = self._wrap_text(self.font_small, card['question'], w - 56)
+        for i, line in enumerate(question[:2]):
+            self._blit_text(self.font_small, line, x + 28, y + 67 + i * 19, color=(175, 148, 108))
+        for i, line in enumerate(visible):
+            self._blit_text(self.font, line, x + 28, start_y + i * 23, color=(239, 224, 197))
+        track_y = y + h - 53
+        self._draw_rect(x + 24, track_y, w - 48, 2, *theme_color, .12)
+        fraction = min(1, (self.info_scroll + len(visible)) / max(1, len(lines)))
+        self._draw_rect(x + 24, track_y, (w - 48) * fraction, 2, *theme_color, .65)
 
     def _draw_idle_indicator(self, theme_color):
-        """Shown only in empty mode — a soft breathing ring so the center
-        of the screen reads as 'idle, ready, listening' rather than a
-        dead void that looks broken."""
-        cx, cy = self.width / 2, self.height / 2 + 15
-        pulse = 0.5 + 0.5 * math.sin(self.elapsed * 1.1)
-        r, g, b = theme_color
-
-        for i, base_r in enumerate((60, 90, 120)):
-            radius = base_r + pulse * 12
-            alpha = (0.22 - i * 0.06) * (0.6 + 0.4 * pulse)
-            glColor4f(r, g, b, alpha)
-            glLineWidth(1.5)
-            self._draw_circle_2d(cx, cy, radius, segments=64, filled=False)
-
-        glColor4f(r, g, b, 0.5 + 0.3 * pulse)
-        self._draw_circle_2d(cx, cy, 5, segments=20)
+        """Reference-inspired amber particle sphere, orbital trails and hot nucleus."""
+        docked = bool(self.weather or self.weather_status or self.info_card) and self.width >= 1000
+        target = 1.0 if docked else 0.0
+        previous = getattr(self, '_core_dock', target)
+        self._core_dock = target if self.reduced_motion else previous + (target - previous) * .12
+        free = ParticleCore.layout(self.width, self.height, False)
+        side = ParticleCore.layout(self.width, self.height, True)
+        cx, cy, radius = tuple(a + (b - a) * self._core_dock for a, b in zip(free, side))
+        frame = self.particle_core.frame(self.elapsed, self.state, self.reduced_motion)
+        color = self._voice_color()
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+        try:
+            # All points of one size share a draw call (no per-particle polygons).
+            for size, halo in ((1, True), (2, True), (1, False), (2, False)):
+                glPointSize(size + 3 if halo else size)
+                glBegin(GL_POINTS)
+                for x, y, alpha, point_size in frame.particles:
+                    if point_size == size:
+                        glColor4f(*color, alpha * self.brightness * (.09 if halo else 1))
+                        glVertex2f(cx + x * radius, cy + y * radius)
+                glEnd()
+            for orbit in frame.orbits:
+                glLineWidth(1)
+                glBegin(GL_LINE_STRIP)
+                for x, y, alpha in orbit:
+                    glColor4f(*color, alpha * .95)
+                    glVertex2f(cx + x * radius, cy + y * radius)
+                glEnd()
+            # Central filaments taper into sparse orange radial streaks.
+            glLineWidth(1)
+            glBegin(GL_LINES)
+            for x, y, alpha in frame.rays:
+                glColor4f(1, .78, .3, alpha * 1.4)
+                glVertex2f(cx, cy)
+                glColor4f(*color, alpha * .8)
+                glVertex2f(cx + x * radius, cy + y * radius)
+            glEnd()
+            # Smooth radial glow, not nested opaque disks; white-hot central seed.
+            for scale, alpha in ((.4, .09), (.2, .22), (.08, .85)):
+                glBegin(GL_TRIANGLE_FAN)
+                glColor4f(1, .7 + .2 * frame.energy, .22, alpha)
+                glVertex2f(cx, cy)
+                glColor4f(*color, 0)
+                for i in range(65):
+                    angle = i * math.tau / 64
+                    glVertex2f(cx + math.cos(angle) * radius * scale,
+                               cy + math.sin(angle) * radius * scale)
+                glEnd()
+            glColor4f(1, .94, .65, .95)
+            self._draw_circle_2d(cx, cy, radius * .035, segments=32)
+        finally:
+            glPointSize(1)
+            glLineWidth(1)
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 
     def _draw_dashboard(self, theme_color):
         self._begin_ortho()
-        self._draw_background_grid()
-        self._draw_hud_reticle(theme_color)
-        if self.mode == "empty":
+        overlay_active = bool(self.weather or self.weather_status or self.info_card)
+        if self.mode in ("empty", "info") and (not overlay_active or self.width >= 1000):
             self._draw_idle_indicator(theme_color)
         if self.mode == "info":
             self._draw_info_card(theme_color)
         self._draw_top_bar(theme_color)
-        self._draw_system_panel(theme_color)
-        self._draw_event_log()
+        if self.show_diagnostics and self.width >= 1100 and self.height >= 720:
+            self._draw_system_panel(theme_color)
+            if not self.weather and not self.weather_status and self.mode != "info":
+                self._draw_event_log()
         self._draw_weather_panel(theme_color)
         self._draw_bottom_bar(theme_color)
-        self._draw_scanlines()
-        self._draw_corner_brackets()
+        if self.show_help:
+            self._draw_help(theme_color)
         self._end_ortho()
 
     # ---- main render ------------------------------------------------------
@@ -1662,14 +1882,11 @@ class Hologram:
     def render(self, pinch_amount=0.0):
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
-        self._begin_ortho()
-        self._draw_starfield()
-        self._draw_aurora_background()
-        self._end_ortho()
 
         base_color = {
             "listening": COLOR_LISTENING,
             "speaking": COLOR_SPEAKING,
+            "thinking": COLOR_THINKING,
         }.get(self.state, self._current_theme_color())
         if self.mode == "solar_system":
             base_color = (1.0, 0.75, 0.2)  # sunlight tint regardless of theme
