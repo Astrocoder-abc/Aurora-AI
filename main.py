@@ -1,14 +1,10 @@
 """
 Aurora Project — Editable Holographic Element Display
 
-Launches windowed by default; use --fullscreen for fullscreen. Press F11 to toggle windowed mode, ESC to
-quit (or close the debug window / press 'q' there).
-
-Two windows open:
-  1. The hologram dashboard — nucleus with orbiting "element" nodes, a
-     glowing projector base plate, scanline flicker, corner-bracket HUD
-     frame, and system/event-log side panels.
-  2. Webcam debug view with hand landmarks + live gesture/finger labels.
+Launches in a normal 960x640 window (smaller on compact desktops).
+Fullscreen is disabled unless explicitly launched with --fullscreen.
+Use --diagnose to print the loaded UI build, path, branch and commit.
+The camera preview is opt-in with --debug-camera.
 
 VOICE (say "Aurora" + your request):
   "Aurora, show me a carbon atom"      -> real Bohr-model diagram
@@ -130,12 +126,19 @@ def main():
     import argparse
     import traceback
     parser = argparse.ArgumentParser(description="Aurora holographic assistant")
-    parser.add_argument("--fullscreen", action="store_true")
+    display_mode = parser.add_mutually_exclusive_group()
+    display_mode.add_argument("--fullscreen", action="store_true", help="Explicitly allow fullscreen/F11")
+    display_mode.add_argument("--windowed", action="store_true", help="Normal window; fullscreen/F11 disabled (default)")
+    parser.add_argument("--diagnose", action="store_true", help="Print UI build, loaded paths and Git revision, then exit")
     parser.add_argument("--no-camera", action="store_true")
     parser.add_argument("--no-voice", action="store_true")
     parser.add_argument("--debug-camera", action="store_true")
     parser.add_argument("--camera-index", type=int, default=0)
     args = parser.parse_args()
+    from jarvis_ui.runtime import launch_report
+    print(launch_report(), flush=True)
+    if args.diagnose:
+        return 0
     global cv2, TrackerResult
     try:
         import cv2
@@ -144,6 +147,8 @@ def main():
         from jarvis_ui.face_id import FaceID
         from jarvis_ui import system_control
         from jarvis_ui.display_bridge import DisplayBridge
+        import inspect
+        print(f"Loaded renderer: {inspect.getfile(Hologram)}", flush=True)
     except (ImportError, OSError) as exc:
         print(f"Startup dependency error: {exc}\n"
               "Install requirements.txt in your virtual environment. "
@@ -152,7 +157,7 @@ def main():
     tracker, hologram, voice = DisabledTracker(), None, DisabledVoice()
     display_bridge = face_bridge = None
     try:
-        hologram = Hologram(fullscreen=args.fullscreen)
+        hologram = Hologram(fullscreen=args.fullscreen, windowed_only=not args.fullscreen)
         display_bridge = DisplayBridge(hologram)
         if not args.no_camera:
             try:
@@ -312,7 +317,7 @@ def main():
                 elif gesture == "thumbs_down":
                     hologram.trigger_flash("thumbs_down")
                     hologram.reset_orbits()
-                    hologram.log_event("RESET orbits")
+                    hologram.log_event("RESET to voice core")
                 elif gesture == "ok_sign":
                     system_control.media_play_pause()
                     hologram.trigger_flash("ok_sign")

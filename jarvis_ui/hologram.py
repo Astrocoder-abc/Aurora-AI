@@ -29,6 +29,7 @@ import threading
 
 from jarvis_ui.particle_core import ParticleCore
 from jarvis_ui.overlays import overlay_rect, visible_page
+from jarvis_ui.runtime import UI_BUILD, window_size
 
 try:
     import psutil
@@ -281,7 +282,7 @@ SPEED_MIN, SPEED_MAX = -180, 180
 
 
 class Hologram:
-    def __init__(self, fullscreen=False, windowed_size=(1200, 800)):
+    def __init__(self, fullscreen=False, windowed_size=(960, 640), windowed_only=True):
         pygame.init()
         try:
             if not pygame.mixer.get_init():
@@ -303,8 +304,9 @@ class Hologram:
         self._stats_sample_time = -1.0
         self._stats_cache = []
         self.windowed_size = windowed_size
-        self.fullscreen = fullscreen
-        self._set_display_mode(fullscreen)
+        self.windowed_only = windowed_only
+        self.fullscreen = bool(fullscreen and not windowed_only)
+        self._set_display_mode(self.fullscreen)
 
         # Bahnschrift/Agency FB have a geometric, technical HUD look closer
         # to sci-fi interfaces than a plain monospace font — both ship
@@ -402,14 +404,14 @@ class Hologram:
     # ---- display mode / fullscreen -----------------------------------------
 
     def _set_display_mode(self, fullscreen):
+        fullscreen = fullscreen and not getattr(self, "windowed_only", True)
         if fullscreen:
             info = pygame.display.Info()
             self.width, self.height = info.current_w, info.current_h
             flags = DOUBLEBUF | OPENGL | FULLSCREEN
         else:
             info = pygame.display.Info()
-            self.width = min(self.windowed_size[0], max(640, info.current_w - 80))
-            self.height = min(self.windowed_size[1], max(480, info.current_h - 100))
+            self.width, self.height = window_size((info.current_w, info.current_h), self.windowed_size)
             flags = DOUBLEBUF | OPENGL
 
         try:
@@ -425,7 +427,7 @@ class Hologram:
             pygame.display.gl_set_attribute(pygame.GL_MULTISAMPLEBUFFERS, 0)
             pygame.display.gl_set_attribute(pygame.GL_MULTISAMPLESAMPLES, 0)
             pygame.display.set_mode((self.width, self.height), flags)
-        pygame.display.set_caption("AURORA")
+        pygame.display.set_caption(f"AURORA — Amber Core | {UI_BUILD}")
         self._init_gl_state()
 
     def _init_gl_state(self):
@@ -463,6 +465,9 @@ class Hologram:
         glTranslatef(0.0, 0.0, -6)
 
     def toggle_fullscreen(self):
+        if self.windowed_only:
+            self.log_event("WINDOWED: fullscreen disabled for this launch")
+            return
         self.fullscreen = not self.fullscreen
         self._set_display_mode(self.fullscreen)
 
@@ -479,7 +484,7 @@ class Hologram:
                 if event.key == pygame.K_F11:
                     self.toggle_fullscreen()
                 elif event.key == pygame.K_1:
-                    self.reset_orbits()
+                    self.load_demo()
                 elif event.key == pygame.K_2:
                     self.load_atom("carbon")
                 elif event.key == pygame.K_3:
@@ -847,7 +852,7 @@ class Hologram:
         orbit["speed"] = max(SPEED_MIN, min(SPEED_MAX, orbit["speed"] + yaw_norm * rate * dt * 60.0))
 
     def reset_orbits(self):
-        self.load_demo()
+        self.show_core()
 
     # ---- per-frame update --------------------------------------------------
 
@@ -1499,7 +1504,7 @@ class Hologram:
         if self.width >= 1000:
             self._blit_text(self.font_small, "VOICE INTERFACE / " + ("READY" if self.voice_available else "OFFLINE"),
                             32, self.height - 40, color=(90, 77, 57))
-            self._blit_text(self.font_small, "F11 FULLSCREEN  /  ESC EXIT", self.width - 255,
+            self._blit_text(self.font_small, "WINDOWED  /  ESC EXIT" if self.windowed_only else "F11 WINDOW  /  ESC EXIT", self.width - 255,
                             self.height - 40, color=(90, 77, 57))
         transcript = self.last_heard or '"Aurora, show me the solar system"'
         self._center_text(self.font_small, self._fit_text(self.font_small, transcript, self.width - 100),

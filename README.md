@@ -34,13 +34,18 @@ the same environment; this project uses `opencv-contrib-python` for LBPH.
 python main.py
 ```
 
-Starts windowed. Camera and voice are attempted; unavailable camera or voice
+Starts in a normal **960×640 window**, reduced to leave desktop/taskbar space.
+Fullscreen and F11 switching are disabled unless you explicitly pass `--fullscreen`.
+The title bar identifies this build as **Amber Core | amber-windowed-v2**.
+Camera and voice are attempted; unavailable camera or voice
 setup is reported in the dashboard event log. Missing core dependencies are
 reported in the terminal with a nonzero exit code.
 
 ```sh
 python main.py --no-camera --no-voice  # visual-only troubleshooting
-python main.py --fullscreen
+python main.py --windowed             # explicitly lock normal-window mode
+python main.py --diagnose             # identify the code this folder will launch
+python main.py --fullscreen           # opt in to fullscreen and F11 switching
 python main.py --debug-camera         # optional webcam preview window
 python main.py --camera-index 1       # choose another camera
 python main.py --help
@@ -83,7 +88,7 @@ Paths do not depend on your terminal's current working directory.
 | `3` | Solar system |
 | `Tab` | Cycle color theme |
 | `R` | Reset zoom, pan and roll |
-| `F11` | Toggle fullscreen |
+| `F11` | Toggle fullscreen only when launched with `--fullscreen` |
 | `H` | Toggle help overlay |
 | `Esc` | Close help first, otherwise exit |
 | `q` in webcam preview | Exit when `--debug-camera` is enabled |
@@ -193,7 +198,7 @@ geolocation lookup is performed.
 - Hold a fist and move closer/further to zoom; two-hand spreading also zooms.
 - Swipe left/right to change theme; up/down to change brightness.
 - Peace sign saves a webcam snapshot in `snapshots/`.
-- Thumbs down resets the display; OK sign toggles media playback on Windows.
+- Thumbs down returns to the amber voice core; OK sign toggles media playback on Windows.
 
 ## Voice and optional general chat
 
@@ -255,3 +260,28 @@ Windows/ADB integration still need testing on your machine. The sandbox lacks
 OpenGL system support and its live Open-Meteo request failed with a network
 error; no successful live reading or OpenGL screenshot is claimed here. The
 software preview above is for design review only.
+
+
+## If you still see the old blue dashboard
+
+The wave background and permanently visible blue system/event panels identify
+an older rendering path. The amber build does not draw those in its normal view.
+Close any running Aurora process, update the **Arena branch** in the folder you
+actually launch, and stop if Git reports conflicting local changes:
+
+```sh
+git fetch origin
+git switch arena/01a07f7e-aurora-ai
+git pull --ff-only origin arena/01a07f7e-aurora-ai
+python main.py --diagnose
+python main.py --windowed
+```
+
+Do not pull the Arena branch into `main`. Confirm the switch succeeds before
+continuing. Don't discard local changes to get past an error.
+
+The report must say `Aurora UI build: amber-windowed-v2`. It also prints the
+project folder, Python executable, UI file, branch and commit. An unrecognized
+`--diagnose`/`--windowed` option indicates that terminal is still launching an
+older `main.py`. For a low-load visual check, use
+`python main.py --windowed --no-camera --no-voice` first.

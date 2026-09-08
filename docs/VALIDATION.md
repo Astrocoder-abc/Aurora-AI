@@ -35,7 +35,8 @@ Use a terminal so any traceback stays visible. Do not test phone calls, PIN entr
 or app launches unless you intend the corresponding action on your own device.
 
 1. **Graphics only:** `python main.py --no-camera --no-voice`.
-   The amber core should animate and show voice offline. Toggle F11 twice. Close
+   The amber core should animate and show voice offline. F11 must leave the
+   window unchanged in default/windowed mode. Close
    the window; the process should exit without a second cleanup exception.
 2. **Voice:** `python main.py --no-camera`. Say “Aurora” alone, then “show me a
    carbon atom” during the listening window. Or say the entire request together.

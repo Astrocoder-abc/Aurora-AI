@@ -757,8 +757,8 @@ class VoiceAssistant:
             return True
 
         if "reset" in t and ("display" in t or "hologram" in t or "diagram" in t):
-            self.hologram.load_demo()
-            self._on_log("DISPLAY: reset to demo")
+            self.hologram.show_core()
+            self._on_log("DISPLAY: reset to voice core")
             self._speak("Resetting the display")
             return True
 

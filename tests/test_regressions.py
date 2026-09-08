@@ -46,7 +46,7 @@ class DashboardTests(unittest.TestCase):
             self.assertEqual(self.hud.selected_index, expected)
 
     def test_keyboard_shortcuts_dispatch(self):
-        for key, method, args in [('K_1', 'reset_orbits', ()),
+        for key, method, args in [('K_1', 'load_demo', ()),
                                   ('K_2', 'load_atom', ('carbon',)),
                                   ('K_3', 'load_solar_system', ()),
                                   ('K_TAB', 'cycle_theme', (1,))]:
@@ -148,6 +148,28 @@ class DashboardTests(unittest.TestCase):
         self.assertLess(self.hud.info_scroll, 9999)
         self.assertGreater(self.hud.info_scroll, 0)
 
+    def test_windowed_mode_blocks_f11_and_fullscreen_flag(self):
+        self.hud.windowed_only = True
+        self.hud.fullscreen = False
+        self.hud.log_event = MagicMock()
+        self.hud.toggle_fullscreen()
+        self.assertFalse(self.hud.fullscreen)
+        self.pygame.display.set_mode.assert_not_called()
+        self.pygame.display.Info.return_value = types.SimpleNamespace(current_w=1366, current_h=768)
+        self.hud.windowed_size = (960, 640)
+        self.hud._init_gl_state = MagicMock()
+        self.hud._set_display_mode(True)
+        size, flags = self.pygame.display.set_mode.call_args.args
+        self.assertEqual(size, (960, 628))
+        self.assertFalse(flags & self.module.FULLSCREEN)
+
+    def test_reset_returns_to_amber_core_not_legacy_demo(self):
+        self.hud.show_core = MagicMock()
+        self.hud.load_demo = MagicMock()
+        self.hud.reset_orbits()
+        self.hud.show_core.assert_called_once()
+        self.hud.load_demo.assert_not_called()
+
     def test_msaa_fallback_retries_without_antialiasing(self):
         self.pygame.display.Info.return_value = types.SimpleNamespace(current_w=1920, current_h=1080)
         self.pygame.error = RuntimeError
@@ -178,6 +200,22 @@ class StartupTests(unittest.TestCase):
             self.assertEqual(Path(phone_control.PIN_FILE).parent, ROOT)
         finally:
             sys.path.pop(0)
+
+    def test_diagnose_does_not_need_hardware_dependencies(self):
+        result = subprocess.run([sys.executable, str(ROOT / 'main.py'), '--diagnose'],
+                                cwd='/tmp', capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('amber-windowed-v2', result.stdout)
+        self.assertIn(str(ROOT / 'jarvis_ui' / 'hologram.py'), result.stdout)
+
+    def test_window_fits_desktop_without_minimum_size_overflow(self):
+        from jarvis_ui.runtime import window_size
+        for desktop in ((1920, 1080), (1366, 768), (1024, 768), (800, 600), (640, 480)):
+            width, height = window_size(desktop)
+            self.assertLessEqual(width, desktop[0] - 100)
+            self.assertLessEqual(height, desktop[1] - 140)
+            self.assertLessEqual(width, 960)
+            self.assertLessEqual(height, 640)
 
     def test_disabled_voice_can_speak_and_stop(self):
         spec = importlib.util.spec_from_file_location('aurora_main', ROOT / 'main.py')
