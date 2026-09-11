@@ -1292,19 +1292,44 @@ class Hologram:
             y += 90
         glEnd()
 
+        # starfield parallax: the backdrop drifts gently against hand rotation
+        ox = -self.rotation_y * 1.4
+        oy = self.rotation_x * 1.4
+        placed = [((fx * self.width + ox) % self.width, (fy * self.height + oy) % self.height)
+                  for fx, fy, _phase, _size in self.stars]
+
         glBegin(GL_LINES)
         for a, b in self.star_links:
-            ax, ay = self.stars[a][0] * self.width, self.stars[a][1] * self.height
-            bx, by = self.stars[b][0] * self.width, self.stars[b][1] * self.height
             glColor4f(0.55, 0.65, 0.9, 0.05)
-            glVertex2f(ax, ay); glVertex2f(bx, by)
+            glVertex2f(*placed[a]); glVertex2f(*placed[b])
         glEnd()
 
-        for fx, fy, phase, size in self.stars:
+        for (px, py), (_fx, _fy, phase, size) in zip(placed, self.stars):
             twinkle = 1.0 if self.reduced_motion else \
                 0.35 + 0.65 * max(0.0, math.sin(self.elapsed * 1.2 + phase))
             glColor4f(0.82, 0.88, 1.0, 0.65 * twinkle)
-            self._draw_circle_2d(fx * self.width, fy * self.height, size * 0.7)
+            self._draw_circle_2d(px, py, size * 0.7)
+
+        # occasional shooting star on a deterministic 7-second cycle
+        if not self.reduced_motion:
+            cycle = int(self.elapsed // 7)
+            phase = self.elapsed - cycle * 7
+            if phase < 1.1:
+                rng = random.Random(cycle)
+                sx = rng.uniform(.1, .9) * self.width
+                sy = rng.uniform(.08, .5) * self.height
+                direction = 1 if cycle % 2 else -1
+                dx = rng.uniform(.5, .9) * 300 * direction
+                dy = rng.uniform(.25, .55) * 160
+                head = phase / 1.1
+                hx, hy = sx + dx * head, sy + dy * head
+                glBegin(GL_LINES)
+                for i in range(6):
+                    fade_tail = (1 - i / 6) * (1 - head * .5) * .45
+                    glColor4f(0.8, 0.9, 1.0, fade_tail)
+                    glVertex2f(hx - dx * .10 * i / 6, hy - dy * .10 * i / 6)
+                    glVertex2f(hx - dx * .10 * (i + 1) / 6, hy - dy * .10 * (i + 1) / 6)
+                glEnd()
 
     def _draw_rect(self, x, y, w, h, r, g, b, a, filled=True):
         glBegin(GL_QUADS if filled else GL_LINE_LOOP)
@@ -1881,19 +1906,21 @@ class Hologram:
         fade = self._materialize_progress()
         positions = self._graph_positions()
 
-        # soft multi-hue nebula haze behind the core (additive)
+        # soft multi-hue nebula haze behind the core (additive), slowly drifting
         glBlendFunc(GL_SRC_ALPHA, GL_ONE)
-        for (r, g, b), dx, dy, scale in (((1.0, .3, .8), -.4, -.15, 1.2),
-                                         ((.5, .35, 1.0), .4, -.3, 1.3),
-                                         ((.2, .7, 1.0), .1, .4, 1.1)):
+        for i, ((r, g, b), dx, dy, scale) in enumerate((((1.0, .3, .8), -.4, -.15, 1.2),
+                                                        ((.5, .35, 1.0), .4, -.3, 1.3),
+                                                        ((.2, .7, 1.0), .1, .4, 1.1))):
+            drift_x = 0 if self.reduced_motion else .08 * math.sin(self.elapsed * .06 + i * 2.1)
+            drift_y = 0 if self.reduced_motion else .08 * math.cos(self.elapsed * .05 + i * 1.7)
             glBegin(GL_TRIANGLE_FAN)
             glColor4f(r, g, b, 0.22 * fade)
             glVertex2f(cx, cy)
             glColor4f(r, g, b, 0)
-            for i in range(49):
-                angle = i * math.tau / 48
-                glVertex2f(cx + dx * radius + math.cos(angle) * radius * scale,
-                           cy + dy * radius + math.sin(angle) * radius * scale)
+            for k in range(49):
+                angle = k * math.tau / 48
+                glVertex2f(cx + (dx + drift_x) * radius + math.cos(angle) * radius * scale,
+                           cy + (dy + drift_y) * radius + math.sin(angle) * radius * scale)
             glEnd()
         # white swirl arms sweeping around the nucleus, like the reference
         if not self.reduced_motion:
@@ -1908,6 +1935,18 @@ class Hologram:
                     glColor4f(0.9, 0.95, 1.0, (1 - t) * 0.45 * fade)
                     glVertex2f(cx + math.cos(angle) * rr, cy + math.sin(angle) * rr * 0.9)
                 glEnd()
+        # light packets travelling outward along the gear-node spokes
+        for index, (node, (x, y)) in enumerate(zip(GRAPH_NODES, positions)):
+            if not node[4]:
+                continue
+            r, g, b = GRAPH_FAMILIES[node[3]]
+            for k in range(2):
+                progress = .5 if self.reduced_motion else \
+                    (self.elapsed * .10 + index * .17 + k * .5) % 1.0
+                px = cx + (x - cx) * progress
+                py = cy + (y - cy) * progress
+                glColor4f(r, g, b, math.sin(progress * math.pi) * .5 * fade)
+                self._draw_circle_2d(px, py, 2.2, segments=8)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 
         # connector lines: hub spokes through gear nodes + chained links,
@@ -1954,10 +1993,11 @@ class Hologram:
                     glVertex2f(x + math.cos(a) * 6, y + math.sin(a) * 6)
                     glVertex2f(x + math.cos(a) * 13, y + math.sin(a) * 13)
                 glEnd()
+                ring_r = 17 + (0 if self.reduced_motion else 1.5 * math.sin(self.elapsed * 2 + index))
                 for d in range(14):
                     a = d * math.tau / 14
                     glColor4f(r, g, b, 0.55 * glow)
-                    self._draw_circle_2d(x + math.cos(a) * 17, y + math.sin(a) * 17, 1.2, segments=6)
+                    self._draw_circle_2d(x + math.cos(a) * ring_r, y + math.sin(a) * ring_r, 1.2, segments=6)
                 glColor4f(min(1, r + .3), min(1, g + .3), min(1, b + .3), 0.95 * glow)
                 self._draw_circle_2d(x, y, 2.6, segments=10)
             else:
@@ -1993,7 +2033,9 @@ class Hologram:
         cx, cy, radius = tuple(a + (b - a) * self._core_dock for a, b in zip(free, side))
         motion_time, energy = self.core_animation.advance(self.elapsed, self.state, self.reduced_motion)
         frame = self.particle_core.frame(motion_time, self.state,
-                                         quality=self.particle_quality, energy=energy)
+                                         quality=self.particle_quality, energy=energy,
+                                         view_yaw=math.radians(getattr(self, 'rotation_y', 0.0)),
+                                         view_pitch=math.radians(getattr(self, 'rotation_x', 0.0)) * 0.6)
         color = self._voice_color()
         glBlendFunc(GL_SRC_ALPHA, GL_ONE)
         try:

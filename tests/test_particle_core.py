@@ -59,6 +59,17 @@ class ParticleCoreTests(unittest.TestCase):
         self.assertEqual(len(colors), len(lines)*2)
         self.assertTrue(all(math.isfinite(v) for v in lines))
 
+    def test_hand_rotation_offsets_turn_the_nebula_core(self):
+        core = ParticleCore()
+        straight = core.frame(4)
+        turned = core.frame(4, view_yaw=1.2, view_pitch=0.3)
+        self.assertNotEqual(straight.positions_3d, turned.positions_3d)
+        self.assertNotEqual(straight.particles, turned.particles)
+        # reduced motion still honors the user's own hand rotation
+        frozen_a = core.frame(4, reduced_motion=True)
+        frozen_b = core.frame(9, reduced_motion=True, view_yaw=1.2)
+        self.assertNotEqual(frozen_a.positions_3d, frozen_b.positions_3d)
+
     def test_weather_dock_keeps_core_left_and_scales_down(self):
         for width, height in ((640, 480), (1200, 800), (1920, 1080)):
             cx, cy, radius = ParticleCore.layout(width, height)

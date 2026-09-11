@@ -251,6 +251,11 @@ def main():
     hud.log_event("CAMERA OFF: no device")
     snapshot(canvas, hud, ROOT / 'docs' / 'dashboard-preview.png')
 
+    # hand-rotation pose: the core must visibly turn with the gestures
+    hud.rotation_y, hud.rotation_x = 55, 18
+    snapshot(canvas, hud, ROOT / 'docs' / 'dashboard-rotated-preview.png')
+    hud.rotation_y, hud.rotation_x = 0, 0
+
     hud.show_weather({
         'location': 'Ghaziabad, Uttar Pradesh, India', 'temp_c': 30,
         'condition': 'cloudy', 'description': 'Overcast', 'humidity': 65,

@@ -61,14 +61,16 @@ class ParticleCore:
         cr, sr = math.cos(rotation), math.sin(rotation)
         return x * cr + z * sr, y, -x * sr + z * cr
 
-    def frame(self, elapsed, state='idle', reduced_motion=False, quality='balanced', energy=None):
+    def frame(self, elapsed, state='idle', reduced_motion=False, quality='balanced', energy=None,
+              view_yaw=0.0, view_pitch=0.0):
         t = 0.0 if reduced_motion else elapsed
         if quality not in ('performance', 'balanced', 'cinematic'):
             raise ValueError('Unknown particle quality')
         if energy is None:
             energy = {'idle': .24, 'listening': .52, 'thinking': .78, 'speaking': 1}.get(state, .24)
         energy = max(0, min(1, energy))
-        yaw, tilt = t * .11, .44 + .12 * math.sin(t * .13)
+        # Hand-gesture rotation adds on top of the slow autonomous turn.
+        yaw, tilt = t * .11 + view_yaw, .44 + .12 * math.sin(t * .13) + view_pitch
         ca, sa, ct, st = math.cos(yaw), math.sin(yaw), math.cos(tilt), math.sin(tilt)
         def view(point):
             x, y, z = point

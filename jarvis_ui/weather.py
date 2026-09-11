@@ -7,6 +7,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from .paths import PROJECT_ROOT
+
 
 class WeatherError(Exception):
     def __init__(self, code, message):
@@ -77,8 +79,21 @@ def condition_for(code, is_day=1):
     raise WeatherError('invalid_data', 'Weather provider returned an unknown condition code.')
 
 
+def configured_default_city():
+    """Fallback city so 'Aurora, what's the weather?' works hands-free:
+    environment first, then the optional weather_city.txt at the project
+    root (personal data, like contacts.json / phone_pin.txt)."""
+    env = os.getenv('AURORA_WEATHER_CITY', '').strip()
+    if env:
+        return env
+    try:
+        return (PROJECT_ROOT / 'weather_city.txt').read_text(encoding='utf-8').strip()
+    except OSError:
+        return ''
+
+
 def fetch_current_weather(city=None, get_json=None):
-    city = (city or os.getenv('AURORA_WEATHER_CITY', '')).strip()
+    city = (city or configured_default_city()).strip()
     if not city:
         raise WeatherError('location_required', 'Which city? Say Aurora, weather in Delhi, or name your city.')
     get_json = get_json or _get_json

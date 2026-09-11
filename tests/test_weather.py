@@ -1,8 +1,10 @@
 import copy
 import os
 import sys
+import tempfile
 import types
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError, URLError
 
@@ -34,10 +36,41 @@ class WeatherTests(unittest.TestCase):
                 self.assertEqual(weather.extract_location(phrase), expected)
 
     def test_missing_location_does_not_guess(self):
-        with patch.dict(os.environ, {'AURORA_WEATHER_CITY': ''}):
-            with self.assertRaises(weather.WeatherError) as error:
-                weather.fetch_current_weather(get_json=Mock())
-            self.assertEqual(error.exception.code, 'location_required')
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {'AURORA_WEATHER_CITY': ''}), \
+                    patch.object(weather, 'PROJECT_ROOT', Path(tmp)):
+                with self.assertRaises(weather.WeatherError) as error:
+                    weather.fetch_current_weather(get_json=Mock())
+                self.assertEqual(error.exception.code, 'location_required')
+
+    def test_default_city_file_resolves_hands_free(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / 'weather_city.txt').write_text('Ghaziabad\n', encoding='utf-8')
+            with patch.dict(os.environ, {'AURORA_WEATHER_CITY': ''}), \
+                    patch.object(weather, 'PROJECT_ROOT', Path(tmp)):
+                fetch = Mock(side_effect=[{'results': [copy.deepcopy(PLACE)]}, copy.deepcopy(DATA)])
+                result = weather.fetch_current_weather(get_json=fetch)
+        self.assertEqual(fetch.call_args_list[0].args[1]['name'], 'Ghaziabad')
+        self.assertIn('India', result['location'])
+
+    def test_real_open_meteo_payload_parses(self):
+        # Captured live from Open-Meteo on 2026-09-11 (geocoding + forecast),
+        # so the parser is checked against the provider's real contract.
+        geo = {'results': [{'id': 1271308, 'name': 'Ghaziabad', 'latitude': 28.66535,
+                           'longitude': 77.43915, 'country_code': 'IN', 'country': 'India',
+                           'admin1': 'Uttar Pradesh'}]}
+        forecast = {'latitude': 28.646748, 'longitude': 77.48004, 'timezone': 'Asia/Kolkata',
+                    'current': {'time': '2026-09-11T11:45', 'interval': 900,
+                                'temperature_2m': 27.1, 'relative_humidity_2m': 90,
+                                'weather_code': 53, 'wind_speed_10m': 7.4, 'is_day': 1}}
+        fetch = Mock(side_effect=[geo, forecast])
+        result = weather.fetch_current_weather('Ghaziabad', get_json=fetch)
+        self.assertEqual(result['temp_c'], 27.1)
+        self.assertEqual(result['humidity'], 90)
+        self.assertEqual(result['condition'], 'rain')  # WMO 53 = drizzle
+        self.assertEqual(result['timezone'], 'Asia/Kolkata')
+        self.assertEqual(result['updated_at'], '2026-09-11 11:45')
+        self.assertIn('Uttar Pradesh', result['location'])
 
     def test_configured_default(self):
         with patch.dict(os.environ, {'AURORA_WEATHER_CITY': 'Ghaziabad'}):

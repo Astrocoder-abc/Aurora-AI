@@ -132,9 +132,12 @@ python main.py --windowed --graphics performance
 python main.py --windowed --graphics cinematic
 ```
 
-Voice energy/color changes are eased rather than snapped. “Reduce motion” holds
-the current particle pose; “resume animation” continues from there instead of
-jumping to a different frame. Quality changes retain shared particle positions.
+Voice energy/color changes are eased rather than snapped. Moving your hand
+rotates the nebula core itself — yaw/pitch on top of the slow autonomous turn —
+so the constellation view answers gestures exactly like the atom and solar
+scenes. “Reduce motion” holds the current particle pose but still honors your
+hand rotation; “resume animation” continues from there instead of jumping to a
+different frame. Quality changes retain shared particle positions.
 All quality levels remain procedural, not video/image playback. Actual frame
 rate still depends on camera workload and your graphics driver.
 
@@ -208,8 +211,9 @@ internet access). Try:
 - “Aurora, what's the weather like in Delhi today?”
 - “Aurora, close the weather.”
 
-No city is silently guessed. For “weather here” or a request without a city,
-optionally configure a default before starting:
+No city is silently guessed from nothing. For “weather here” or a request
+without a city, Aurora uses your configured default — this repo ships
+`weather_city.txt` (Ghaziabad); edit it, or set the environment instead:
 
 ```powershell
 # Windows PowerShell
