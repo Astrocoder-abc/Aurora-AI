@@ -24,8 +24,12 @@ import asyncio
 import ast
 import difflib
 import operator
+import math
 import os
+
+from .paths import PROJECT_ROOT
 import random
+import queue
 import re
 import tempfile
 import threading
@@ -35,9 +39,11 @@ import webbrowser
 import speech_recognition as sr
 import pygame
 
-from jarvis_ui.hologram import ELEMENTS, SHAPES, SHAPE_ALIASES, US_STATE_POSITIONS, STAR_SYSTEMS
-from jarvis_ui import system_control
-from jarvis_ui import phone_control
+from .hologram import ELEMENTS, SHAPES, SHAPE_ALIASES, US_STATE_POSITIONS, STAR_SYSTEMS
+from . import system_control
+from . import phone_control
+from .timers import TimerManager
+from .weather import WeatherError, extract_location, fetch_current_weather
 
 try:
     from groq import Groq
@@ -78,7 +84,7 @@ def find_wake_word(text):
             before = " ".join(words[:i])
             return True, (after if after else before)
     return False, None
-API_KEY_FILE = os.path.join(os.path.dirname(__file__), "..", "api_key.txt")
+API_KEY_FILE = os.path.join(str(PROJECT_ROOT), "api_key.txt")
 
 # groq/compound does live web search internally, but that reasoning step
 # adds real latency even for questions that don't need it — a plain "hi"
@@ -138,27 +144,34 @@ _SAFE_OPS = {
 
 
 def _safe_eval_node(node):
-    """Evaluates only basic arithmetic — no function calls, no names, no
-    attribute access — so this is safe to run on raw speech text, unlike
-    a bare eval()."""
-    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
-        return node.value
-    if isinstance(node, ast.BinOp) and type(node.op) in _SAFE_OPS:
-        return _SAFE_OPS[type(node.op)](_safe_eval_node(node.left), _safe_eval_node(node.right))
-    if isinstance(node, ast.UnaryOp) and type(node.op) in _SAFE_OPS:
-        return _SAFE_OPS[type(node.op)](_safe_eval_node(node.operand))
-    raise ValueError("unsupported expression")
+    if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+        result = node.value
+    elif isinstance(node, ast.BinOp) and type(node.op) in _SAFE_OPS:
+        left, right = _safe_eval_node(node.left), _safe_eval_node(node.right)
+        if isinstance(node.op, ast.Pow) and abs(right) > 12:
+            raise ValueError("exponent too large")
+        result = _SAFE_OPS[type(node.op)](left, right)
+    elif isinstance(node, ast.UnaryOp) and type(node.op) in _SAFE_OPS:
+        result = _SAFE_OPS[type(node.op)](_safe_eval_node(node.operand))
+    else:
+        raise ValueError("unsupported expression")
+    if type(result) not in (int, float) or abs(result) > 1e15 or not math.isfinite(result):
+        raise ValueError("result outside calculator limits")
+    return result
 
 
 def try_calculate(text):
     """Returns (result, display_expression) or None if the text doesn't
     look like a calculable expression."""
+    if len(text) > 200:
+        return None
     t = text.lower()
 
     m = re.search(r"([\d.]+)\s*percent of\s*([\d.]+)", t)
     if m:
         a, b = float(m.group(1)), float(m.group(2))
-        return (a / 100 * b), f"{a}% of {b}"
+        result = a / 100 * b
+        return (result, f"{a}% of {b}") if math.isfinite(result) and abs(result) <= 1e15 else None
 
     expr = t
     expr = re.sub(r"\bplus\b", "+", expr)
@@ -171,6 +184,8 @@ def try_calculate(text):
         return None
     try:
         tree = ast.parse(expr, mode="eval")
+        if sum(1 for _ in ast.walk(tree)) > 64:
+            return None
         return _safe_eval_node(tree.body), expr
     except Exception:
         return None
@@ -202,13 +217,13 @@ class VoiceAssistant:
     def __init__(self, hologram, face_id, on_log=None):
         self.hologram = hologram
         self.face_id = face_id
-        self.state = "idle"       # idle | listening | speaking
+        self.state = "idle"       # idle | listening | thinking | speaking
         self.last_heard = ""
         self.last_reply = ""
         self.enabled = False
 
         external_log = on_log or (lambda text: None)
-        log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "voice_debug.log")
+        log_file_path = os.path.join(str(PROJECT_ROOT), "voice_debug.log")
 
         def combined_log(text):
             print(text, flush=True)
@@ -225,22 +240,25 @@ class VoiceAssistant:
         self._running = False
         self._thread = None
         self.history = []
-        self.active_timers = []  # list of dicts: label, ends_at (time.time())
+        self.timers = TimerManager(self._timer_finished)
+        self._speech_queue = queue.Queue(maxsize=20)
+        self._mic_lock = threading.Lock()
         self.last_weather_error = None
         self.pending_enrollment_name = None  # set by voice, consumed by main.py's camera loop
 
         self.api_key = load_api_key()
         if Groq is None:
-            self._on_log("VOICE: 'groq' package not installed — voice AI disabled")
+            self._on_log("VOICE: 'groq' package not installed — general chat unavailable; local voice commands remain available")
             self.client = None
         elif not self.api_key:
-            self._on_log("VOICE: no API key found (api_key.txt or GROQ_API_KEY) — voice AI disabled")
+            self._on_log("VOICE: no API key found (api_key.txt or GROQ_API_KEY) — general chat unavailable; local voice commands remain available")
             self.client = None
         else:
-            self.client = Groq(api_key=self.api_key)
+            self.client = Groq(api_key=self.api_key, timeout=20, max_retries=1)
 
         try:
             self.recognizer = sr.Recognizer()
+            self.recognizer.operation_timeout = 8
             mic_names = sr.Microphone.list_microphone_names()
             self._on_log(f"VOICE: found {len(mic_names)} audio input device(s):")
             for i, name in enumerate(mic_names):
@@ -278,7 +296,7 @@ class VoiceAssistant:
             self._on_log("VOICE: no TTS backend available — replies will be text-only")
 
     def _load_mic_index(self):
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "mic_index.txt")
+        path = os.path.join(str(PROJECT_ROOT), "mic_index.txt")
         if os.path.exists(path):
             try:
                 with open(path, "r") as f:
@@ -300,7 +318,7 @@ class VoiceAssistant:
                 return
 
     def start(self):
-        if not self.client or not self.microphone:
+        if self._running or not self.microphone:
             return
         self.enabled = True
         self._running = True
@@ -309,16 +327,26 @@ class VoiceAssistant:
         self._on_log("VOICE: listening for wake word 'Aurora'")
 
     def stop(self):
+        self.enabled = False
         self._running = False
+        self.timers.cancel_all()
+        try:
+            if pygame.mixer.get_init():
+                pygame.mixer.music.stop()
+        except pygame.error:
+            pass
 
     # ---- speech output -----------------------------------------------------
 
     def speak_now(self, text):
-        """Public entry point for other threads (main.py's camera loop)
-        to trigger speech — e.g. greeting someone the moment face
-        recognition identifies them. Safe to call cross-thread the same
-        way the mid-speech 'stop' watcher already does."""
-        self._speak(text)
+        """Queue greetings/timer notices; never block the graphics thread on TTS."""
+        if not self.enabled:
+            self._on_log(text)
+            return
+        try:
+            self._speech_queue.put_nowait(text)
+        except queue.Full:
+            self._on_log("VOICE: notification queue full; skipped speech")
 
     def _speak(self, text):
         text = clean_for_speech(text)
@@ -349,7 +377,9 @@ class VoiceAssistant:
         fd, path = tempfile.mkstemp(suffix=".mp3")
         os.close(fd)
         try:
-            asyncio.run(_edge_tts_save(text, path))
+            asyncio.run(asyncio.wait_for(_edge_tts_save(text, path), timeout=15))
+            if not self._running:
+                return True
             pygame.mixer.music.load(path)
             pygame.mixer.music.play()
 
@@ -361,7 +391,7 @@ class VoiceAssistant:
             stop_watcher = threading.Thread(target=self._watch_for_stop, daemon=True)
             stop_watcher.start()
 
-            while pygame.mixer.music.get_busy():
+            while self._running and pygame.mixer.music.get_busy():
                 time.sleep(0.05)
             return True
         except Exception as e:
@@ -377,8 +407,8 @@ class VoiceAssistant:
         """Runs only while audio is playing. Listens for a short phrase and
         interrupts playback immediately if it hears 'stop'."""
         try:
-            while pygame.mixer.music.get_busy():
-                with self.microphone as source:
+            while self._running and pygame.mixer.music.get_busy():
+                with self._mic_lock, self.microphone as source:
                     audio = self.recognizer.listen(source, timeout=1.5, phrase_time_limit=2)
                 text = self.recognizer.recognize_google(audio).lower()
                 if "stop" in text or "aurora" in text:
@@ -390,26 +420,66 @@ class VoiceAssistant:
 
     # ---- timers -----------------------------------------------------------
 
+    def _timer_finished(self, label):
+        self._on_log(f"TIMER: {label} finished")
+        self.speak_now(f"{label} is up!" if label else "Timer's up!")
+
     def _start_timer(self, seconds, label):
-        ends_at = time.time() + seconds
-        self.active_timers.append({"label": label, "ends_at": ends_at})
-
-        def run():
-            time.sleep(seconds)
-            self.active_timers[:] = [t for t in self.active_timers if t["ends_at"] != ends_at]
-            self._on_log(f"TIMER: {label} finished")
-            self._speak(f"{label} is up!" if label else "Timer's up!")
-
-        threading.Thread(target=run, daemon=True).start()
+        self.timers.start(seconds, label)
         self._on_log(f"VOICE: timer started — {label} ({seconds}s)")
 
     # ---- local (no-API) commands, including hologram diagrams -------------
 
     def _handle_local_command(self, text):
-        t = text.lower()
+        t = text.lower().strip()
+        if "weather" in t:
+            return self._handle_weather(t)
+        quality_commands = {"performance mode": "performance", "lower graphics": "performance",
+                            "balanced graphics": "balanced", "balanced quality": "balanced",
+                            "cinematic mode": "cinematic", "higher graphics": "cinematic"}
+        if t in quality_commands:
+            quality = quality_commands[t]
+            self.hologram.set_particle_quality(quality)
+            self._speak(f"Graphics set to {quality}")
+            return True
+        if t in ("show diagnostics", "hide diagnostics"):
+            self.hologram.show_diagnostics = t.startswith("show")
+            self._speak("Diagnostics " + ("shown" if self.hologram.show_diagnostics else "hidden"))
+            return True
+        if t in ("reduce motion", "less motion", "resume animation"):
+            self.hologram.reduced_motion = t != "resume animation"
+            self._speak("Motion reduced" if self.hologram.reduced_motion else "Animation resumed")
+            return True
+        if t in ("show core", "show the core", "close display", "close the display"):
+            self.hologram.show_core()
+            self._speak("Returning to the core")
+            return True
+        if t in ("help", "show help", "show commands", "what can you do"):
+            self.hologram.show_help = True
+            self._speak("Try asking me to show a carbon atom, change theme, or show weather in your city.")
+            return True
+        if t in ("close help", "hide help"):
+            self.hologram.show_help = False
+            self._speak("Closing the guide")
+            return True
+        if t in ("change theme", "next theme", "change color"):
+            self.hologram.cycle_theme(1)
+            self._speak("Theme changed")
+            return True
+        if t in ("scroll down", "read more", "next page"):
+            self.hologram.scroll_info(1)
+            return True
+        if t in ("scroll up", "previous page"):
+            self.hologram.scroll_info(-1)
+            return True
 
+        if t in ("close answer", "close the answer", "dismiss response", "close response"):
+            self.hologram.show_core()
+            self._speak("Closing the answer")
+            return True
         if t.strip() in ("stop", "stop it", "be quiet", "silence"):
-            pygame.mixer.music.stop()
+            if pygame.mixer.get_init():
+                pygame.mixer.music.stop()
             self._on_log("VOICE: stop command")
             return True
 
@@ -441,29 +511,33 @@ class VoiceAssistant:
             return True
 
         # ---- timers ---------------------------------------------------------
-        m = re.search(r"(?:set a |set )?timer for (\d+)\s*(second|minute|hour)s?(?:\s+(?:for|called|named)\s+(.+))?", t)
+        m = re.search(r"(?:set a |set )?timer for (\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s*(second|minute|hour)s?(?:\s+(?:for|called|named)\s+(.+))?", t)
         if m:
-            amount, unit, label = int(m.group(1)), m.group(2), m.group(3)
+            amount = int(m.group(1)) if m.group(1).isdigit() else NUMBER_WORDS[m.group(1)]
+            unit, label = m.group(2), m.group(3)
             seconds = amount * {"second": 1, "minute": 60, "hour": 3600}[unit]
             display_label = label.strip() if label else f"{amount} {unit}{'s' if amount != 1 else ''} timer"
+            if not 0 < seconds <= 86400:
+                self._speak("Choose a timer between one second and twenty four hours.")
+                return True
             self._start_timer(seconds, display_label)
             self._speak(f"Timer set for {amount} {unit}{'s' if amount != 1 else ''}")
             return True
 
         if "cancel" in t and "timer" in t:
-            count = len(self.active_timers)
-            self.active_timers.clear()
+            count = self.timers.cancel_all()
             self._on_log(f"VOICE: cancelled {count} timer(s)")
             self._speak(f"Cancelled {count} timer{'s' if count != 1 else ''}" if count else "No timers running")
             return True
 
         if "how much time" in t or ("timer" in t and any(k in t for k in ("left", "remaining"))):
-            if not self.active_timers:
+            active_timers = self.timers.snapshot()
+            if not active_timers:
                 self._speak("No timers running")
             else:
                 parts = []
-                for timer in self.active_timers:
-                    remaining = max(0, round(timer["ends_at"] - time.time()))
+                for timer in active_timers:
+                    remaining = round(timer["remaining"])
                     mins, secs = divmod(remaining, 60)
                     parts.append(f"{timer['label']}: {mins} minutes {secs} seconds" if mins else f"{timer['label']}: {secs} seconds")
                 self._speak("; ".join(parts))
@@ -489,10 +563,10 @@ class VoiceAssistant:
             return True
 
         # ---- volume ---------------------------------------------------------
-        if "volume" in t:
+        if "volume" in t or t in ("mute", "mute audio"):
             m = re.search(r"volume to (\d+)", t)
             if m:
-                pct = int(m.group(1))
+                pct = max(0, min(100, int(m.group(1))))
                 ok = system_control.set_volume_percent(pct)
                 self._speak(f"Volume set to {pct} percent" if ok else "Volume control isn't available — install pycaw")
                 return True
@@ -511,19 +585,17 @@ class VoiceAssistant:
 
         # ---- media playback -----------------------------------------------------
         if any(k in t for k in ("pause music", "play music", "pause the music", "play the music")) or t.strip() in ("play", "pause"):
-            system_control.media_play_pause()
-            self._on_log("MEDIA: play/pause")
-            self._speak("Done")
+            ok = system_control.media_play_pause()
+            self._on_log(f"MEDIA: play/pause {ok}")
+            self._speak("Playback toggled" if ok else "Media control is unavailable on this device")
             return True
         if any(k in t for k in ("next song", "next track", "skip song", "skip track")):
-            system_control.media_next()
-            self._on_log("MEDIA: next")
-            self._speak("Skipping")
+            ok = system_control.media_next()
+            self._speak("Skipping" if ok else "Media control is unavailable on this device")
             return True
         if any(k in t for k in ("previous song", "previous track", "last song", "go back a song")):
-            system_control.media_previous()
-            self._on_log("MEDIA: previous")
-            self._speak("Going back")
+            ok = system_control.media_previous()
+            self._speak("Going back" if ok else "Media control is unavailable on this device")
             return True
 
         # ---- phone (requires ADB setup — see phone_control.py) ------------------
@@ -534,7 +606,7 @@ class VoiceAssistant:
                 return True
             ok, output = phone_control.unlock_with_pin()
             self._on_log(f"PHONE: unlock {'ok' if ok else 'failed'} — {output[:80]}")
-            self._speak("Phone unlocked" if ok else "I couldn't unlock the phone — check phone_pin.txt is set up")
+            self._speak("Unlock input sent. Check your phone." if ok else "I couldn't unlock the phone — check phone_pin.txt is set up")
             return True
 
         m = re.search(r"^call (\w+(?:\s\w+)?)$", t.strip())
@@ -561,7 +633,7 @@ class VoiceAssistant:
             self._speak(f"Opening {site}")
             return True
 
-        m = re.search(r"select orbit (\w+)", t)
+        m = re.search(r"\bselect orbit (\w+)", t)
         if m:
             word = m.group(1)
             num = NUMBER_WORDS.get(word)
@@ -589,14 +661,15 @@ class VoiceAssistant:
         m = re.search(r"(add|remove)\s+(\d+|a|an|one|two|three|four|five|six|seven|eight|nine|ten)?\s*(proton|neutron|electron)s?", t)
         if m:
             direction, count_word, particle = m.group(1), m.group(2), m.group(3)
-            count = NUMBER_WORDS.get(count_word, 1) if count_word else 1
+            count = int(count_word) if count_word and count_word.isdigit() else NUMBER_WORDS.get(count_word, 1)
             delta = count if direction == "add" else -count
             method = {
                 "proton": self.hologram.add_protons,
                 "neutron": self.hologram.add_neutrons,
                 "electron": self.hologram.add_electrons,
             }[particle]
-            method(delta)
+            actual_delta = method(delta)
+            count = abs(actual_delta)
             self._on_log(f"EDIT: {direction} {count} {particle}{'s' if count != 1 else ''} -> {self.hologram.mode_label}")
             verb = "Added" if direction == "add" else "Removed"
             self._speak(f"{verb} {count} {particle}{'s' if count != 1 else ''}. Now {self.hologram.protons} protons, "
@@ -604,11 +677,7 @@ class VoiceAssistant:
             return True
 
         if "new element" in t or ("start" in t and "element" in t):
-            self.hologram.protons = 1
-            self.hologram.neutrons = 0
-            self.hologram.electron_count = 1
-            self.hologram._ensure_atom_mode()
-            self.hologram._update_custom_label()
+            self.hologram.new_element()
             self._on_log("EDIT: started new custom element from scratch")
             self._speak("Starting a new element with one proton and one electron. Tell me what to add.")
             return True
@@ -657,38 +726,6 @@ class VoiceAssistant:
             self._speak(f"Displaying the {label} system, {count} planets.{note}")
             return True
 
-        if "weather" in t:
-            if any(k in t for k in ("hide", "close", "dismiss")):
-                self.hologram.hide_weather()
-                self._on_log("DISPLAY: weather hidden")
-                self._speak("Closing the weather display")
-                return True
-
-            m = re.search(r"weather (?:in|at|for)\s+([a-zA-Z\s]+)", t)
-            location_query = m.group(1).strip() if m else None
-
-            # If the location matches a US state, ask for weather at its
-            # capital-ish/general area and flag it so the display shows a
-            # US map with that state highlighted instead of the icon.
-            state_key = None
-            if location_query:
-                state_key = next((s for s in US_STATE_POSITIONS if s in location_query), None)
-
-            data = self._fetch_weather_data(location_query)
-            if data:
-                if state_key:
-                    data["state"] = state_key
-                self.hologram.show_weather(data)
-                self._on_log(f"DISPLAY: weather for {data['location']}" + (f" (map: {state_key})" if state_key else ""))
-                temp_part = f"{round(data['temp_c'])} degrees" if data["temp_c"] is not None else "an unknown temperature"
-                self._speak(f"It's {temp_part} and {data['description']} in {data['location']}.")
-            else:
-                if self.last_weather_error == "rate_limit":
-                    self._speak("I've hit my weather search rate limit for now — try again in a bit, or check console.groq.com for your usage.")
-                else:
-                    self._speak("Sorry, I couldn't get the weather right now — check the log for details.")
-            return True
-
         # Explicit shape name (sphere, cube, torus, pyramid, cylinder)
         shape_hit = next((s for s in SHAPES if s in t), None)
         if not shape_hit:
@@ -715,8 +752,9 @@ class VoiceAssistant:
         # forgiving because speech recognition often clips trailing words
         # like "atom" — "show me a carbon" should still work, not just
         # the perfectly-transcribed "show me a carbon atom".
-        element_hit = next((name for name in ELEMENTS if name in t), None)
-        if element_hit:
+        element_hit = next((name for name in sorted(ELEMENTS, key=len, reverse=True)
+                            if re.search(r"\b" + re.escape(name) + r"\b", t)), None)
+        if element_hit and re.search(r"\b(show|display|draw|load|model)\b", t):
             result = self.hologram.load_atom(element_hit)
             if result:
                 symbol, name = result
@@ -727,102 +765,40 @@ class VoiceAssistant:
             return True
 
         if "reset" in t and ("display" in t or "hologram" in t or "diagram" in t):
-            self.hologram.load_demo()
-            self._on_log("DISPLAY: reset to demo")
+            self.hologram.show_core()
+            self._on_log("DISPLAY: reset to voice core")
             self._speak("Resetting the display")
             return True
 
         return False
 
-    # ---- weather -------------------------------------------------------------
+    # ---- structured weather (independent of Groq) ----------------------------
 
-    WEATHER_CONDITIONS = {"sunny", "partly_cloudy", "cloudy", "fog", "rain", "snow", "storm"}
-
-    def _call_weather_api(self, system, user_msg, max_tokens):
-        """Makes one weather API call, classifying failures into
-        self.last_weather_error ('rate_limit' | 'too_large' | 'other')
-        so the caller can decide whether a retry is worth attempting.
-        Returns the raw response content, or None on any failure."""
+    def _handle_weather(self, command):
+        if re.search(r"\b(?:hide|close|dismiss)\b", command):
+            self.hologram.hide_weather()
+            self._speak("Closing the weather display")
+            return True
+        if re.search(r"\b(?:tomorrow|forecast|next week|yesterday|tonight)\b", command):
+            message = "I can show current weather, not forecasts yet. Ask for weather in a city right now."
+            self.hologram.set_weather_status("error", message)
+            self._speak(message)
+            return True
+        self.state = "thinking"
+        self.hologram.set_weather_status("loading", "Resolving location and current conditions")
         try:
-            self._on_log(f"VOICE: fetching weather ({user_msg}, max_tokens={max_tokens})...")
-            response = self.client.chat.completions.create(
-                model=MODEL_SEARCH,
-                max_tokens=max_tokens,
-                messages=[{"role": "system", "content": system}, {"role": "user", "content": user_msg}],
-            )
-            content = response.choices[0].message.content or ""
-            self._on_log(f"VOICE: weather raw response -> {content[:200]}")
-            return content
-        except Exception as e:
-            msg = str(e)
-            if "429" in msg or "rate_limit" in msg.lower() or "rate limit" in msg.lower():
-                self._on_log(f"VOICE: weather lookup hit a rate limit ({e})")
-                self.last_weather_error = "rate_limit"
-            elif "413" in msg or "too large" in msg.lower() or "request_too_large" in msg.lower():
-                self._on_log(f"VOICE: weather lookup request too large ({e})")
-                self.last_weather_error = "too_large"
-            else:
-                self._on_log(f"VOICE: weather lookup failed ({type(e).__name__}: {e})")
-                self.last_weather_error = "other"
-            return None
-
-    def _fetch_weather_data(self, location_query):
-        """One dedicated API call asking for a strictly-formatted line (not
-        conversational), so it's reliably parseable — separate from the
-        normal chat history entirely."""
-        system = (
-            "You are a weather data lookup tool with web search access. Find the "
-            "current weather and respond with ONLY one line, no other text, in "
-            "exactly this format:\n"
-            "LOCATION=<city, region> TEMP_C=<number> "
-            "CONDITION=<one of: sunny, partly_cloudy, cloudy, fog, rain, snow, storm> "
-            "DESCRIPTION=<short phrase like 'light rain'> "
-            "HUMIDITY=<percent number or NA> WIND_KPH=<number or NA>"
-        )
-        user_msg = f"Current weather in {location_query}" if location_query else "Current weather at my location"
-
-        content = self._call_weather_api(system, user_msg, max_tokens=700)
-        if content is None and self.last_weather_error == "too_large":
-            # The request itself is tiny (short system + short user
-            # message), so a 413 here is much more likely an output
-            # token-budget limit than genuine payload size. Retry once
-            # with a smaller budget and a shorter prompt before giving up.
-            self._on_log("VOICE: weather request too large, retrying with a smaller budget...")
-            short_system = (
-                "Weather lookup tool with web search. Respond with ONLY: "
-                "LOCATION=<city> TEMP_C=<number> "
-                "CONDITION=<sunny|partly_cloudy|cloudy|fog|rain|snow|storm> "
-                "DESCRIPTION=<short phrase>"
-            )
-            content = self._call_weather_api(short_system, user_msg, max_tokens=250)
-
-        if content is None:
-            return None
-
-        def grab(pattern, default=None):
-            m = re.search(pattern, content)
-            return m.group(1).strip() if m else default
-
-        location = grab(r"LOCATION=([^\n]+?)(?=\s+TEMP_C=|$)", location_query or "Unknown")
-        temp_str = grab(r"TEMP_C=(-?\d+\.?\d*)")
-        condition_raw = (grab(r"CONDITION=(\w+)", "cloudy") or "cloudy").lower()
-        description = grab(r"DESCRIPTION=([^\n]+?)(?=\s+HUMIDITY=|$)", condition_raw)
-        humidity_str = grab(r"HUMIDITY=(\d+\.?\d*)")
-        wind_str = grab(r"WIND_KPH=(\d+\.?\d*)")
-
-        condition = condition_raw if condition_raw in self.WEATHER_CONDITIONS else "cloudy"
-
-        result = {
-            "location": location,
-            "temp_c": float(temp_str) if temp_str else None,
-            "condition": condition,
-            "description": description,
-            "humidity": int(float(humidity_str)) if humidity_str else None,
-            "wind_kph": float(wind_str) if wind_str else None,
-            "updated_at": time.strftime("%H:%M"),
-        }
-        self._on_log(f"VOICE: weather parsed -> {result}")
-        return result
+            data = fetch_current_weather(extract_location(command))
+        except WeatherError as exc:
+            self.last_weather_error = exc.code
+            self._on_log(f"WEATHER: {exc.code}: {exc}")
+            self.hologram.set_weather_status("error", str(exc))
+            self._speak(str(exc))
+        else:
+            self.last_weather_error = None
+            self.hologram.show_weather(data)
+            self._on_log(f"WEATHER: {data['location']} / {data['updated_at']}")
+            self._speak(f"It's {round(data['temp_c'])} degrees Celsius and {data['description']} in {data['location']}.")
+        return True
 
     # ---- Groq brain ---------------------------------------------------------
 
@@ -836,6 +812,8 @@ class VoiceAssistant:
         return any(k in t for k in self.NEEDS_SEARCH_KEYWORDS)
 
     def _ask_groq(self, text):
+        if not self.client:
+            return "General conversation needs a Groq API key. Weather and local display commands are still available."
         self.history.append({"role": "user", "content": text})
         use_search = self._needs_search(text)
         reply = self._call_groq_safe(use_search)
@@ -887,7 +865,7 @@ class VoiceAssistant:
     MAX_ENERGY_THRESHOLD = 600  # calibration can never require shouting past this
 
     def _load_energy_override(self):
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "energy_threshold.txt")
+        path = os.path.join(str(PROJECT_ROOT), "energy_threshold.txt")
         if os.path.exists(path):
             try:
                 with open(path, "r") as f:
@@ -924,18 +902,27 @@ class VoiceAssistant:
             self._on_log(f"VOICE: using energy_threshold.txt override -> {override:.0f}")
         else:
             try:
-                with self.microphone as source:
+                with self._mic_lock, self.microphone as source:
                     self._on_log("VOICE: calibrating for ambient noise (2 sec)...")
                     self.recognizer.adjust_for_ambient_noise(source, duration=2)
                 self._clamp_energy_threshold()
                 self._on_log(f"VOICE: calibration done (energy_threshold={self.recognizer.energy_threshold:.0f}), now listening")
             except Exception as e:
                 self._on_log(f"VOICE: could not calibrate microphone ({e})")
+                self.enabled = False
+                self._running = False
                 return
 
         loop_count = 0
         last_recalibration = time.time()
         while self._running:
+            try:
+                notice = self._speech_queue.get_nowait()
+            except queue.Empty:
+                notice = None
+            if notice:
+                self._speak(notice)
+                continue
             loop_count += 1
 
             # Ambient noise drifts over a long-running session (AC turning
@@ -945,7 +932,7 @@ class VoiceAssistant:
             # always clamped so it can never drift up to shouting levels.
             if override is None and time.time() - last_recalibration > 120:
                 try:
-                    with self.microphone as source:
+                    with self._mic_lock, self.microphone as source:
                         self.recognizer.adjust_for_ambient_noise(source, duration=1)
                     self._clamp_energy_threshold()
                     self._on_log(f"VOICE: recalibrated (energy_threshold={self.recognizer.energy_threshold:.0f})")
@@ -954,7 +941,7 @@ class VoiceAssistant:
                 last_recalibration = time.time()
 
             try:
-                with self.microphone as source:
+                with self._mic_lock, self.microphone as source:
                     audio = self.recognizer.listen(source, timeout=5, phrase_time_limit=8)
                 text = self.recognizer.recognize_google(audio)
                 self._on_log(f"VOICE: picked up audio -> '{text}'")
@@ -976,8 +963,22 @@ class VoiceAssistant:
             command = command.strip(" ,.")
 
             if not command:
-                self._speak("Yes?")
-                continue
+                # A wake word on its own opens a real follow-up listening window.
+                self.state = "listening"
+                self._on_log("VOICE: listening for your request")
+                try:
+                    with self._mic_lock, self.microphone as source:
+                        audio = self.recognizer.listen(source, timeout=5, phrase_time_limit=10)
+                    command = self.recognizer.recognize_google(audio).lower().strip(" ,.")
+                    repeated_wake, remainder = find_wake_word(command)
+                    if repeated_wake:
+                        command = remainder.strip(" ,.")
+                except Exception as exc:
+                    self._on_log(f"VOICE: follow-up ended ({type(exc).__name__})")
+                    command = ""
+                if not command:
+                    self.state = "idle"
+                    continue
 
             self.state = "listening"
             self.last_heard = command
@@ -985,9 +986,10 @@ class VoiceAssistant:
 
             try:
                 if self._handle_local_command(command):
+                    self.state = "idle"
                     continue
 
-                self.state = "speaking"
+                self.state = "thinking"
                 reply = self._ask_groq(command)
                 self.hologram.show_info_card(command, reply)
                 self._speak(reply)

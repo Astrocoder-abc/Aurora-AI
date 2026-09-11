@@ -10,21 +10,29 @@ grid, glow). The central display can show:
 EDITABLE: point to select the next orbit/shell, pinch + move to reshape
 it (vertical = radius, horizontal = spin speed).
 
-FULLSCREEN: launches fullscreen by default. Press F11 to toggle back to
+FULLSCREEN: launches windowed by default. Press F11 to toggle back to
 a windowed view, ESC to quit. (Previous versions never processed pygame's
 window events at all, which is almost certainly why the window sometimes
 showed "Not Responding" in Windows — fixed here.)
 """
 
 import math
+import ctypes
+from copy import deepcopy
 import random
 import time
 import pygame
 from pygame.locals import DOUBLEBUF, OPENGL, FULLSCREEN
 from OpenGL.GL import *
 from OpenGL.GLU import gluPerspective
-from collections import deque
+from collections import deque, OrderedDict
 import threading
+
+from jarvis_ui.particle_core import ParticleCore
+from jarvis_ui.core_animation import CoreAnimation
+from jarvis_ui.particle_buffers import build_buffers, NEBULA_PALETTE
+from jarvis_ui.overlays import overlay_rect, visible_page
+from jarvis_ui.runtime import UI_BUILD, window_size
 
 try:
     import psutil
@@ -33,14 +41,56 @@ except ImportError:
     PSUTIL_AVAILABLE = False
 
 COLOR_LISTENING = (0.1, 1.0, 0.9)
-COLOR_SPEAKING = (0.2, 1.0, 0.3)
+COLOR_SPEAKING = (0.35, 0.85, 1.0)
+COLOR_THINKING = (0.65, 0.4, 1.0)
 
 THEMES = [
+    (1.0, 0.56, 0.06),
     (0.1, 0.6, 1.0),
     (0.8, 0.2, 1.0),
-    (1.0, 0.55, 0.05),
     (1.0, 0.2, 0.4),
 ]
+
+# Subsystem graph drawn across the whole screen around the voice core — a
+# live constellation of the assistant's modules, in the style of the supplied
+# reference dashboards. (label, fx, fy, family, gear): fx/fy are normalized
+# screen positions; gear=True draws the radial "flower" cluster, otherwise a
+# small tan terminal dot. Families map to colors.
+GRAPH_FAMILIES = {
+    "cyan": (0.25, 0.95, 0.85),
+    "green": (0.45, 1.0, 0.55),
+    "gold": (1.0, 0.78, 0.25),
+    "pink": (1.0, 0.4, 0.65),
+    "violet": (0.68, 0.45, 1.0),
+    "tan": (0.82, 0.72, 0.55),
+}
+GRAPH_NODES = [
+    ("VOICE LINK", 0.34, 0.17, "violet", True),
+    ("WAKE WORD", 0.55, 0.27, "tan", False),
+    ("PARTICLE FLOW", 0.66, 0.13, "cyan", True),
+    ("HAND TRACKER", 0.84, 0.28, "cyan", True),
+    ("OPEN-METEO", 0.78, 0.40, "tan", False),
+    ("WEATHER DOCK", 0.87, 0.50, "gold", False),
+    ("GROQ BRIDGE", 0.70, 0.44, "tan", False),
+    ("TIMER SERVICE", 0.74, 0.76, "green", True),
+    ("EDGE TTS", 0.60, 0.60, "tan", False),
+    ("MEDIA CONTROL", 0.47, 0.82, "pink", True),
+    ("SNAPSHOTS", 0.30, 0.74, "tan", False),
+    ("FACE ID", 0.20, 0.66, "cyan", False),
+    ("ADB PHONE", 0.13, 0.55, "tan", False),
+    ("SYSTEM STATS", 0.12, 0.38, "gold", True),
+    ("STAR CHART", 0.24, 0.45, "tan", False),
+    ("SHAPE LIB", 0.35, 0.55, "tan", False),
+    ("CALC CORE", 0.27, 0.64, "tan", False),
+    ("US MAP", 0.17, 0.45, "green", False),
+    ("EVENT LOG", 0.43, 0.68, "tan", False),
+    ("THEME ENGINE", 0.62, 0.33, "pink", False),
+]
+# Extra constellation edges between node indices (besides hub spokes).
+GRAPH_CROSS_LINKS = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7),
+                     (7, 8), (8, 9), (9, 10), (10, 11), (11, 12), (12, 13),
+                     (13, 14), (14, 15), (15, 16), (16, 17), (17, 11),
+                     (18, 15), (18, 8), (19, 1), (19, 6), (0, 13), (9, 18)]
 
 FLASH_COLORS = {
     "thumbs_up": (0.2, 1.0, 0.3),
@@ -276,31 +326,51 @@ SPEED_MIN, SPEED_MAX = -180, 180
 
 
 class Hologram:
-    def __init__(self, fullscreen=True, windowed_size=(1200, 800)):
+    def __init__(self, fullscreen=False, windowed_size=(960, 640), windowed_only=True):
         pygame.init()
-        if not pygame.mixer.get_init():
-            pygame.mixer.init()  # init on the main thread — doing this from
-                                  # the background voice thread caused
-                                  # intermittent crashes
+        try:
+            if not pygame.mixer.get_init():
+                pygame.mixer.init()
+        except pygame.error:
+            pass  # Audio is optional; keep the visual dashboard available.
+        self.clock = pygame.time.Clock()
+        self.particle_core = ParticleCore()
+        self.core_animation = CoreAnimation()
+        self.particle_quality = "balanced"
+        self._core_dock = 0.0
+        self._text_cache = OrderedDict()
+        self.show_diagnostics = False
+        self.reduced_motion = False
+        self.voice_available = False
+        self.last_heard = ""
+        self.weather_status = None
+        self.show_help = False
+        self.info_scroll = 0
+        self._info_page_lines = 5
+        self._stats_sample_time = -1.0
+        self._stats_cache = []
         self.windowed_size = windowed_size
-        self.fullscreen = fullscreen
-        self._set_display_mode(fullscreen)
+        self.windowed_only = windowed_only
+        self.fullscreen = bool(fullscreen and not windowed_only)
+        self._set_display_mode(self.fullscreen)
 
         # Bahnschrift/Agency FB have a geometric, technical HUD look closer
         # to sci-fi interfaces than a plain monospace font — both ship
         # with Windows, so this is a free upgrade with no install needed.
         # Falls back gracefully through the list, ending at Consolas.
-        font_candidates = ["bahnschrift", "agencyfb", "eurostile", "consolas"]
+        font_candidates = ["segoeui", "dejavusans", "bahnschrift", "arial"]
 
         def _pick_font(size, bold=False):
             for name in font_candidates:
                 try:
+                    if not pygame.font.match_font(name):
+                        continue
                     f = pygame.font.SysFont(name, size, bold=bold)
                     if f:
                         return f
                 except Exception:
                     continue
-            return None
+            return pygame.font.Font(None, size)
 
         try:
             self.font = _pick_font(16)
@@ -312,11 +382,22 @@ class Hologram:
 
         # Twinkling starfield — same seed every run, so it's not distracting
         # random noise each frame, just a fixed field of stars that twinkle.
+        # Dense enough to read as deep space, with a few faint constellation
+        # links between nearby stars (reference constellation dashboard).
         _star_rng = random.Random(7)
         self.stars = [
-            (_star_rng.random(), _star_rng.random(), _star_rng.uniform(0, 6.28), _star_rng.choice([1, 1, 1, 2]))
-            for _ in range(90)
+            (_star_rng.random(), _star_rng.random(), _star_rng.uniform(0, 6.28), _star_rng.choice([1, 1, 2, 2, 3]))
+            for _ in range(420)
         ]
+        self.star_links = []
+        for i in range(0, len(self.stars) - 1, 7):
+            ax, ay = self.stars[i][0], self.stars[i][1]
+            bx, by = self.stars[i + 1][0], self.stars[i + 1][1]
+            if math.hypot(ax - bx, ay - by) < 0.16:
+                self.star_links.append((i, i + 1))
+
+        # Uptime counter shown in the top-right stats block.
+        self._start_time = time.time()
 
         self.rotation_x = 0.0
         self.rotation_y = 0.0
@@ -380,12 +461,14 @@ class Hologram:
     # ---- display mode / fullscreen -----------------------------------------
 
     def _set_display_mode(self, fullscreen):
+        fullscreen = fullscreen and not getattr(self, "windowed_only", True)
         if fullscreen:
             info = pygame.display.Info()
             self.width, self.height = info.current_w, info.current_h
             flags = DOUBLEBUF | OPENGL | FULLSCREEN
         else:
-            self.width, self.height = self.windowed_size
+            info = pygame.display.Info()
+            self.width, self.height = window_size((info.current_w, info.current_h), self.windowed_size)
             flags = DOUBLEBUF | OPENGL
 
         try:
@@ -394,12 +477,18 @@ class Hologram:
         except Exception:
             pass  # MSAA unsupported on this GPU/driver — fine, just less smooth
 
-        pygame.display.set_mode((self.width, self.height), flags)
-        pygame.display.set_caption("AURORA")
+        try:
+            pygame.display.set_mode((self.width, self.height), flags)
+        except pygame.error:
+            # Unsupported MSAA usually fails at set_mode, not gl_set_attribute.
+            pygame.display.gl_set_attribute(pygame.GL_MULTISAMPLEBUFFERS, 0)
+            pygame.display.gl_set_attribute(pygame.GL_MULTISAMPLESAMPLES, 0)
+            pygame.display.set_mode((self.width, self.height), flags)
+        pygame.display.set_caption(f"AURORA — Nebula Core | {UI_BUILD}")
         self._init_gl_state()
 
     def _init_gl_state(self):
-        glClearColor(0.01, 0.02, 0.045, 1.0)
+        glClearColor(0.006, 0.005, 0.004, 1.0)
         glEnable(GL_DEPTH_TEST)
         glEnable(GL_LINE_SMOOTH)
         glEnable(GL_BLEND)
@@ -417,7 +506,7 @@ class Hologram:
         try:
             glEnable(GL_FOG)
             glFogi(GL_FOG_MODE, GL_LINEAR)
-            glFogfv(GL_FOG_COLOR, (0.01, 0.02, 0.045, 1.0))
+            glFogfv(GL_FOG_COLOR, (0.006, 0.005, 0.004, 1.0))
             glFogf(GL_FOG_START, 4.0)
             glFogf(GL_FOG_END, 11.0)
             glHint(GL_FOG_HINT, GL_NICEST)
@@ -433,6 +522,9 @@ class Hologram:
         glTranslatef(0.0, 0.0, -6)
 
     def toggle_fullscreen(self):
+        if self.windowed_only:
+            self.log_event("WINDOWED: fullscreen disabled for this launch")
+            return
         self.fullscreen = not self.fullscreen
         self._set_display_mode(self.fullscreen)
 
@@ -441,14 +533,33 @@ class Hologram:
         Windows will mark the window 'Not Responding' even while it's
         rendering fine. Also handles F11 (toggle fullscreen), ESC/window
         close (quit)."""
+        self.clock.tick(60)
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self.should_quit = True
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_F11:
                     self.toggle_fullscreen()
+                elif event.key == pygame.K_1:
+                    self.load_demo()
+                elif event.key == pygame.K_2:
+                    self.load_atom("carbon")
+                elif event.key == pygame.K_3:
+                    self.load_solar_system()
+                elif event.key == pygame.K_TAB:
+                    self.cycle_theme(1)
+                elif event.key == pygame.K_r:
+                    self.zoom = 1.0
+                    self.translate_x = self.translate_y = self.roll = 0.0
+                elif event.key == pygame.K_F3:
+                    self.show_diagnostics = not self.show_diagnostics
+                elif event.key == pygame.K_h:
+                    self.show_help = not self.show_help
                 elif event.key == pygame.K_ESCAPE:
-                    self.should_quit = True
+                    if self.show_help:
+                        self.show_help = False
+                    else:
+                        self.should_quit = True
 
     # ---- external control API -------------------------------------------
 
@@ -514,13 +625,27 @@ class Hologram:
         humidity, wind_kph, updated_at, and optionally 'state' (a US state
         name key into US_STATE_POSITIONS) to show a map instead of the
         generic weather icon. Automatically docks the hologram left."""
+        self.weather_status = None
+        self.info_card = None
+        if self.mode == "info":
+            self.mode = "empty"
         self.weather = data
         state = data.get("state")
         self.map_highlight = state if state in US_STATE_POSITIONS else None
         self.dock_left()
         self._trigger_materialize()
 
+    def set_weather_status(self, status, message):
+        self.info_card = None
+        if self.mode == "info":
+            self.mode = "empty"
+        self.weather = None  # Never leave old readings looking like a fresh lookup.
+        self.weather_status = {"status": status, "message": message}
+        self.show_help = False
+        self.dock_left()
+
     def hide_weather(self):
+        self.weather_status = None
         self.weather = None
         self.map_highlight = None
         self.undock()
@@ -532,6 +657,7 @@ class Hologram:
         self.hide_weather()
         self.mode = "info"
         self.mode_label = "RESPONSE"
+        self.info_scroll = 0
         self.info_card = {"question": question, "answer": answer}
         self.orbits = []
         self.selected_index = None
@@ -540,7 +666,40 @@ class Hologram:
     def hide_info_card(self):
         self.info_card = None
 
+    def set_particle_quality(self, quality):
+        if quality not in ("performance", "balanced", "cinematic"):
+            raise ValueError("Unknown particle quality")
+        self.particle_quality = quality
+        self.log_event(f"GRAPHICS: {quality} quality")
+
+    def scroll_info(self, direction):
+        if self.info_card:
+            self.info_scroll = max(0, self.info_scroll + direction * self._info_page_lines)
+
+    def show_core(self):
+        self.hide_weather()
+        self.info_card = None
+        self.show_help = False
+        self.mode = "empty"
+        self.mode_label = "VOICE CORE"
+        self.orbits = []
+        self.selected_index = None
+        self._trigger_materialize()
+
+    def new_element(self):
+        self.hide_weather()
+        self.info_card = None
+        self.protons, self.neutrons, self.electron_count = 1, 0, 1
+        self.current_element_z = 1
+        self.mode = "atom"
+        self._rebuild_atom_orbits()
+        self._update_custom_label()
+        self._trigger_materialize()
+
     def _trigger_materialize(self):
+        if self.mode not in ("empty", "info"):
+            self.info_card = None
+        self.show_help = False
         self._materialize_start = self.elapsed
 
     # ---- content: atom / solar system / demo ------------------------------
@@ -614,6 +773,8 @@ class Hologram:
         self.mode_label = f"{base} — {self.protons}p {self.neutrons}n {self.electron_count}e{charge_str}"
 
     def _ensure_atom_mode(self):
+        self.hide_weather()
+        self.info_card = None
         if self.mode != "atom":
             self.mode = "atom"
             self._rebuild_atom_orbits()
@@ -622,23 +783,30 @@ class Hologram:
         """Adding/removing protons changes the element itself, and keeps
         the atom neutral by default (electrons follow along)."""
         self._ensure_atom_mode()
-        self.protons = max(1, self.protons + n)
-        self.electron_count = max(0, self.electron_count + n)
+        previous = self.protons
+        self.protons = max(1, min(118, self.protons + n))
+        self.current_element_z = self.protons
+        self.electron_count = max(0, min(118, self.electron_count + self.protons - previous))
         self._rebuild_atom_orbits()
         self._update_custom_label()
+        return self.protons - previous
 
     def add_neutrons(self, n=1):
         """Neutrons don't affect electron shells — just the isotope."""
         self._ensure_atom_mode()
-        self.neutrons = max(0, self.neutrons + n)
+        previous = self.neutrons
+        self.neutrons = max(0, min(300, self.neutrons + n))
         self._update_custom_label()
+        return self.neutrons - previous
 
     def add_electrons(self, n=1):
         """Electrons alone (protons unchanged) creates an ion."""
         self._ensure_atom_mode()
-        self.electron_count = max(0, self.electron_count + n)
+        previous = self.electron_count
+        self.electron_count = max(0, min(118, self.electron_count + n))
         self._rebuild_atom_orbits()
         self._update_custom_label()
+        return self.electron_count - previous
 
     def load_solar_system(self):
         self.hide_weather()
@@ -695,7 +863,7 @@ class Hologram:
 
     def load_demo(self):
         self.hide_weather()
-        self.orbits = [dict(o) for o in DEFAULT_ORBITS]
+        self.orbits = deepcopy(DEFAULT_ORBITS)
         self.selected_index = None
         self.mode = "demo"
         self.mode_label = "DEMO DISPLAY"
@@ -708,6 +876,7 @@ class Hologram:
             return False
         self.hide_weather()
         self.mode = "shape"
+        self.orbits = []
         self.shape_name = shape_name
         self.mode_label = f"{shape_name.upper()} MODEL"
         self.selected_index = None
@@ -728,6 +897,9 @@ class Hologram:
         self.selected_index = None
 
     def select_next_orbit(self):
+        if not self.orbits:
+            self.selected_index = None
+            return
         if self.selected_index is None:
             self.selected_index = 0
         else:
@@ -743,7 +915,7 @@ class Hologram:
         orbit["speed"] = max(SPEED_MIN, min(SPEED_MAX, orbit["speed"] + yaw_norm * rate * dt * 60.0))
 
     def reset_orbits(self):
-        self.load_demo()
+        self.show_core()
 
     # ---- per-frame update --------------------------------------------------
 
@@ -1099,50 +1271,40 @@ class Hologram:
         glMatrixMode(GL_PROJECTION); glPopMatrix()
         glMatrixMode(GL_MODELVIEW); glPopMatrix()
 
-    def _draw_starfield(self):
+    def _draw_space_background(self):
+        """Deep-space backdrop: faint grid, fixed twinkling starfield and a
+        few thin constellation links between nearby stars."""
+        cx, cy = self.width / 2, self.height / 2
+        max_dist = math.hypot(cx, cy)
+        glLineWidth(1.0)
+        glBegin(GL_LINES)
+        x = 0
+        while x < self.width:
+            dist = abs(x - cx) / max_dist
+            glColor4f(0.16, 0.22, 0.38, max(0.015, 0.05 * (1 - dist)))
+            glVertex2f(x, 0); glVertex2f(x, self.height)
+            x += 90
+        y = 0
+        while y < self.height:
+            dist = abs(y - cy) / max_dist
+            glColor4f(0.16, 0.22, 0.38, max(0.015, 0.05 * (1 - dist)))
+            glVertex2f(0, y); glVertex2f(self.width, y)
+            y += 90
+        glEnd()
+
+        glBegin(GL_LINES)
+        for a, b in self.star_links:
+            ax, ay = self.stars[a][0] * self.width, self.stars[a][1] * self.height
+            bx, by = self.stars[b][0] * self.width, self.stars[b][1] * self.height
+            glColor4f(0.55, 0.65, 0.9, 0.05)
+            glVertex2f(ax, ay); glVertex2f(bx, by)
+        glEnd()
+
         for fx, fy, phase, size in self.stars:
-            twinkle = 0.35 + 0.65 * max(0.0, math.sin(self.elapsed * 1.2 + phase))
-            glColor4f(0.8, 0.9, 1.0, 0.55 * twinkle)
-            self._draw_circle_2d(fx * self.width, fy * self.height, size * 0.9)
-
-    def _draw_aurora_background(self):
-        """Flowing aurora borealis backdrop — translucent glowing ribbons
-        that wave across the upper portion of the screen using additive
-        blending for real glow, rather than the standard alpha blend used
-        everywhere else."""
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE)  # additive — makes overlaps glow brighter
-
-        bands = [
-            {"color": (0.15, 0.9, 0.55), "base_y": 0.16, "freq": 1.3, "speed": 0.35, "phase": 0.0, "amp": 0.05},
-            {"color": (0.25, 0.7, 1.0), "base_y": 0.26, "freq": 1.7, "speed": 0.5, "phase": 2.1, "amp": 0.06},
-            {"color": (0.55, 0.35, 0.95), "base_y": 0.10, "freq": 2.1, "speed": 0.28, "phase": 4.2, "amp": 0.04},
-        ]
-        segments = 40
-
-        for band in bands:
-            r, g, b = band["color"]
-            top_pts, bottom_pts = [], []
-            for i in range(segments + 1):
-                xf = i / segments
-                x = xf * self.width
-                wave = math.sin(xf * band["freq"] * 2 * math.pi + self.elapsed * band["speed"] + band["phase"])
-                wave2 = math.sin(xf * band["freq"] * 1.7 * 2 * math.pi + self.elapsed * band["speed"] * 0.6 + band["phase"] * 1.3)
-                cy = (band["base_y"] + band["amp"] * wave + band["amp"] * 0.5 * wave2) * self.height
-                band_h = (0.10 + 0.03 * math.sin(xf * 3 + self.elapsed * 0.4 + band["phase"])) * self.height
-                top_pts.append((x, cy - band_h / 2))
-                bottom_pts.append((x, cy + band_h / 2))
-
-            glBegin(GL_TRIANGLE_STRIP)
-            for i in range(segments + 1):
-                edge_fade = math.sin(i / segments * math.pi)  # fades out at screen edges
-                alpha = 0.09 * edge_fade
-                glColor4f(r, g, b, alpha * 0.25)
-                glVertex2f(*top_pts[i])
-                glColor4f(r, g, b, alpha)
-                glVertex2f(*bottom_pts[i])
-            glEnd()
-
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)  # restore normal blending
+            twinkle = 1.0 if self.reduced_motion else \
+                0.35 + 0.65 * max(0.0, math.sin(self.elapsed * 1.2 + phase))
+            glColor4f(0.82, 0.88, 1.0, 0.65 * twinkle)
+            self._draw_circle_2d(fx * self.width, fy * self.height, size * 0.7)
 
     def _draw_rect(self, x, y, w, h, r, g, b, a, filled=True):
         glBegin(GL_QUADS if filled else GL_LINE_LOOP)
@@ -1166,13 +1328,13 @@ class Hologram:
             (x + chamfer, y), (x + w, y), (x + w, y + h - chamfer),
             (x + w - chamfer, y + h), (x, y + h), (x, y + chamfer),
         ]
-        glColor4f(0.02, 0.05, 0.09, fill_alpha * alpha_mult)
+        glColor4f(0.035, 0.027, 0.017, fill_alpha * alpha_mult)
         glBegin(GL_POLYGON)
         for px, py in pts:
             glVertex2f(px, py)
         glEnd()
 
-        border_pulse = 0.45 + 0.15 * math.sin(self.elapsed * 1.5)
+        border_pulse = 0.28
         glColor4f(r, g, b, border_pulse * alpha_mult)
         glLineWidth(1.3)
         glBegin(GL_LINE_LOOP)
@@ -1207,54 +1369,104 @@ class Hologram:
     def _truncate(self, text, max_chars):
         return text if len(text) <= max_chars else text[:max_chars - 1] + "…"
 
-    def _blit_text(self, font, text, x, y, color=(60, 220, 255)):
+    def _blit_text(self, font, text, x, y, color=(235, 216, 182)):
         if not font:
             return 0
         try:
-            surf = font.render(text, True, color)
-            w, h = surf.get_size()
-            data = pygame.image.tostring(surf, "RGBA", True)
+            # Cache CPU glyph pixels, not context-bound GL textures. Safe across F11.
+            key = (id(font), str(text), tuple(color))
+            pixels = self._text_cache.get(key)
+            if pixels is None:
+                surface = font.render(str(text), True, color)
+                w, h = surface.get_size()
+                pixels = (w, h, pygame.image.tostring(surface, "RGBA", True))
+                self._text_cache[key] = pixels
+                if len(self._text_cache) > 256:
+                    self._text_cache.popitem(last=False)
+            self._text_cache.move_to_end(key)
+            w, h, data = pixels
             glRasterPos2f(x, y + h)
             glDrawPixels(w, h, GL_RGBA, GL_UNSIGNED_BYTE, data)
             return h
         except Exception:
             return 0
 
-    def _draw_background_grid(self):
-        cx, cy = self.width / 2, self.height / 2
-        max_dist = math.hypot(cx, cy)
-        step = 80
-        glLineWidth(1.0)
+    def _fit_text(self, font, text, width):
+        """Pixel-based clipping for labels, including long activity messages."""
+        if not font:
+            return text
+        if font.size(text)[0] <= width:
+            return text
+        while text and font.size(text + "...")[0] > width:
+            text = text[:-1]
+        return text + "..." if text else ""
 
-        glBegin(GL_LINES)
-        x = 0
-        while x < self.width:
-            dist = abs(x - cx) / max_dist
-            alpha = max(0.02, 0.10 * (1 - dist))
-            glColor4f(0.15, 0.35, 0.55, alpha)
-            glVertex2f(x, 0); glVertex2f(x, self.height)
-            x += step
-        y = 0
-        while y < self.height:
-            dist = abs(y - cy) / max_dist
-            alpha = max(0.02, 0.10 * (1 - dist))
-            glColor4f(0.15, 0.35, 0.55, alpha)
-            glVertex2f(0, y); glVertex2f(self.width, y)
-            y += step
-        glEnd()
+    def _center_text(self, font, text, cx, y, color=(215, 235, 245)):
+        width = font.size(text)[0] if font else 0
+        self._blit_text(font, text, cx - width / 2, y, color=color)
+
+    def _draw_tab_chip(self, x, y, label, active, accent):
+        """Small status tab like the reference's BUSINESS/PERSONAL chips.
+        Visual only — the dashboard stays voice-operated."""
+        text_w = self.font_small.size(label)[0] if self.font_small else len(label) * 7
+        w, h = text_w + 30, 20
+        r, g, b = accent
+        self._draw_rect(x, y, w, h, r, g, b, 0.14 if active else 0.04)
+        self._draw_rect(x, y, w, h, r, g, b, 0.55 if active else 0.16, filled=False)
+        dot_a = 0.9 if active else 0.3
+        pulse = 0.6 + 0.4 * math.sin(self.elapsed * 3) if active and not self.reduced_motion else 1.0
+        glColor4f(r, g, b, dot_a * pulse)
+        self._draw_circle_2d(x + 10, y + h / 2, 2.5, segments=10)
+        self._blit_text(self.font_small, label, x + 18, y + 4,
+                        color=(int(120 + 120 * r * (0.4 + 0.6 * active)),
+                               int(120 + 120 * g * (0.4 + 0.6 * active)),
+                               int(120 + 120 * b * (0.4 + 0.6 * active))))
+        return w
 
     def _draw_top_bar(self, theme_color):
-        self._draw_panel(16, 12, self.width - 32, 66, theme_color, chamfer=18, fill_alpha=0.45)
+        """Reference-style status bar: mode tabs left, live briefing chip in
+        the middle, real stats counters on the right."""
+        # left: status tabs (visual only, voice remains the only input)
+        x, y = 24, 24
+        x += self._draw_tab_chip(x, y, "CORE", self.mode == "empty", (0.45, 1.0, 0.55)) + 8
+        x += self._draw_tab_chip(x, y, "SYSTEM", self.show_diagnostics, (1.0, 0.78, 0.25)) + 8
+        self._draw_rect(x, y, 20, 20, 0.55, 0.65, 0.85, 0.05)
+        self._draw_rect(x, y, 20, 20, 0.55, 0.65, 0.85, 0.25, filled=False)
+        self._blit_text(self.font_small, "+", x + 6, y + 3, color=(150, 165, 195))
 
-        title = "A U R O R A"
-        self._blit_text(self.font_big, title, self.width / 2 - 70, 16, color=(150, 225, 255))
+        # center: live briefing chip
+        stamp = time.strftime("%m / %d %I:%M %p").replace(" 0", " ").upper()
+        briefing = f"BRIEFING - LIVE {stamp}"
+        bw = self.font_small.size(briefing)[0] + 40 if self.font_small else len(briefing) * 8
+        bx = self.width / 2 - bw / 2
+        self._draw_rect(bx, 22, bw, 22, 1.0, 0.62, 0.12, 0.08)
+        self._draw_rect(bx, 22, bw, 22, 1.0, 0.62, 0.12, 0.5, filled=False)
+        pulse = 0.55 + 0.45 * math.sin(self.elapsed * 2.4) if not self.reduced_motion else 1.0
+        glColor4f(0.6, 1.0, 0.4, pulse)
+        self._draw_circle_2d(bx + 12, 33, 2.5, segments=10)
+        self._blit_text(self.font_small, briefing, bx + 22, 27, color=(235, 170, 80))
+        self._center_text(self.font_small, "A U R O R A", self.width / 2, 52, color=(140, 122, 92))
 
-        self._blit_text(self.font_small, time.strftime("%H:%M:%S"), self.width - 120, 20, color=(140, 190, 220))
-        self._blit_text(self.font_small, f"FPS {self._fps:.0f}", self.width - 120, 40, color=(90, 130, 160))
-
-        mode_text = self._truncate(self.mode_label, 42)
-        self._blit_text(self.font_small, "DISPLAYING", 32, 20, color=(90, 130, 160))
-        self._blit_text(self.font, mode_text, 32, 36, color=(200, 235, 255))
+        # right: real counters (fps + psutil + uptime)
+        if self.width >= 900:
+            uptime = max(0, int(time.time() - self._start_time))
+            up = f"+{uptime // 3600:02d}:{(uptime % 3600) // 60:02d}"
+            stats = [("FPS", f"{self._fps:.0f}")]
+            for label, frac in self._get_system_stats()[:2]:
+                stats.append((label, "N/A" if frac is None else f"{int(frac * 100)}"))
+            stats.append(("UPTIME", up))
+            # two-row mini table, right aligned: dim label over bright value
+            rx = self.width - 24
+            for label, value in reversed(stats):
+                vw = self.font_small.size(value)[0] if self.font_small else len(value) * 7
+                lw = self.font_small.size(label)[0] if self.font_small else len(label) * 7
+                rx -= max(vw, lw)
+                self._blit_text(self.font_small, label, rx, 20, color=(95, 110, 135))
+                self._blit_text(self.font_small, value, rx, 34, color=(215, 230, 250))
+                rx -= 18
+            label = "CORE / VOICE" if self.mode == "empty" else self.mode_label
+            self._blit_text(self.font_small, self._fit_text(self.font_small, label, self.width / 2 - 235),
+                            36, 52, color=(110, 100, 80))
 
     def _get_system_stats(self):
         """Real system stats via psutil. Falls back to a clearly-labeled
@@ -1262,6 +1474,9 @@ class Hologram:
         if not PSUTIL_AVAILABLE:
             return [("CPU", None), ("MEM", None), ("BATT", None)]
 
+        if self.elapsed - self._stats_sample_time < 0.5 and self._stats_cache:
+            return self._stats_cache
+        self._stats_sample_time = self.elapsed
         cpu = psutil.cpu_percent(interval=None) / 100.0
         self.cpu_history.append(cpu)
         mem = psutil.virtual_memory().percent / 100.0
@@ -1274,7 +1489,8 @@ class Hologram:
             batt_frac = None
             batt_label = "BATT"
 
-        return [("CPU", cpu), ("MEM", mem), (batt_label, batt_frac)]
+        self._stats_cache = [("CPU", cpu), ("MEM", mem), (batt_label, batt_frac)]
+        return self._stats_cache
 
     def _draw_sparkline(self, x, y, w, h, values, color):
         if len(values) < 2:
@@ -1299,11 +1515,11 @@ class Hologram:
         glEnd()
 
     def _draw_system_panel(self, theme_color):
-        px, py, pw, ph = 16, 92, 230, 180
-        self._draw_panel(px, py, pw, ph, theme_color, chamfer=14)
+        px, py, pw, ph = 20, 110, 220, 242
+        self._draw_rect(px, py, 2, ph, *theme_color, 0.4)
 
-        x, y, bar_w = px + 18, py + 16, 190
-        self._blit_text(self.font_small, "SYSTEM", x, y, color=(90, 130, 160))
+        x, y, bar_w = px + 18, py + 18, 184
+        self._blit_text(self.font_small, "SYSTEM / LIVE", x, y, color=(90, 130, 160))
         y += 24
         for label, frac in self._get_system_stats():
             if frac is None:
@@ -1327,88 +1543,108 @@ class Hologram:
         self._draw_sparkline(x, y, bar_w, 26, list(self.cpu_history), theme_color)
 
     def _draw_event_log(self):
-        pw, ph = 300, 180
-        px, py = self.width - pw - 16, 92
-        self._draw_panel(px, py, pw, ph, (0.3, 0.85, 1.0), chamfer=14)
+        pw, ph = 260, 242
+        px, py = self.width - pw - 20, 110
+        self._draw_rect(px, py, 2, ph, 0.3, 0.85, 1.0, 0.25)
 
         x, y = px + 18, py + 16
-        self._blit_text(self.font_small, "EVENT LOG", x, y, color=(90, 130, 160))
+        self._blit_text(self.font_small, "RECENT ACTIVITY", x, y, color=(90, 130, 160))
         y += 24
         with self._event_log_lock:
             log_snapshot = list(self.event_log)
         if not log_snapshot:
-            self._blit_text(self.font_small, "-- awaiting input --", x, y, color=(80, 110, 130))
+            self._blit_text(self.font_small, "Your session starts here.", x, y, color=(80, 110, 130))
         for i, line in enumerate(log_snapshot):
             fade = max(0.35, 1.0 - i * 0.16)
             base = (170, 220, 245) if i == 0 else (150, 190, 215)
             color = tuple(int(c * fade) for c in base)
-            self._blit_text(self.font_small, self._truncate(line, 38), x, y, color=color)
-            y += 19
+            self._blit_text(self.font_small, self._fit_text(self.font_small, line, pw - 36), x, y, color=color)
+            y += 27
+
+    def _voice_color(self):
+        # Preserve the reference's amber palette through voice states. States change
+        # energy and warmth, rather than abruptly switching the entire core to cyan.
+        color = self._current_theme_color()
+        warmth = max(0, self.core_animation.energy - .24) * .21
+        return tuple(min(1, channel + warmth) for channel in color)
 
     def _draw_bottom_bar(self, theme_color):
-        state_labels = {"idle": "IDLE", "listening": "LISTENING", "speaking": "SPEAKING"}
-        state_colors = {"idle": theme_color, "listening": COLOR_LISTENING, "speaking": COLOR_SPEAKING}
-        label = state_labels.get(self.state, "IDLE")
-        c = state_colors.get(self.state, theme_color)
+        # State-driven animation, deliberately not presented as microphone amplitude.
+        color = self._voice_color()
+        cx, y = self.width / 2, self.height - 108
+        active = self.voice_available and self.state != "idle"
+        for i in range(49):
+            envelope = math.sin(math.pi * i / 48) ** 2
+            wave = abs(math.sin(self.elapsed * (5 if active else 1.3) + i * 0.48))
+            h = 3 + envelope * (24 if active else 6) * wave
+            self._draw_rect(cx + (i - 24) * 5, y - h / 2, 2, h, *color, 0.45 + envelope * 0.5)
+        label = ({"idle": 'SAY "AURORA" TO BEGIN', "listening": "LISTENING",
+                  "thinking": "PROCESSING YOUR REQUEST", "speaking": "AURORA IS SPEAKING"}
+                 .get(self.state, "STANDBY") if self.voice_available else "VOICE OFFLINE / CHECK MICROPHONE SETUP")
+        self._center_text(self.font_small, label, cx, y + 20, color=(165, 140, 105))
 
-        bar_h = 76
-        self._draw_panel(16, self.height - bar_h - 12, self.width - 32, bar_h, c, chamfer=18, fill_alpha=0.45)
+        # reference-style command pill with the live transcript inside
+        pw = min(430, self.width - 80)
+        px, py, ph = cx - pw / 2, self.height - 58, 26
+        self._draw_rect(px, py, pw, ph, 0.55, 0.62, 0.85, 0.05)
+        self._draw_rect(px, py, pw, ph, 0.55, 0.62, 0.85, 0.28, filled=False)
+        transcript = self.last_heard or "talk to aurora"
+        shown = self._fit_text(self.font_small, transcript, pw - 56)
+        self._blit_text(self.font_small, shown, px + 14, py + 7,
+                        color=(185, 195, 215) if self.last_heard else (110, 120, 145))
+        ix = px + pw - 24
+        self._draw_rect(ix, py + 6, 14, 14, 1.0, 0.68, 0.2, 0.12)
+        self._draw_rect(ix, py + 6, 14, 14, 1.0, 0.68, 0.2, 0.5, filled=False)
+        glColor4f(1.0, 0.75, 0.3, 0.9 if active else 0.4)
+        self._draw_circle_2d(ix + 7, py + 13, 2.0, segments=10)
+        if self.width >= 1000:
+            self._blit_text(self.font_small, "VOICE INTERFACE / " + ("READY" if self.voice_available else "OFFLINE"),
+                            32, self.height - 30, color=(80, 90, 110))
+            self._blit_text(self.font_small, "WINDOWED  /  ESC EXIT" if self.windowed_only else "F11 WINDOW  /  ESC EXIT",
+                            self.width - 255, self.height - 30, color=(80, 90, 110))
 
-        self._blit_text(self.font_small, "STATUS", 34, self.height - bar_h + 4, color=(90, 130, 160))
+    def _draw_telemetry(self):
+        """The per-frame HUD lines main.py feeds (zoom/fps/voice/hands) were
+        collected but never drawn — surface them as a dim readout so the
+        tracking state is visible without a debug window."""
+        if not self.hud_lines:
+            return
+        y = self.height - 96
+        for line in self.hud_lines:
+            y -= 16
+            self._blit_text(self.font_small, self._fit_text(self.font_small, line, 260),
+                            24, y, color=(96, 132, 160))
 
-        dot_pulse = 0.5 + 0.5 * math.sin(self.elapsed * (5 if self.state != "idle" else 2))
-        dot_x, dot_y = 140, self.height - bar_h + 30
-        glColor4f(c[0], c[1], c[2], 0.25 + 0.2 * dot_pulse)
-        self._draw_circle_2d(dot_x, dot_y, 9 + 3 * dot_pulse)
-        glColor4f(c[0], c[1], c[2], 1.0)
-        self._draw_circle_2d(dot_x, dot_y, 4)
+    def _overlay_frame(self, rect, theme_color, label, hint):
+        x, y, w, h = rect.x, rect.y, rect.width, rect.height
+        self._draw_panel(x, y, w, h, theme_color, chamfer=12, fill_alpha=.96)
+        self._draw_rect(x + 24, y + 48, w - 48, 1, *theme_color, .18)
+        self._blit_text(self.font_small, self._fit_text(self.font_small, label, w - 48),
+                        x + 24, y + 20, color=(209, 163, 84))
+        self._draw_rect(x + 24, y + h - 43, w - 48, 1, *theme_color, .12)
+        self._blit_text(self.font_small, self._fit_text(self.font_small, hint, w - 48),
+                        x + 24, y + h - 29, color=(153, 130, 94))
 
-        self._blit_text(self.font_big, label, 155, self.height - bar_h + 18,
-                         color=(int(c[0] * 255), int(c[1] * 255), int(c[2] * 255)))
-
-        hint = "Try: \"Aurora, show the Eiffel Tower\" or \"a skyscraper\"   F11 fullscreen   ESC quit"
-        self._blit_text(self.font_small, self._truncate(hint, 68), 34, self.height - 22, color=(100, 140, 165))
-
-        if self.hud_lines:
-            panel_w = 320
-            x = self.width - panel_w - 30
-            y = self.height - bar_h + 8
-            for line in self.hud_lines:
-                self._blit_text(self.font_small, self._truncate(line, 44), x, y, color=(160, 210, 235))
-                y += 17
-
-    def _draw_scanlines(self):
-        glColor4f(0.3, 0.9, 1.0, 0.035)
-        glBegin(GL_LINES)
-        y = self.scanline_phase % self.height
-        while y < self.height:
-            glVertex2f(60, y); glVertex2f(self.width - 60, y); y += 46
-        glEnd()
-
-    def _draw_corner_brackets(self):
-        m, L = 24, 46
-        corners = [
-            (m, m, 1, 1), (self.width - m, m, -1, 1),
-            (m, self.height - m, 1, -1), (self.width - m, self.height - m, -1, -1),
-        ]
-        glColor4f(0.25, 0.85, 1.0, 0.85)
-        glLineWidth(2.0)
-        glBegin(GL_LINES)
-        for x, y, dx, dy in corners:
-            glVertex2f(x, y); glVertex2f(x + dx * L, y)
-            glVertex2f(x, y); glVertex2f(x, y + dy * L)
-        glEnd()
-
-        # thinner inset accent line, offset slightly for a layered look
-        off = 6
-        glColor4f(0.25, 0.85, 1.0, 0.35)
-        glLineWidth(1.0)
-        glBegin(GL_LINES)
-        for x, y, dx, dy in corners:
-            ix, iy = x + dx * off, y + dy * off
-            glVertex2f(ix, iy); glVertex2f(ix + dx * (L - off), iy)
-            glVertex2f(ix, iy); glVertex2f(ix, iy + dy * (L - off))
-        glEnd()
+    def _draw_help(self, theme_color):
+        self._draw_rect(0, 0, self.width, self.height, .006, .005, .004, .9)
+        rect = overlay_rect(self.width, self.height, 'help')
+        self._overlay_frame(rect, theme_color, "VOICE GUIDE / NO BUTTONS REQUIRED",
+                            'Say "Aurora, close help"  /  ESC')
+        rows = [("EXPLORE", '"Show me a carbon atom"'),
+                ("WEATHER", '"Weather in Ghaziabad"'),
+                ("PERSONALIZE", '"Change theme" / "Reduce motion"'),
+                ("READ", '"Read more" / "Scroll up"'),
+                ("RETURN", '"Show core" / "Close answer"')]
+        available = rect.height - 116
+        spacing = available / len(rows)
+        for i, (label, phrase) in enumerate(rows):
+            y = rect.y + 65 + i * spacing
+            if spacing >= 38:
+                self._blit_text(self.font_small, label, rect.x + 24, y, color=(183, 143, 78))
+                self._blit_text(self.font, phrase, rect.x + 24, y + 20, color=(238, 220, 187))
+            else:
+                self._blit_text(self.font_small, self._fit_text(self.font_small, phrase, rect.width - 48),
+                                rect.x + 24, y, color=(238, 220, 187))
 
     # ---- weather widget (docks the hologram left, shows this on the right) --
 
@@ -1513,148 +1749,328 @@ class Hologram:
             self._blit_text(self.font_small, label, hx + 11, hy - 8, color=(230, 240, 255))
 
     def _draw_weather_panel(self, theme_color):
-        if not self.weather:
+        data, status = self.weather, self.weather_status
+        if not data and not status:
             return
-        w = self.weather
-        pw, ph = self.width * 0.36, self.height - 260
-        px, py = self.width - pw - 40, 130
-        self._draw_panel(px, py, pw, ph, theme_color, chamfer=20, fill_alpha=0.55, alpha_mult=self._materialize_progress())
-
-        cx = px + pw / 2
-        self._blit_text(self.font, w.get("location", "Unknown"), px + 24, py + 22, color=(150, 200, 230))
-        self._blit_text(self.font_small, f"Updated {w.get('updated_at', '')}", px + 24, py + 44, color=(90, 130, 160))
-
-        if self.map_highlight:
-            self._draw_us_map(px + 20, py + 60, pw - 40, 140, self.map_highlight, theme_color)
+        rect = overlay_rect(self.width, self.height, 'weather')
+        x, y, w, h = rect.x, rect.y, rect.width, rect.height
+        self._overlay_frame(rect, theme_color, "ATMOSPHERE / CURRENT CONDITIONS",
+                            'Say "Aurora, close weather"')
+        expanded = h >= 440
+        if status:
+            loading = status['status'] == 'loading'
+            label = "Acquiring conditions" if loading else "Unable to update weather"
+            self._blit_text(self.font, self._fit_text(self.font, label, w - 48), x + 24, y + 68,
+                            color=(241, 221, 184))
+            if loading:
+                phase = 0 if self.reduced_motion else (self.elapsed * .35) % 1
+                self._draw_rect(x + 24, y + 101, w - 48, 2, *theme_color, .15)
+                self._draw_rect(x + 24 + phase * (w - 80), y + 100, 32, 3, *theme_color, .8)
+            lines = self._wrap_text(self.font_small, status['message'], w - 48)
+            _, _, visible = visible_page(lines, 0, h - 172, 19)
+            for i, line in enumerate(visible):
+                self._blit_text(self.font_small, line, x + 24, y + 118 + i * 19,
+                                color=(197, 176, 142))
+            return
+        # A single clipped location keeps small overlays inside their bounds.
+        self._blit_text(self.font, self._fit_text(self.font, data['location'], w - 48),
+                        x + 24, y + 64, color=(241, 226, 202))
+        if expanded:
+            icon_x, icon_y = x + w - 78, y + 158
+            if data['condition'] == 'clear_night':
+                glColor4f(.96, .8, .48, .9)
+                self._draw_circle_2d(icon_x, icon_y, 25, segments=48)
+                glColor4f(.035, .027, .017, 1)
+                self._draw_circle_2d(icon_x + 12, icon_y - 8, 23, segments=48)
+            else:
+                bob = 0 if self.reduced_motion else math.sin(self.elapsed * .7) * 2
+                self._draw_weather_icon(data['condition'], icon_x, icon_y + bob, 34, theme_color)
+        temp_y = y + (119 if expanded else 93)
+        self._blit_text(self.font_huge if expanded else self.font_big,
+                        f"{round(data['temp_c'])}°C", x + 24, temp_y, color=(255, 223, 157))
+        description = self._fit_text(self.font_small, data['description'].upper(), w - 48)
+        self._blit_text(self.font_small, description, x + 24, temp_y + (68 if expanded else 36),
+                        color=(199, 170, 118))
+        humidity = '--' if data['humidity'] is None else f"{round(data['humidity'])}%"
+        wind = '--' if data['wind_kph'] is None else f"{round(data['wind_kph'])} km/h"
+        if expanded:
+            metrics_y = y + 238
+            for i, (label, value) in enumerate((("HUMIDITY", humidity), ("WIND", wind))):
+                mx = x + 24 + i * (w - 48) / 2
+                self._draw_rect(mx, metrics_y, (w - 64) / 2, 72, *theme_color, .045)
+                self._blit_text(self.font_small, label, mx + 12, metrics_y + 12, color=(156, 127, 81))
+                self._blit_text(self.font_big, value, mx + 12, metrics_y + 32, color=(230, 213, 180))
+            source_y = y + h - 95
+            self._blit_text(self.font_small, self._fit_text(self.font_small,
+                f"{data['source']} / {data['updated_at']}", w - 48), x + 24, source_y, color=(158, 137, 101))
+            self._blit_text(self.font_small, self._fit_text(self.font_small,
+                data.get('timezone', ''), w - 48), x + 24, source_y + 19, color=(126, 111, 86))
         else:
-            self._draw_weather_icon(w.get("condition", "cloudy"), cx, py + 130, 90, theme_color)
-
-        temp = w.get("temp_c")
-        temp_str = f"{round(temp)}°C" if temp is not None else "--"
-        if self.font_huge:
-            surf = self.font_huge.render(temp_str, True, (220, 240, 255))
-            tw = surf.get_size()[0]
-            self._blit_text(self.font_huge, temp_str, cx - tw / 2, py + 210, color=(220, 240, 255))
-
-        desc = w.get("description", "").upper()
-        if self.font:
-            surf = self.font.render(desc, True, (255, 255, 255))
-            dw = surf.get_size()[0]
-            self._blit_text(self.font, desc, cx - dw / 2, py + 275, color=(180, 220, 245))
-
-        stat_y = py + ph - 60
-        humidity = w.get("humidity")
-        wind = w.get("wind_kph")
-        stats = []
-        if humidity is not None:
-            stats.append(f"Humidity {humidity}%")
-        if wind is not None:
-            stats.append(f"Wind {round(wind)} km/h")
-        if stats:
-            line = "   |   ".join(stats)
-            surf = self.font_small.render(line, True, (255, 255, 255)) if self.font_small else None
-            lw = surf.get_size()[0] if surf else 0
-            self._blit_text(self.font_small, line, cx - lw / 2, stat_y, color=(150, 200, 230))
-
-    def _draw_hud_reticle(self, theme_color):
-        """Faint concentric rings + cardinal tick marks centered on the
-        hologram area — a subtle targeting-reticle HUD flourish."""
-        cx, cy = self.width / 2, self.height / 2 + 15
-        r, g, b = theme_color
-
-        for radius in (170, 230):
-            glColor4f(r, g, b, 0.07)
-            glLineWidth(1.0)
-            self._draw_circle_2d(cx, cy, radius, segments=64, filled=False)
-
-        glColor4f(r, g, b, 0.16)
-        glLineWidth(1.5)
-        glBegin(GL_LINES)
-        for angle_deg in (0, 90, 180, 270):
-            a = math.radians(angle_deg)
-            x1, y1 = cx + 230 * math.cos(a), cy + 230 * math.sin(a)
-            x2, y2 = cx + 248 * math.cos(a), cy + 248 * math.sin(a)
-            glVertex2f(x1, y1); glVertex2f(x2, y2)
-        glEnd()
+            stats = f"Humidity {humidity}  /  Wind {wind}"
+            self._blit_text(self.font_small, stats, x + 24, y + 154, color=(197, 177, 144))
+            # Source stays visible in compact view; timestamp is clipped by pixels.
+            self._blit_text(self.font_small, self._fit_text(self.font_small,
+                f"{data['source']} / {data['updated_at']}", w - 48),
+                x + 24, y + h - 63, color=(148, 126, 91))
 
     def _wrap_text(self, font, text, max_width):
         if not font:
             return [text]
-        words = text.split()
         lines, current = [], ""
-        for word in words:
-            test = (current + " " + word).strip()
-            if font.size(test)[0] <= max_width:
-                current = test
-            else:
-                if current:
+        for word in text.split():
+            candidate = (current + " " + word).strip()
+            if font.size(candidate)[0] <= max_width:
+                current = candidate
+                continue
+            if current:
+                lines.append(current)
+            current = ""
+            # Break long URLs/tokens too; word-only wrapping lets these escape cards.
+            for char in word:
+                if current and font.size(current + char)[0] > max_width:
                     lines.append(current)
-                current = word
+                    current = ""
+                current += char
         if current:
             lines.append(current)
         return lines
 
     def _draw_info_card(self, theme_color):
-        if not self.info_card:
+        card = self.info_card
+        if not card:
             return
-        pw = max(500, min(800, self.width - 620))
-        ph = 300
-        px = (self.width - pw) / 2
-        py = (self.height - ph) / 2 + 10
-        self._draw_panel(px, py, pw, ph, theme_color, chamfer=20, fill_alpha=0.6, alpha_mult=self._materialize_progress())
+        rect = overlay_rect(self.width, self.height, 'answer')
+        x, y, w, h = rect.x, rect.y, rect.width, rect.height
+        lines = self._wrap_text(self.font, card['answer'], w - 56)
+        start_y = y + 128
+        self.info_scroll, self._info_page_lines, visible = visible_page(
+            lines, self.info_scroll, h - 190)
+        page = self.info_scroll // self._info_page_lines + 1
+        pages = max(1, math.ceil(len(lines) / self._info_page_lines))
+        hint = '"Aurora, read more" / "Scroll up"' if pages > 1 else '"Aurora, close answer"'
+        self._overlay_frame(rect, theme_color, f"AURORA / RESPONSE   {page:02d} / {pages:02d}", hint)
+        question = self._wrap_text(self.font_small, card['question'], w - 56)
+        for i, line in enumerate(question[:2]):
+            self._blit_text(self.font_small, line, x + 28, y + 67 + i * 19, color=(175, 148, 108))
+        for i, line in enumerate(visible):
+            self._blit_text(self.font, line, x + 28, start_y + i * 23, color=(239, 224, 197))
+        track_y = y + h - 53
+        self._draw_rect(x + 24, track_y, w - 48, 2, *theme_color, .12)
+        fraction = min(1, (self.info_scroll + len(visible)) / max(1, len(lines)))
+        self._draw_rect(x + 24, track_y, (w - 48) * fraction, 2, *theme_color, .65)
 
-        x, y = px + 24, py + 20
-        self._blit_text(self.font_small, "YOU ASKED", x, y, color=(90, 130, 160))
-        y += 18
-        for line in self._wrap_text(self.font_small, self.info_card["question"], pw - 48)[:2]:
-            self._blit_text(self.font_small, line, x, y, color=(140, 180, 210))
-            y += 16
+    def _graph_positions(self):
+        """Screen-space node layout: the constellation spans the whole
+        window, with long connectors radiating through the core, like the
+        reference dashboards."""
+        positions = []
+        for _label, fx, fy, _family, _gear in GRAPH_NODES:
+            x = min(self.width - 180, max(24, fx * self.width))
+            y = min(self.height - 150, max(80, fy * self.height))
+            positions.append((x, y))
+        return positions
 
-        y += 14
-        self._blit_text(self.font_small, "AURORA", x, y, color=(90, 130, 160))
-        y += 22
+    def _draw_system_graph(self, theme_color):
+        """Constellation of live subsystem nodes around the voice core —
+        glowing clusters, thin connector lines and boxed uppercase labels,
+        in the style of the supplied reference dashboard."""
+        docked = bool(self.weather or self.weather_status or self.info_card) and self.width >= 1000
+        free = ParticleCore.layout(self.width, self.height, False)
+        side = ParticleCore.layout(self.width, self.height, True)
+        cx, cy, radius = tuple(a + (b - a) * self._core_dock for a, b in zip(free, side))
+        fade = self._materialize_progress()
+        positions = self._graph_positions()
 
-        a_lines = self._wrap_text(self.font, self.info_card["answer"], pw - 48)
-        max_lines = max(1, (py + ph - 20 - y) // 22)
-        for line in a_lines[:max_lines]:
-            self._blit_text(self.font, line, x, y, color=(210, 235, 255))
-            y += 22
-        if len(a_lines) > max_lines:
-            self._blit_text(self.font_small, "...", x, y, color=(120, 150, 175))
+        # soft multi-hue nebula haze behind the core (additive)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+        for (r, g, b), dx, dy, scale in (((1.0, .3, .8), -.4, -.15, 1.2),
+                                         ((.5, .35, 1.0), .4, -.3, 1.3),
+                                         ((.2, .7, 1.0), .1, .4, 1.1)):
+            glBegin(GL_TRIANGLE_FAN)
+            glColor4f(r, g, b, 0.22 * fade)
+            glVertex2f(cx, cy)
+            glColor4f(r, g, b, 0)
+            for i in range(49):
+                angle = i * math.tau / 48
+                glVertex2f(cx + dx * radius + math.cos(angle) * radius * scale,
+                           cy + dy * radius + math.sin(angle) * radius * scale)
+            glEnd()
+        # white swirl arms sweeping around the nucleus, like the reference
+        if not self.reduced_motion:
+            glLineWidth(1.5)
+            for arm in range(2):
+                base = self.elapsed * 0.6 + arm * math.pi
+                glBegin(GL_LINE_STRIP)
+                for i in range(25):
+                    t = i / 24
+                    angle = base + t * 2.4
+                    rr = radius * (0.10 + 0.32 * t)
+                    glColor4f(0.9, 0.95, 1.0, (1 - t) * 0.45 * fade)
+                    glVertex2f(cx + math.cos(angle) * rr, cy + math.sin(angle) * rr * 0.9)
+                glEnd()
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+
+        # connector lines: hub spokes through gear nodes + chained links,
+        # some drawn dashed like the reference's long constellation edges
+        glLineWidth(1.0)
+        glBegin(GL_LINES)
+        for node, (x, y) in zip(GRAPH_NODES, positions):
+            if node[4]:
+                glColor4f(0.78, 0.84, 1.0, 0.12 * fade)
+                glVertex2f(cx, cy); glVertex2f(x, y)
+        for a, b in GRAPH_CROSS_LINKS:
+            ax, ay = positions[a]
+            bx, by = positions[b]
+            glColor4f(0.78, 0.84, 1.0, 0.09 * fade)
+            if (a + b) % 3 == 0:  # dashed variant
+                length = math.hypot(bx - ax, by - ay) or 1
+                steps = max(2, int(length / 14))
+                for s in range(0, steps, 2):
+                    t0, t1 = s / steps, min(1, (s + 1) / steps)
+                    glVertex2f(ax + (bx - ax) * t0, ay + (by - ay) * t0)
+                    glVertex2f(ax + (bx - ax) * t1, ay + (by - ay) * t1)
+            else:
+                glVertex2f(ax, ay); glVertex2f(bx, by)
+        glEnd()
+
+        for index, (node, (x, y)) in enumerate(zip(GRAPH_NODES, positions)):
+            label, _fx, _fy, family, gear = node
+            r, g, b = GRAPH_FAMILIES[family]
+            if label == "VOICE LINK":
+                status = 1.0 if self.voice_available else 0.35
+            elif label == "WEATHER DOCK":
+                status = 1.0 if self.weather else 0.5
+            else:
+                status = 0.75 + 0.25 * math.sin(self.elapsed * 1.7 + index)
+            glow = status * fade
+            if gear:
+                # radial "flower" cluster: dotted ring + spokes
+                glColor4f(r, g, b, 0.10 * glow)
+                self._draw_circle_2d(x, y, 11, segments=16)
+                glBegin(GL_LINES)
+                for s in range(8):
+                    a = s * math.tau / 8 + self.elapsed * (0 if self.reduced_motion else 0.15)
+                    glColor4f(r, g, b, 0.5 * glow)
+                    glVertex2f(x + math.cos(a) * 6, y + math.sin(a) * 6)
+                    glVertex2f(x + math.cos(a) * 13, y + math.sin(a) * 13)
+                glEnd()
+                for d in range(14):
+                    a = d * math.tau / 14
+                    glColor4f(r, g, b, 0.55 * glow)
+                    self._draw_circle_2d(x + math.cos(a) * 17, y + math.sin(a) * 17, 1.2, segments=6)
+                glColor4f(min(1, r + .3), min(1, g + .3), min(1, b + .3), 0.95 * glow)
+                self._draw_circle_2d(x, y, 2.6, segments=10)
+            else:
+                # tan terminal dot with a darker ring, like the reference
+                glColor4f(r, g, b, 0.14 * glow)
+                self._draw_circle_2d(x, y, 8, segments=12)
+                glColor4f(0.16, 0.13, 0.10, 0.9 * fade)
+                self._draw_circle_2d(x, y, 4.6, segments=12)
+                glColor4f(min(1, r + .15), min(1, g + .15), min(1, b + .15), 0.9 * glow)
+                self._draw_circle_2d(x, y, 3.4, segments=12)
+
+            # boxed uppercase label chip
+            text = label.upper()
+            tw = self.font_small.size(text)[0] if self.font_small else len(text) * 7
+            lx, ly = x + 12, y - 9
+            if lx + tw + 12 > self.width - 8:
+                lx = x - tw - 24
+            self._draw_rect(lx, ly, tw + 12, 17, 0.02, 0.02, 0.03, 0.72 * fade)
+            self._draw_rect(lx, ly, tw + 12, 17, r, g, b, 0.28 * fade, filled=False)
+            self._blit_text(self.font_small, text, lx + 6, ly + 3,
+                            color=(int(165 + 70 * r * status), int(165 + 70 * g * status),
+                                   int(165 + 70 * b * status)))
 
     def _draw_idle_indicator(self, theme_color):
-        """Shown only in empty mode — a soft breathing ring so the center
-        of the screen reads as 'idle, ready, listening' rather than a
-        dead void that looks broken."""
-        cx, cy = self.width / 2, self.height / 2 + 15
-        pulse = 0.5 + 0.5 * math.sin(self.elapsed * 1.1)
-        r, g, b = theme_color
-
-        for i, base_r in enumerate((60, 90, 120)):
-            radius = base_r + pulse * 12
-            alpha = (0.22 - i * 0.06) * (0.6 + 0.4 * pulse)
-            glColor4f(r, g, b, alpha)
-            glLineWidth(1.5)
-            self._draw_circle_2d(cx, cy, radius, segments=64, filled=False)
-
-        glColor4f(r, g, b, 0.5 + 0.3 * pulse)
-        self._draw_circle_2d(cx, cy, 5, segments=20)
+        """Multi-hue nebula particle sphere with orbital trails and a hot
+        blue-white nucleus, in the style of the supplied reference."""
+        docked = bool(self.weather or self.weather_status or self.info_card) and self.width >= 1000
+        target = 1.0 if docked else 0.0
+        previous = getattr(self, '_core_dock', target)
+        self._core_dock = target if self.reduced_motion else previous + (target - previous) * .12
+        free = ParticleCore.layout(self.width, self.height, False)
+        side = ParticleCore.layout(self.width, self.height, True)
+        cx, cy, radius = tuple(a + (b - a) * self._core_dock for a, b in zip(free, side))
+        motion_time, energy = self.core_animation.advance(self.elapsed, self.state, self.reduced_motion)
+        frame = self.particle_core.frame(motion_time, self.state,
+                                         quality=self.particle_quality, energy=energy)
+        color = self._voice_color()
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+        try:
+            batches, line_batch = build_buffers(frame, (cx, cy), radius, color, self.brightness,
+                                                palette=NEBULA_PALETTE)
+            # A handful of vertex-array draws replaces thousands of Python GL calls.
+            glPushClientAttrib(GL_CLIENT_VERTEX_ARRAY_BIT)
+            glPushAttrib(GL_POINT_BIT)
+            try:
+                glEnableClientState(GL_VERTEX_ARRAY)
+                glEnableClientState(GL_COLOR_ARRAY)
+                glEnable(GL_POINT_SMOOTH)
+                def draw_batch(vertices, colors, primitive):
+                    if not vertices:
+                        return
+                    glVertexPointer(2, GL_FLOAT, 0, ctypes.c_void_p(vertices.buffer_info()[0]))
+                    glColorPointer(4, GL_FLOAT, 0, ctypes.c_void_p(colors.buffer_info()[0]))
+                    glDrawArrays(primitive, 0, len(vertices) // 2)
+                for size, (vertices, colors) in batches.items():
+                    # Broad dim halo plus a sharp head: real moving points, no sprites/images.
+                    halo = colors[:]
+                    for index in range(3, len(halo), 4):
+                        halo[index] *= .12
+                    point_scale = max(.75, min(1.25, math.sqrt(radius / 200)))
+                    if self.particle_quality != "performance" or size == 3:
+                        glPointSize((size * 2.5 + 1) * point_scale)
+                        draw_batch(vertices, halo, GL_POINTS)
+                    if self.particle_quality == "cinematic":
+                        for index in range(3, len(halo), 4):
+                            halo[index] *= .45
+                        glPointSize((size * 4 + 2) * point_scale)
+                        draw_batch(vertices, halo, GL_POINTS)
+                    glPointSize(size * point_scale)
+                    draw_batch(vertices, colors, GL_POINTS)
+                glLineWidth(1.2)
+                draw_batch(*line_batch, GL_LINES)
+            finally:
+                glPopAttrib()
+                glPopClientAttrib()
+            # Smooth radial glow, not nested opaque disks; white-hot central seed.
+            for scale, alpha in ((.4, .09), (.2, .22), (.08, .85)):
+                glBegin(GL_TRIANGLE_FAN)
+                glColor4f(.5 + .4 * frame.energy, .68 + .27 * frame.energy, 1.0, alpha)
+                glVertex2f(cx, cy)
+                glColor4f(.3, .45, 1.0, 0)
+                for i in range(65):
+                    angle = i * math.tau / 64
+                    glVertex2f(cx + math.cos(angle) * radius * scale,
+                               cy + math.sin(angle) * radius * scale)
+                glEnd()
+            glColor4f(.88, .94, 1.0, .95)
+            self._draw_circle_2d(cx, cy, radius * .021, segments=32)
+        finally:
+            glPointSize(1)
+            glLineWidth(1)
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 
     def _draw_dashboard(self, theme_color):
         self._begin_ortho()
-        self._draw_background_grid()
-        self._draw_hud_reticle(theme_color)
-        if self.mode == "empty":
+        self._draw_space_background()
+        overlay_active = bool(self.weather or self.weather_status or self.info_card)
+        if self.mode in ("empty", "info") and (not overlay_active or self.width >= 1000):
+            if self.mode == "empty":
+                self._draw_system_graph(theme_color)
             self._draw_idle_indicator(theme_color)
         if self.mode == "info":
             self._draw_info_card(theme_color)
         self._draw_top_bar(theme_color)
-        self._draw_system_panel(theme_color)
-        self._draw_event_log()
+        if self.show_diagnostics and self.width >= 1100 and self.height >= 720:
+            self._draw_system_panel(theme_color)
+            if not self.weather and not self.weather_status and self.mode != "info":
+                self._draw_event_log()
         self._draw_weather_panel(theme_color)
         self._draw_bottom_bar(theme_color)
-        self._draw_scanlines()
-        self._draw_corner_brackets()
+        self._draw_telemetry()
+        if self.show_help:
+            self._draw_help(theme_color)
         self._end_ortho()
 
     # ---- main render ------------------------------------------------------
@@ -1662,14 +2078,11 @@ class Hologram:
     def render(self, pinch_amount=0.0):
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
-        self._begin_ortho()
-        self._draw_starfield()
-        self._draw_aurora_background()
-        self._end_ortho()
 
         base_color = {
             "listening": COLOR_LISTENING,
             "speaking": COLOR_SPEAKING,
+            "thinking": COLOR_THINKING,
         }.get(self.state, self._current_theme_color())
         if self.mode == "solar_system":
             base_color = (1.0, 0.75, 0.2)  # sunlight tint regardless of theme

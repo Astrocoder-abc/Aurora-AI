@@ -18,10 +18,12 @@ which have historically been painful to install on Windows.
 import json
 import os
 
+from .paths import PROJECT_ROOT
+
 import cv2
 import numpy as np
 
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "face_data")
+DATA_DIR = os.path.join(str(PROJECT_ROOT), "face_data")
 MODEL_PATH = os.path.join(DATA_DIR, "lbph_model.yml")
 PEOPLE_PATH = os.path.join(DATA_DIR, "people.json")
 CASCADE_PATH = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
@@ -110,7 +112,11 @@ class FaceID:
         if name in self.people:
             label = self.people[name]["label"]
         else:
-            label = max([info["label"] for info in self.people.values()], default=-1) + 1
+            # Forgotten labels still exist in LBPH; never assign them to someone else.
+            labels = [info["label"] for info in self.people.values()]
+            if self._trained:
+                labels.extend(int(v) for v in self.recognizer.getLabels().flatten())
+            label = max(labels, default=-1) + 1
             self.people[name] = {"label": label, "theme_index": len(self.people) % 4}
 
         faces = [cv2.resize(f, (200, 200)) for f in gray_face_samples]

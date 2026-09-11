@@ -25,6 +25,8 @@ Full gesture feature set:
 
 import math
 import os
+
+from .paths import PROJECT_ROOT
 import time
 import urllib.request
 from collections import deque, Counter
@@ -38,7 +40,7 @@ from mediapipe.tasks.python.vision import (
     RunningMode,
 )
 
-MODEL_FILENAME = "hand_landmarker.task"
+MODEL_FILENAME = os.path.join(str(PROJECT_ROOT), "hand_landmarker.task")
 MODEL_URL = (
     "https://storage.googleapis.com/mediapipe-models/hand_landmarker/"
     "hand_landmarker/float16/latest/hand_landmarker.task"
@@ -131,6 +133,10 @@ class HandTracker:
         self.landmarker = HandLandmarker.create_from_options(options)
 
         self.cap = cv2.VideoCapture(camera_index)
+        if not self.cap.isOpened():
+            self.cap.release()
+            self.landmarker.close()
+            raise RuntimeError(f"Camera {camera_index} unavailable; check permissions or --camera-index")
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
@@ -268,7 +274,7 @@ class HandTracker:
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-        self._timestamp_ms += 33
+        self._timestamp_ms = max(self._timestamp_ms + 1, int(time.monotonic() * 1000))
         detection = self.landmarker.detect_for_video(mp_image, self._timestamp_ms)
 
         h, w = frame.shape[:2]
