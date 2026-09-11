@@ -51,30 +51,46 @@ THEMES = [
     (1.0, 0.2, 0.4),
 ]
 
-# Subsystem graph drawn around the voice core — a live constellation of the
-# assistant's modules. (label, ux, uy, family, gear) with gear=True drawing
-# the radial "flower" cluster from the reference. Families map to colors.
+# Subsystem graph drawn across the whole screen around the voice core — a
+# live constellation of the assistant's modules, in the style of the supplied
+# reference dashboards. (label, fx, fy, family, gear): fx/fy are normalized
+# screen positions; gear=True draws the radial "flower" cluster, otherwise a
+# small tan terminal dot. Families map to colors.
 GRAPH_FAMILIES = {
     "cyan": (0.25, 0.95, 0.85),
     "green": (0.45, 1.0, 0.55),
     "gold": (1.0, 0.78, 0.25),
     "pink": (1.0, 0.4, 0.65),
     "violet": (0.68, 0.45, 1.0),
+    "tan": (0.82, 0.72, 0.55),
 }
 GRAPH_NODES = [
-    ("VOICE LINK", -0.62, -0.86, "violet", False),
-    ("PARTICLE FLOW", 0.55, -1.02, "cyan", True),
-    ("HAND TRACKER", 1.28, -0.52, "cyan", True),
-    ("WEATHER DOCK", 1.42, 0.28, "gold", False),
-    ("TIMER SERVICE", 0.86, 0.92, "green", False),
-    ("MEDIA CONTROL", -0.18, 1.12, "pink", True),
-    ("FACE ID", -1.12, 0.72, "cyan", False),
-    ("SYSTEM STATS", -1.42, -0.18, "gold", True),
-    ("EVENT LOG", -0.52, 0.42, "green", False),
-    ("THEME ENGINE", 0.28, -0.48, "pink", False),
+    ("VOICE LINK", 0.34, 0.17, "violet", True),
+    ("WAKE WORD", 0.55, 0.27, "tan", False),
+    ("PARTICLE FLOW", 0.66, 0.13, "cyan", True),
+    ("HAND TRACKER", 0.84, 0.28, "cyan", True),
+    ("OPEN-METEO", 0.78, 0.40, "tan", False),
+    ("WEATHER DOCK", 0.87, 0.50, "gold", False),
+    ("GROQ BRIDGE", 0.70, 0.44, "tan", False),
+    ("TIMER SERVICE", 0.74, 0.76, "green", True),
+    ("EDGE TTS", 0.60, 0.60, "tan", False),
+    ("MEDIA CONTROL", 0.47, 0.82, "pink", True),
+    ("SNAPSHOTS", 0.30, 0.74, "tan", False),
+    ("FACE ID", 0.20, 0.66, "cyan", False),
+    ("ADB PHONE", 0.13, 0.55, "tan", False),
+    ("SYSTEM STATS", 0.12, 0.38, "gold", True),
+    ("STAR CHART", 0.24, 0.45, "tan", False),
+    ("SHAPE LIB", 0.35, 0.55, "tan", False),
+    ("CALC CORE", 0.27, 0.64, "tan", False),
+    ("US MAP", 0.17, 0.45, "green", False),
+    ("EVENT LOG", 0.43, 0.68, "tan", False),
+    ("THEME ENGINE", 0.62, 0.33, "pink", False),
 ]
 # Extra constellation edges between node indices (besides hub spokes).
-GRAPH_CROSS_LINKS = [(0, 7), (7, 6), (6, 8), (8, 5), (5, 4), (4, 3), (3, 2), (2, 1), (1, 9), (9, 0)]
+GRAPH_CROSS_LINKS = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (6, 7),
+                     (7, 8), (8, 9), (9, 10), (10, 11), (11, 12), (12, 13),
+                     (13, 14), (14, 15), (15, 16), (16, 17), (17, 11),
+                     (18, 15), (18, 8), (19, 1), (19, 6), (0, 13), (9, 18)]
 
 FLASH_COLORS = {
     "thumbs_up": (0.2, 1.0, 0.3),
@@ -370,8 +386,8 @@ class Hologram:
         # links between nearby stars (reference constellation dashboard).
         _star_rng = random.Random(7)
         self.stars = [
-            (_star_rng.random(), _star_rng.random(), _star_rng.uniform(0, 6.28), _star_rng.choice([1, 1, 1, 2]))
-            for _ in range(300)
+            (_star_rng.random(), _star_rng.random(), _star_rng.uniform(0, 6.28), _star_rng.choice([1, 1, 2, 2, 3]))
+            for _ in range(420)
         ]
         self.star_links = []
         for i in range(0, len(self.stars) - 1, 7):
@@ -1287,8 +1303,8 @@ class Hologram:
         for fx, fy, phase, size in self.stars:
             twinkle = 1.0 if self.reduced_motion else \
                 0.35 + 0.65 * max(0.0, math.sin(self.elapsed * 1.2 + phase))
-            glColor4f(0.8, 0.88, 1.0, 0.5 * twinkle)
-            self._draw_circle_2d(fx * self.width, fy * self.height, size * 0.8)
+            glColor4f(0.82, 0.88, 1.0, 0.65 * twinkle)
+            self._draw_circle_2d(fx * self.width, fy * self.height, size * 0.7)
 
     def _draw_rect(self, x, y, w, h, r, g, b, a, filled=True):
         glBegin(GL_QUADS if filled else GL_LINE_LOOP)
@@ -1439,15 +1455,15 @@ class Hologram:
             for label, frac in self._get_system_stats()[:2]:
                 stats.append((label, "N/A" if frac is None else f"{int(frac * 100)}"))
             stats.append(("UPTIME", up))
+            # two-row mini table, right aligned: dim label over bright value
             rx = self.width - 24
             for label, value in reversed(stats):
                 vw = self.font_small.size(value)[0] if self.font_small else len(value) * 7
                 lw = self.font_small.size(label)[0] if self.font_small else len(label) * 7
-                rx -= vw
-                self._blit_text(self.font_small, value, rx, 24, color=(215, 230, 250))
-                rx -= lw + 6
-                self._blit_text(self.font_small, label, rx, 26, color=(95, 110, 135))
-                rx -= 16
+                rx -= max(vw, lw)
+                self._blit_text(self.font_small, label, rx, 20, color=(95, 110, 135))
+                self._blit_text(self.font_small, value, rx, 34, color=(215, 230, 250))
+                rx -= 18
             label = "CORE / VOICE" if self.mode == "empty" else self.mode_label
             self._blit_text(self.font_small, self._fit_text(self.font_small, label, self.width / 2 - 235),
                             36, 52, color=(110, 100, 80))
@@ -1843,12 +1859,14 @@ class Hologram:
         fraction = min(1, (self.info_scroll + len(visible)) / max(1, len(lines)))
         self._draw_rect(x + 24, track_y, (w - 48) * fraction, 2, *theme_color, .65)
 
-    def _graph_positions(self, cx, cy, radius):
-        sx, sy = radius * 1.55, radius * 1.3
+    def _graph_positions(self):
+        """Screen-space node layout: the constellation spans the whole
+        window, with long connectors radiating through the core, like the
+        reference dashboards."""
         positions = []
-        for _label, ux, uy, _family, _gear in GRAPH_NODES:
-            x = min(self.width - 170, max(28, cx + ux * sx))
-            y = min(self.height - 150, max(86, cy + uy * sy))
+        for _label, fx, fy, _family, _gear in GRAPH_NODES:
+            x = min(self.width - 180, max(24, fx * self.width))
+            y = min(self.height - 150, max(80, fy * self.height))
             positions.append((x, y))
         return positions
 
@@ -1861,7 +1879,7 @@ class Hologram:
         side = ParticleCore.layout(self.width, self.height, True)
         cx, cy, radius = tuple(a + (b - a) * self._core_dock for a, b in zip(free, side))
         fade = self._materialize_progress()
-        positions = self._graph_positions(cx, cy, radius)
+        positions = self._graph_positions()
 
         # soft multi-hue nebula haze behind the core (additive)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE)
@@ -1877,21 +1895,46 @@ class Hologram:
                 glVertex2f(cx + dx * radius + math.cos(angle) * radius * scale,
                            cy + dy * radius + math.sin(angle) * radius * scale)
             glEnd()
+        # white swirl arms sweeping around the nucleus, like the reference
+        if not self.reduced_motion:
+            glLineWidth(1.5)
+            for arm in range(2):
+                base = self.elapsed * 0.6 + arm * math.pi
+                glBegin(GL_LINE_STRIP)
+                for i in range(25):
+                    t = i / 24
+                    angle = base + t * 2.4
+                    rr = radius * (0.10 + 0.32 * t)
+                    glColor4f(0.9, 0.95, 1.0, (1 - t) * 0.45 * fade)
+                    glVertex2f(cx + math.cos(angle) * rr, cy + math.sin(angle) * rr * 0.9)
+                glEnd()
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 
-        # connector lines: hub spokes + cross links
+        # connector lines: hub spokes through gear nodes + chained links,
+        # some drawn dashed like the reference's long constellation edges
         glLineWidth(1.0)
         glBegin(GL_LINES)
-        for (x, y) in positions:
-            glColor4f(0.75, 0.82, 1.0, 0.13 * fade)
-            glVertex2f(cx, cy); glVertex2f(x, y)
+        for node, (x, y) in zip(GRAPH_NODES, positions):
+            if node[4]:
+                glColor4f(0.78, 0.84, 1.0, 0.12 * fade)
+                glVertex2f(cx, cy); glVertex2f(x, y)
         for a, b in GRAPH_CROSS_LINKS:
-            glColor4f(0.75, 0.82, 1.0, 0.08 * fade)
-            glVertex2f(*positions[a]); glVertex2f(*positions[b])
+            ax, ay = positions[a]
+            bx, by = positions[b]
+            glColor4f(0.78, 0.84, 1.0, 0.09 * fade)
+            if (a + b) % 3 == 0:  # dashed variant
+                length = math.hypot(bx - ax, by - ay) or 1
+                steps = max(2, int(length / 14))
+                for s in range(0, steps, 2):
+                    t0, t1 = s / steps, min(1, (s + 1) / steps)
+                    glVertex2f(ax + (bx - ax) * t0, ay + (by - ay) * t0)
+                    glVertex2f(ax + (bx - ax) * t1, ay + (by - ay) * t1)
+            else:
+                glVertex2f(ax, ay); glVertex2f(bx, by)
         glEnd()
 
         for index, (node, (x, y)) in enumerate(zip(GRAPH_NODES, positions)):
-            label, _ux, _uy, family, gear = node
+            label, _fx, _fy, family, gear = node
             r, g, b = GRAPH_FAMILIES[family]
             if label == "VOICE LINK":
                 status = 1.0 if self.voice_available else 0.35
@@ -1900,10 +1943,10 @@ class Hologram:
             else:
                 status = 0.75 + 0.25 * math.sin(self.elapsed * 1.7 + index)
             glow = status * fade
-            glColor4f(r, g, b, 0.10 * glow)
-            self._draw_circle_2d(x, y, 11, segments=16)
             if gear:
                 # radial "flower" cluster: dotted ring + spokes
+                glColor4f(r, g, b, 0.10 * glow)
+                self._draw_circle_2d(x, y, 11, segments=16)
                 glBegin(GL_LINES)
                 for s in range(8):
                     a = s * math.tau / 8 + self.elapsed * (0 if self.reduced_motion else 0.15)
@@ -1915,20 +1958,28 @@ class Hologram:
                     a = d * math.tau / 14
                     glColor4f(r, g, b, 0.55 * glow)
                     self._draw_circle_2d(x + math.cos(a) * 17, y + math.sin(a) * 17, 1.2, segments=6)
-            glColor4f(min(1, r + .3), min(1, g + .3), min(1, b + .3), 0.95 * glow)
-            self._draw_circle_2d(x, y, 2.6, segments=10)
+                glColor4f(min(1, r + .3), min(1, g + .3), min(1, b + .3), 0.95 * glow)
+                self._draw_circle_2d(x, y, 2.6, segments=10)
+            else:
+                # tan terminal dot with a darker ring, like the reference
+                glColor4f(r, g, b, 0.14 * glow)
+                self._draw_circle_2d(x, y, 8, segments=12)
+                glColor4f(0.16, 0.13, 0.10, 0.9 * fade)
+                self._draw_circle_2d(x, y, 4.6, segments=12)
+                glColor4f(min(1, r + .15), min(1, g + .15), min(1, b + .15), 0.9 * glow)
+                self._draw_circle_2d(x, y, 3.4, segments=12)
 
             # boxed uppercase label chip
             text = label.upper()
             tw = self.font_small.size(text)[0] if self.font_small else len(text) * 7
-            lx, ly = x + 14, y - 9
+            lx, ly = x + 12, y - 9
             if lx + tw + 12 > self.width - 8:
-                lx = x - tw - 26
+                lx = x - tw - 24
             self._draw_rect(lx, ly, tw + 12, 17, 0.02, 0.02, 0.03, 0.72 * fade)
-            self._draw_rect(lx, ly, tw + 12, 17, r, g, b, 0.30 * fade, filled=False)
+            self._draw_rect(lx, ly, tw + 12, 17, r, g, b, 0.28 * fade, filled=False)
             self._blit_text(self.font_small, text, lx + 6, ly + 3,
-                            color=(int(150 + 90 * r * status), int(150 + 90 * g * status),
-                                   int(150 + 90 * b * status)))
+                            color=(int(165 + 70 * r * status), int(165 + 70 * g * status),
+                                   int(165 + 70 * b * status)))
 
     def _draw_idle_indicator(self, theme_color):
         """Multi-hue nebula particle sphere with orbital trails and a hot
