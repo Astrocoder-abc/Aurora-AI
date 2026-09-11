@@ -24,6 +24,7 @@ passing these checks does **not** verify a GPU driver or a working microphone.
 | Speech notices | Greeting/timer notifications queue rather than block rendering |
 | Weather | Structured fixtures, city parsing, missing location, invalid values, network/rate-limit failures |
 | Overlays | Layout and drawing logic at 640×480, 800×600, 1000×680, 1200×800, 1920×1080 |
+| Constellation UI | Space background, subsystem graph labels, top-bar tabs/briefing/stats, command pill, telemetry readout (GL stubbed) |
 | Answer navigation | Every page is reachable, final page preserved, scroll bounds |
 | Calculator | Basic math, percentage, zero division, exponent/size limits |
 | Device fallbacks | Media failure feedback, authorized/offline/multiple ADB device parsing |
@@ -35,7 +36,7 @@ Use a terminal so any traceback stays visible. Do not test phone calls, PIN entr
 or app launches unless you intend the corresponding action on your own device.
 
 1. **Graphics only:** `python main.py --no-camera --no-voice`.
-   The amber core should animate and show voice offline. F11 must leave the
+   The nebula core should animate and show voice offline. F11 must leave the
    window unchanged in default/windowed mode. Close
    the window; the process should exit without a second cleanup exception.
 2. **Voice:** `python main.py --no-camera`. Say “Aurora” alone, then “show me a
@@ -64,15 +65,20 @@ PIN files, contacts, or face data.
 
 ## Visual previews
 
-`core-motion.gif`, `core-preview.png`, and `overlays-preview.png` are software design previews, **not
-captured OpenGL windows**. Overlay weather values are explicitly fixture/sample
-data. The overlay preview invokes the real overlay layout/text methods through
-Pillow drawing adapters; glow and weather-icon rendering are approximations.
+`core-motion.gif`, `core-preview.png`, `overlays-preview.png`,
+`dashboard-preview.png`, and `dashboard-docked-preview.png` are software design
+previews, **not captured OpenGL windows**. Overlay weather values are
+explicitly fixture/sample data. The overlay preview invokes the real overlay
+layout/text methods through Pillow drawing adapters; the dashboard preview
+executes the real HUD draw methods through a small software GL rasterizer
+(only the GPU rasterizer is replaced); glow and weather-icon rendering are
+approximations.
 
 ```sh
 pip install Pillow  # optional development-only dependency
 python tools/render_core_preview.py --motion
 python tools/render_overlays_preview.py
+python tools/render_dashboard_preview.py
 ```
 
 Live speech services, live weather requests, device operations, and real OpenGL

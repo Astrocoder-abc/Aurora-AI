@@ -290,8 +290,10 @@ def main():
             # because your hand dropped out of frame.
             hologram.voice_available = voice.enabled
             hologram.last_heard = getattr(voice, "last_heard", "")
-            # Voice HUD states must not pretend a hand gesture is microphone activity.
-            hologram.set_state(voice.state)
+            # Voice state takes priority; hand gestures drive the core glow
+            # only while the voice assistant is off (visual troubleshooting),
+            # so gestures never fake microphone activity on a live voice HUD.
+            hologram.set_state(voice.state if voice.enabled else gesture_state)
 
             if result.zoom_delta:
                 hologram.apply_zoom_delta(result.zoom_delta)

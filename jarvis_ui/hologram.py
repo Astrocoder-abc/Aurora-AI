@@ -30,7 +30,7 @@ import threading
 
 from jarvis_ui.particle_core import ParticleCore
 from jarvis_ui.core_animation import CoreAnimation
-from jarvis_ui.particle_buffers import build_buffers
+from jarvis_ui.particle_buffers import build_buffers, NEBULA_PALETTE
 from jarvis_ui.overlays import overlay_rect, visible_page
 from jarvis_ui.runtime import UI_BUILD, window_size
 
@@ -50,6 +50,31 @@ THEMES = [
     (0.8, 0.2, 1.0),
     (1.0, 0.2, 0.4),
 ]
+
+# Subsystem graph drawn around the voice core — a live constellation of the
+# assistant's modules. (label, ux, uy, family, gear) with gear=True drawing
+# the radial "flower" cluster from the reference. Families map to colors.
+GRAPH_FAMILIES = {
+    "cyan": (0.25, 0.95, 0.85),
+    "green": (0.45, 1.0, 0.55),
+    "gold": (1.0, 0.78, 0.25),
+    "pink": (1.0, 0.4, 0.65),
+    "violet": (0.68, 0.45, 1.0),
+}
+GRAPH_NODES = [
+    ("VOICE LINK", -0.62, -0.86, "violet", False),
+    ("PARTICLE FLOW", 0.55, -1.02, "cyan", True),
+    ("HAND TRACKER", 1.28, -0.52, "cyan", True),
+    ("WEATHER DOCK", 1.42, 0.28, "gold", False),
+    ("TIMER SERVICE", 0.86, 0.92, "green", False),
+    ("MEDIA CONTROL", -0.18, 1.12, "pink", True),
+    ("FACE ID", -1.12, 0.72, "cyan", False),
+    ("SYSTEM STATS", -1.42, -0.18, "gold", True),
+    ("EVENT LOG", -0.52, 0.42, "green", False),
+    ("THEME ENGINE", 0.28, -0.48, "pink", False),
+]
+# Extra constellation edges between node indices (besides hub spokes).
+GRAPH_CROSS_LINKS = [(0, 7), (7, 6), (6, 8), (8, 5), (5, 4), (4, 3), (3, 2), (2, 1), (1, 9), (9, 0)]
 
 FLASH_COLORS = {
     "thumbs_up": (0.2, 1.0, 0.3),
@@ -341,11 +366,22 @@ class Hologram:
 
         # Twinkling starfield — same seed every run, so it's not distracting
         # random noise each frame, just a fixed field of stars that twinkle.
+        # Dense enough to read as deep space, with a few faint constellation
+        # links between nearby stars (reference constellation dashboard).
         _star_rng = random.Random(7)
         self.stars = [
             (_star_rng.random(), _star_rng.random(), _star_rng.uniform(0, 6.28), _star_rng.choice([1, 1, 1, 2]))
-            for _ in range(90)
+            for _ in range(300)
         ]
+        self.star_links = []
+        for i in range(0, len(self.stars) - 1, 7):
+            ax, ay = self.stars[i][0], self.stars[i][1]
+            bx, by = self.stars[i + 1][0], self.stars[i + 1][1]
+            if math.hypot(ax - bx, ay - by) < 0.16:
+                self.star_links.append((i, i + 1))
+
+        # Uptime counter shown in the top-right stats block.
+        self._start_time = time.time()
 
         self.rotation_x = 0.0
         self.rotation_y = 0.0
@@ -432,7 +468,7 @@ class Hologram:
             pygame.display.gl_set_attribute(pygame.GL_MULTISAMPLEBUFFERS, 0)
             pygame.display.gl_set_attribute(pygame.GL_MULTISAMPLESAMPLES, 0)
             pygame.display.set_mode((self.width, self.height), flags)
-        pygame.display.set_caption(f"AURORA — Amber Core | {UI_BUILD}")
+        pygame.display.set_caption(f"AURORA — Nebula Core | {UI_BUILD}")
         self._init_gl_state()
 
     def _init_gl_state(self):
@@ -1219,50 +1255,40 @@ class Hologram:
         glMatrixMode(GL_PROJECTION); glPopMatrix()
         glMatrixMode(GL_MODELVIEW); glPopMatrix()
 
-    def _draw_starfield(self):
+    def _draw_space_background(self):
+        """Deep-space backdrop: faint grid, fixed twinkling starfield and a
+        few thin constellation links between nearby stars."""
+        cx, cy = self.width / 2, self.height / 2
+        max_dist = math.hypot(cx, cy)
+        glLineWidth(1.0)
+        glBegin(GL_LINES)
+        x = 0
+        while x < self.width:
+            dist = abs(x - cx) / max_dist
+            glColor4f(0.16, 0.22, 0.38, max(0.015, 0.05 * (1 - dist)))
+            glVertex2f(x, 0); glVertex2f(x, self.height)
+            x += 90
+        y = 0
+        while y < self.height:
+            dist = abs(y - cy) / max_dist
+            glColor4f(0.16, 0.22, 0.38, max(0.015, 0.05 * (1 - dist)))
+            glVertex2f(0, y); glVertex2f(self.width, y)
+            y += 90
+        glEnd()
+
+        glBegin(GL_LINES)
+        for a, b in self.star_links:
+            ax, ay = self.stars[a][0] * self.width, self.stars[a][1] * self.height
+            bx, by = self.stars[b][0] * self.width, self.stars[b][1] * self.height
+            glColor4f(0.55, 0.65, 0.9, 0.05)
+            glVertex2f(ax, ay); glVertex2f(bx, by)
+        glEnd()
+
         for fx, fy, phase, size in self.stars:
-            twinkle = 0.35 + 0.65 * max(0.0, math.sin(self.elapsed * 1.2 + phase))
-            glColor4f(0.8, 0.9, 1.0, 0.55 * twinkle)
-            self._draw_circle_2d(fx * self.width, fy * self.height, size * 0.9)
-
-    def _draw_aurora_background(self):
-        """Flowing aurora borealis backdrop — translucent glowing ribbons
-        that wave across the upper portion of the screen using additive
-        blending for real glow, rather than the standard alpha blend used
-        everywhere else."""
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE)  # additive — makes overlaps glow brighter
-
-        bands = [
-            {"color": (0.15, 0.9, 0.55), "base_y": 0.16, "freq": 1.3, "speed": 0.35, "phase": 0.0, "amp": 0.05},
-            {"color": (0.25, 0.7, 1.0), "base_y": 0.26, "freq": 1.7, "speed": 0.5, "phase": 2.1, "amp": 0.06},
-            {"color": (0.55, 0.35, 0.95), "base_y": 0.10, "freq": 2.1, "speed": 0.28, "phase": 4.2, "amp": 0.04},
-        ]
-        segments = 40
-
-        for band in bands:
-            r, g, b = band["color"]
-            top_pts, bottom_pts = [], []
-            for i in range(segments + 1):
-                xf = i / segments
-                x = xf * self.width
-                wave = math.sin(xf * band["freq"] * 2 * math.pi + self.elapsed * band["speed"] + band["phase"])
-                wave2 = math.sin(xf * band["freq"] * 1.7 * 2 * math.pi + self.elapsed * band["speed"] * 0.6 + band["phase"] * 1.3)
-                cy = (band["base_y"] + band["amp"] * wave + band["amp"] * 0.5 * wave2) * self.height
-                band_h = (0.10 + 0.03 * math.sin(xf * 3 + self.elapsed * 0.4 + band["phase"])) * self.height
-                top_pts.append((x, cy - band_h / 2))
-                bottom_pts.append((x, cy + band_h / 2))
-
-            glBegin(GL_TRIANGLE_STRIP)
-            for i in range(segments + 1):
-                edge_fade = math.sin(i / segments * math.pi)  # fades out at screen edges
-                alpha = 0.09 * edge_fade
-                glColor4f(r, g, b, alpha * 0.25)
-                glVertex2f(*top_pts[i])
-                glColor4f(r, g, b, alpha)
-                glVertex2f(*bottom_pts[i])
-            glEnd()
-
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)  # restore normal blending
+            twinkle = 1.0 if self.reduced_motion else \
+                0.35 + 0.65 * max(0.0, math.sin(self.elapsed * 1.2 + phase))
+            glColor4f(0.8, 0.88, 1.0, 0.5 * twinkle)
+            self._draw_circle_2d(fx * self.width, fy * self.height, size * 0.8)
 
     def _draw_rect(self, x, y, w, h, r, g, b, a, filled=True):
         glBegin(GL_QUADS if filled else GL_LINE_LOOP)
@@ -1349,29 +1375,6 @@ class Hologram:
         except Exception:
             return 0
 
-    def _draw_background_grid(self):
-        cx, cy = self.width / 2, self.height / 2
-        max_dist = math.hypot(cx, cy)
-        step = 80
-        glLineWidth(1.0)
-
-        glBegin(GL_LINES)
-        x = 0
-        while x < self.width:
-            dist = abs(x - cx) / max_dist
-            alpha = max(0.02, 0.10 * (1 - dist))
-            glColor4f(0.15, 0.35, 0.55, alpha)
-            glVertex2f(x, 0); glVertex2f(x, self.height)
-            x += step
-        y = 0
-        while y < self.height:
-            dist = abs(y - cy) / max_dist
-            alpha = max(0.02, 0.10 * (1 - dist))
-            glColor4f(0.15, 0.35, 0.55, alpha)
-            glVertex2f(0, y); glVertex2f(self.width, y)
-            y += step
-        glEnd()
-
     def _fit_text(self, font, text, width):
         """Pixel-based clipping for labels, including long activity messages."""
         if not font:
@@ -1386,17 +1389,68 @@ class Hologram:
         width = font.size(text)[0] if font else 0
         self._blit_text(font, text, cx - width / 2, y, color=color)
 
+    def _draw_tab_chip(self, x, y, label, active, accent):
+        """Small status tab like the reference's BUSINESS/PERSONAL chips.
+        Visual only — the dashboard stays voice-operated."""
+        text_w = self.font_small.size(label)[0] if self.font_small else len(label) * 7
+        w, h = text_w + 30, 20
+        r, g, b = accent
+        self._draw_rect(x, y, w, h, r, g, b, 0.14 if active else 0.04)
+        self._draw_rect(x, y, w, h, r, g, b, 0.55 if active else 0.16, filled=False)
+        dot_a = 0.9 if active else 0.3
+        pulse = 0.6 + 0.4 * math.sin(self.elapsed * 3) if active and not self.reduced_motion else 1.0
+        glColor4f(r, g, b, dot_a * pulse)
+        self._draw_circle_2d(x + 10, y + h / 2, 2.5, segments=10)
+        self._blit_text(self.font_small, label, x + 18, y + 4,
+                        color=(int(120 + 120 * r * (0.4 + 0.6 * active)),
+                               int(120 + 120 * g * (0.4 + 0.6 * active)),
+                               int(120 + 120 * b * (0.4 + 0.6 * active))))
+        return w
+
     def _draw_top_bar(self, theme_color):
-        self._center_text(self.font, "A U R O R A", self.width / 2, 30,
-                          color=(210, 175, 115))
-        self._center_text(self.font_small, "P E R S O N A L   I N T E L L I G E N C E",
-                          self.width / 2, 57, color=(105, 86, 61))
+        """Reference-style status bar: mode tabs left, live briefing chip in
+        the middle, real stats counters on the right."""
+        # left: status tabs (visual only, voice remains the only input)
+        x, y = 24, 24
+        x += self._draw_tab_chip(x, y, "CORE", self.mode == "empty", (0.45, 1.0, 0.55)) + 8
+        x += self._draw_tab_chip(x, y, "SYSTEM", self.show_diagnostics, (1.0, 0.78, 0.25)) + 8
+        self._draw_rect(x, y, 20, 20, 0.55, 0.65, 0.85, 0.05)
+        self._draw_rect(x, y, 20, 20, 0.55, 0.65, 0.85, 0.25, filled=False)
+        self._blit_text(self.font_small, "+", x + 6, y + 3, color=(150, 165, 195))
+
+        # center: live briefing chip
+        stamp = time.strftime("%m / %d %I:%M %p").replace(" 0", " ").upper()
+        briefing = f"BRIEFING - LIVE {stamp}"
+        bw = self.font_small.size(briefing)[0] + 40 if self.font_small else len(briefing) * 8
+        bx = self.width / 2 - bw / 2
+        self._draw_rect(bx, 22, bw, 22, 1.0, 0.62, 0.12, 0.08)
+        self._draw_rect(bx, 22, bw, 22, 1.0, 0.62, 0.12, 0.5, filled=False)
+        pulse = 0.55 + 0.45 * math.sin(self.elapsed * 2.4) if not self.reduced_motion else 1.0
+        glColor4f(0.6, 1.0, 0.4, pulse)
+        self._draw_circle_2d(bx + 12, 33, 2.5, segments=10)
+        self._blit_text(self.font_small, briefing, bx + 22, 27, color=(235, 170, 80))
+        self._center_text(self.font_small, "A U R O R A", self.width / 2, 52, color=(140, 122, 92))
+
+        # right: real counters (fps + psutil + uptime)
         if self.width >= 900:
+            uptime = max(0, int(time.time() - self._start_time))
+            up = f"+{uptime // 3600:02d}:{(uptime % 3600) // 60:02d}"
+            stats = [("FPS", f"{self._fps:.0f}")]
+            for label, frac in self._get_system_stats()[:2]:
+                stats.append((label, "N/A" if frac is None else f"{int(frac * 100)}"))
+            stats.append(("UPTIME", up))
+            rx = self.width - 24
+            for label, value in reversed(stats):
+                vw = self.font_small.size(value)[0] if self.font_small else len(value) * 7
+                lw = self.font_small.size(label)[0] if self.font_small else len(label) * 7
+                rx -= vw
+                self._blit_text(self.font_small, value, rx, 24, color=(215, 230, 250))
+                rx -= lw + 6
+                self._blit_text(self.font_small, label, rx, 26, color=(95, 110, 135))
+                rx -= 16
             label = "CORE / VOICE" if self.mode == "empty" else self.mode_label
             self._blit_text(self.font_small, self._fit_text(self.font_small, label, self.width / 2 - 235),
-                            36, 38, color=(118, 95, 65))
-            self._blit_text(self.font_small, time.strftime("%H:%M"), self.width - 83, 38,
-                            color=(145, 120, 85))
+                            36, 52, color=(110, 100, 80))
 
     def _get_system_stats(self):
         """Real system stats via psutil. Falls back to a clearly-labeled
@@ -1501,7 +1555,7 @@ class Hologram:
     def _draw_bottom_bar(self, theme_color):
         # State-driven animation, deliberately not presented as microphone amplitude.
         color = self._voice_color()
-        cx, y = self.width / 2, self.height - 80
+        cx, y = self.width / 2, self.height - 108
         active = self.voice_available and self.state != "idle"
         for i in range(49):
             envelope = math.sin(math.pi * i / 48) ** 2
@@ -1511,15 +1565,39 @@ class Hologram:
         label = ({"idle": 'SAY "AURORA" TO BEGIN', "listening": "LISTENING",
                   "thinking": "PROCESSING YOUR REQUEST", "speaking": "AURORA IS SPEAKING"}
                  .get(self.state, "STANDBY") if self.voice_available else "VOICE OFFLINE / CHECK MICROPHONE SETUP")
-        self._center_text(self.font_small, label, cx, y + 25, color=(195, 158, 100))
+        self._center_text(self.font_small, label, cx, y + 20, color=(165, 140, 105))
+
+        # reference-style command pill with the live transcript inside
+        pw = min(430, self.width - 80)
+        px, py, ph = cx - pw / 2, self.height - 58, 26
+        self._draw_rect(px, py, pw, ph, 0.55, 0.62, 0.85, 0.05)
+        self._draw_rect(px, py, pw, ph, 0.55, 0.62, 0.85, 0.28, filled=False)
+        transcript = self.last_heard or "talk to aurora"
+        shown = self._fit_text(self.font_small, transcript, pw - 56)
+        self._blit_text(self.font_small, shown, px + 14, py + 7,
+                        color=(185, 195, 215) if self.last_heard else (110, 120, 145))
+        ix = px + pw - 24
+        self._draw_rect(ix, py + 6, 14, 14, 1.0, 0.68, 0.2, 0.12)
+        self._draw_rect(ix, py + 6, 14, 14, 1.0, 0.68, 0.2, 0.5, filled=False)
+        glColor4f(1.0, 0.75, 0.3, 0.9 if active else 0.4)
+        self._draw_circle_2d(ix + 7, py + 13, 2.0, segments=10)
         if self.width >= 1000:
             self._blit_text(self.font_small, "VOICE INTERFACE / " + ("READY" if self.voice_available else "OFFLINE"),
-                            32, self.height - 40, color=(90, 77, 57))
-            self._blit_text(self.font_small, "WINDOWED  /  ESC EXIT" if self.windowed_only else "F11 WINDOW  /  ESC EXIT", self.width - 255,
-                            self.height - 40, color=(90, 77, 57))
-        transcript = self.last_heard or '"Aurora, show me the solar system"'
-        self._center_text(self.font_small, self._fit_text(self.font_small, transcript, self.width - 100),
-                          cx, self.height - 132, color=(160, 142, 113))
+                            32, self.height - 30, color=(80, 90, 110))
+            self._blit_text(self.font_small, "WINDOWED  /  ESC EXIT" if self.windowed_only else "F11 WINDOW  /  ESC EXIT",
+                            self.width - 255, self.height - 30, color=(80, 90, 110))
+
+    def _draw_telemetry(self):
+        """The per-frame HUD lines main.py feeds (zoom/fps/voice/hands) were
+        collected but never drawn — surface them as a dim readout so the
+        tracking state is visible without a debug window."""
+        if not self.hud_lines:
+            return
+        y = self.height - 96
+        for line in self.hud_lines:
+            y -= 16
+            self._blit_text(self.font_small, self._fit_text(self.font_small, line, 260),
+                            24, y, color=(96, 132, 160))
 
     def _overlay_frame(self, rect, theme_color, label, hint):
         x, y, w, h = rect.x, rect.y, rect.width, rect.height
@@ -1551,39 +1629,6 @@ class Hologram:
             else:
                 self._blit_text(self.font_small, self._fit_text(self.font_small, phrase, rect.width - 48),
                                 rect.x + 24, y, color=(238, 220, 187))
-
-    def _draw_scanlines(self):
-        glColor4f(0.3, 0.9, 1.0, 0.012)
-        glBegin(GL_LINES)
-        y = self.scanline_phase % self.height
-        while y < self.height:
-            glVertex2f(60, y); glVertex2f(self.width - 60, y); y += 46
-        glEnd()
-
-    def _draw_corner_brackets(self):
-        m, L = 24, 46
-        corners = [
-            (m, m, 1, 1), (self.width - m, m, -1, 1),
-            (m, self.height - m, 1, -1), (self.width - m, self.height - m, -1, -1),
-        ]
-        glColor4f(0.25, 0.85, 1.0, 0.85)
-        glLineWidth(2.0)
-        glBegin(GL_LINES)
-        for x, y, dx, dy in corners:
-            glVertex2f(x, y); glVertex2f(x + dx * L, y)
-            glVertex2f(x, y); glVertex2f(x, y + dy * L)
-        glEnd()
-
-        # thinner inset accent line, offset slightly for a layered look
-        off = 6
-        glColor4f(0.25, 0.85, 1.0, 0.35)
-        glLineWidth(1.0)
-        glBegin(GL_LINES)
-        for x, y, dx, dy in corners:
-            ix, iy = x + dx * off, y + dy * off
-            glVertex2f(ix, iy); glVertex2f(ix + dx * (L - off), iy)
-            glVertex2f(ix, iy); glVertex2f(ix, iy + dy * (L - off))
-        glEnd()
 
     # ---- weather widget (docks the hologram left, shows this on the right) --
 
@@ -1752,27 +1797,6 @@ class Hologram:
                 f"{data['source']} / {data['updated_at']}", w - 48),
                 x + 24, y + h - 63, color=(148, 126, 91))
 
-    def _draw_hud_reticle(self, theme_color):
-        """Faint concentric rings + cardinal tick marks centered on the
-        hologram area — a subtle targeting-reticle HUD flourish."""
-        cx, cy = self.width / 2, self.height / 2 + 15
-        r, g, b = theme_color
-
-        for radius in (170, 230):
-            glColor4f(r, g, b, 0.07)
-            glLineWidth(1.0)
-            self._draw_circle_2d(cx, cy, radius, segments=64, filled=False)
-
-        glColor4f(r, g, b, 0.16)
-        glLineWidth(1.5)
-        glBegin(GL_LINES)
-        for angle_deg in (0, 90, 180, 270):
-            a = math.radians(angle_deg)
-            x1, y1 = cx + 230 * math.cos(a), cy + 230 * math.sin(a)
-            x2, y2 = cx + 248 * math.cos(a), cy + 248 * math.sin(a)
-            glVertex2f(x1, y1); glVertex2f(x2, y2)
-        glEnd()
-
     def _wrap_text(self, font, text, max_width):
         if not font:
             return [text]
@@ -1819,8 +1843,96 @@ class Hologram:
         fraction = min(1, (self.info_scroll + len(visible)) / max(1, len(lines)))
         self._draw_rect(x + 24, track_y, (w - 48) * fraction, 2, *theme_color, .65)
 
+    def _graph_positions(self, cx, cy, radius):
+        sx, sy = radius * 1.55, radius * 1.3
+        positions = []
+        for _label, ux, uy, _family, _gear in GRAPH_NODES:
+            x = min(self.width - 170, max(28, cx + ux * sx))
+            y = min(self.height - 150, max(86, cy + uy * sy))
+            positions.append((x, y))
+        return positions
+
+    def _draw_system_graph(self, theme_color):
+        """Constellation of live subsystem nodes around the voice core —
+        glowing clusters, thin connector lines and boxed uppercase labels,
+        in the style of the supplied reference dashboard."""
+        docked = bool(self.weather or self.weather_status or self.info_card) and self.width >= 1000
+        free = ParticleCore.layout(self.width, self.height, False)
+        side = ParticleCore.layout(self.width, self.height, True)
+        cx, cy, radius = tuple(a + (b - a) * self._core_dock for a, b in zip(free, side))
+        fade = self._materialize_progress()
+        positions = self._graph_positions(cx, cy, radius)
+
+        # soft multi-hue nebula haze behind the core (additive)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+        for (r, g, b), dx, dy, scale in (((1.0, .3, .8), -.4, -.15, 1.2),
+                                         ((.5, .35, 1.0), .4, -.3, 1.3),
+                                         ((.2, .7, 1.0), .1, .4, 1.1)):
+            glBegin(GL_TRIANGLE_FAN)
+            glColor4f(r, g, b, 0.22 * fade)
+            glVertex2f(cx, cy)
+            glColor4f(r, g, b, 0)
+            for i in range(49):
+                angle = i * math.tau / 48
+                glVertex2f(cx + dx * radius + math.cos(angle) * radius * scale,
+                           cy + dy * radius + math.sin(angle) * radius * scale)
+            glEnd()
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+
+        # connector lines: hub spokes + cross links
+        glLineWidth(1.0)
+        glBegin(GL_LINES)
+        for (x, y) in positions:
+            glColor4f(0.75, 0.82, 1.0, 0.13 * fade)
+            glVertex2f(cx, cy); glVertex2f(x, y)
+        for a, b in GRAPH_CROSS_LINKS:
+            glColor4f(0.75, 0.82, 1.0, 0.08 * fade)
+            glVertex2f(*positions[a]); glVertex2f(*positions[b])
+        glEnd()
+
+        for index, (node, (x, y)) in enumerate(zip(GRAPH_NODES, positions)):
+            label, _ux, _uy, family, gear = node
+            r, g, b = GRAPH_FAMILIES[family]
+            if label == "VOICE LINK":
+                status = 1.0 if self.voice_available else 0.35
+            elif label == "WEATHER DOCK":
+                status = 1.0 if self.weather else 0.5
+            else:
+                status = 0.75 + 0.25 * math.sin(self.elapsed * 1.7 + index)
+            glow = status * fade
+            glColor4f(r, g, b, 0.10 * glow)
+            self._draw_circle_2d(x, y, 11, segments=16)
+            if gear:
+                # radial "flower" cluster: dotted ring + spokes
+                glBegin(GL_LINES)
+                for s in range(8):
+                    a = s * math.tau / 8 + self.elapsed * (0 if self.reduced_motion else 0.15)
+                    glColor4f(r, g, b, 0.5 * glow)
+                    glVertex2f(x + math.cos(a) * 6, y + math.sin(a) * 6)
+                    glVertex2f(x + math.cos(a) * 13, y + math.sin(a) * 13)
+                glEnd()
+                for d in range(14):
+                    a = d * math.tau / 14
+                    glColor4f(r, g, b, 0.55 * glow)
+                    self._draw_circle_2d(x + math.cos(a) * 17, y + math.sin(a) * 17, 1.2, segments=6)
+            glColor4f(min(1, r + .3), min(1, g + .3), min(1, b + .3), 0.95 * glow)
+            self._draw_circle_2d(x, y, 2.6, segments=10)
+
+            # boxed uppercase label chip
+            text = label.upper()
+            tw = self.font_small.size(text)[0] if self.font_small else len(text) * 7
+            lx, ly = x + 14, y - 9
+            if lx + tw + 12 > self.width - 8:
+                lx = x - tw - 26
+            self._draw_rect(lx, ly, tw + 12, 17, 0.02, 0.02, 0.03, 0.72 * fade)
+            self._draw_rect(lx, ly, tw + 12, 17, r, g, b, 0.30 * fade, filled=False)
+            self._blit_text(self.font_small, text, lx + 6, ly + 3,
+                            color=(int(150 + 90 * r * status), int(150 + 90 * g * status),
+                                   int(150 + 90 * b * status)))
+
     def _draw_idle_indicator(self, theme_color):
-        """Reference-inspired amber particle sphere, orbital trails and hot nucleus."""
+        """Multi-hue nebula particle sphere with orbital trails and a hot
+        blue-white nucleus, in the style of the supplied reference."""
         docked = bool(self.weather or self.weather_status or self.info_card) and self.width >= 1000
         target = 1.0 if docked else 0.0
         previous = getattr(self, '_core_dock', target)
@@ -1834,7 +1946,8 @@ class Hologram:
         color = self._voice_color()
         glBlendFunc(GL_SRC_ALPHA, GL_ONE)
         try:
-            batches, line_batch = build_buffers(frame, (cx, cy), radius, color, self.brightness)
+            batches, line_batch = build_buffers(frame, (cx, cy), radius, color, self.brightness,
+                                                palette=NEBULA_PALETTE)
             # A handful of vertex-array draws replaces thousands of Python GL calls.
             glPushClientAttrib(GL_CLIENT_VERTEX_ARRAY_BIT)
             glPushAttrib(GL_POINT_BIT)
@@ -1852,7 +1965,7 @@ class Hologram:
                     # Broad dim halo plus a sharp head: real moving points, no sprites/images.
                     halo = colors[:]
                     for index in range(3, len(halo), 4):
-                        halo[index] *= .075
+                        halo[index] *= .12
                     point_scale = max(.75, min(1.25, math.sqrt(radius / 200)))
                     if self.particle_quality != "performance" or size == 3:
                         glPointSize((size * 2.5 + 1) * point_scale)
@@ -1872,15 +1985,15 @@ class Hologram:
             # Smooth radial glow, not nested opaque disks; white-hot central seed.
             for scale, alpha in ((.4, .09), (.2, .22), (.08, .85)):
                 glBegin(GL_TRIANGLE_FAN)
-                glColor4f(1, .7 + .2 * frame.energy, .22, alpha)
+                glColor4f(.5 + .4 * frame.energy, .68 + .27 * frame.energy, 1.0, alpha)
                 glVertex2f(cx, cy)
-                glColor4f(*color, 0)
+                glColor4f(.3, .45, 1.0, 0)
                 for i in range(65):
                     angle = i * math.tau / 64
                     glVertex2f(cx + math.cos(angle) * radius * scale,
                                cy + math.sin(angle) * radius * scale)
                 glEnd()
-            glColor4f(1, .94, .65, .95)
+            glColor4f(.88, .94, 1.0, .95)
             self._draw_circle_2d(cx, cy, radius * .021, segments=32)
         finally:
             glPointSize(1)
@@ -1889,8 +2002,11 @@ class Hologram:
 
     def _draw_dashboard(self, theme_color):
         self._begin_ortho()
+        self._draw_space_background()
         overlay_active = bool(self.weather or self.weather_status or self.info_card)
         if self.mode in ("empty", "info") and (not overlay_active or self.width >= 1000):
+            if self.mode == "empty":
+                self._draw_system_graph(theme_color)
             self._draw_idle_indicator(theme_color)
         if self.mode == "info":
             self._draw_info_card(theme_color)
@@ -1901,6 +2017,7 @@ class Hologram:
                 self._draw_event_log()
         self._draw_weather_panel(theme_color)
         self._draw_bottom_bar(theme_color)
+        self._draw_telemetry()
         if self.show_help:
             self._draw_help(theme_color)
         self._end_ortho()

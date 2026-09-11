@@ -36,7 +36,7 @@ python main.py
 
 Starts in a normal **960×640 window**, reduced to leave desktop/taskbar space.
 Fullscreen and F11 switching are disabled unless you explicitly pass `--fullscreen`.
-The title bar identifies this build as **Amber Core | amber-flow-v4**.
+The title bar identifies this build as **Nebula Core | amber-flow-v4**.
 Camera and voice are attempted; unavailable camera or voice
 setup is reported in the dashboard event log. Missing core dependencies are
 reported in the terminal with a nonzero exit code.
@@ -60,7 +60,7 @@ Aurora-AI/
 │   ├── __init__.py
 │   ├── paths.py             # shared project-root paths
 │   ├── hologram.py          # OpenGL dashboard and interaction
-│   ├── particle_core.py     # deterministic amber-core animation
+│   ├── particle_core.py     # deterministic nebula-core animation
 │   ├── overlays.py          # responsive overlay layout
 │   ├── display_bridge.py    # main-thread command dispatch
 │   ├── timers.py            # cancellable timer service
@@ -96,8 +96,13 @@ Paths do not depend on your terminal's current working directory.
 ### Voice-first HUD
 
 No clickable buttons, toolbar, hover targets, or mouse navigation. Inspired by
-the supplied amber-core reference, the default view is almost black with a
-**glowing gold particle sphere** built from moving three-dimensional positions.
+the supplied constellation-dashboard reference, the default view is almost
+black: a starfield behind a **multi-hue nebula particle sphere** (magenta,
+violet, cyan, green and gold points) built from moving three-dimensional
+positions, surrounded by a constellation of labelled subsystem nodes joined by
+thin connector lines. The top bar carries status chips (CORE / SYSTEM), a live
+briefing ticker and real FPS/CPU/uptime counters; a "talk to aurora" command
+pill with the live transcript anchors the bottom.
 In balanced mode it contains 3,460 particles, including 40 bright relay heads with short fading
 trails. Near particles appear brighter/larger; far particles recede. Orbit planes
 precess, nearby relays briefly connect, and light packets move outward instead
@@ -133,12 +138,13 @@ jumping to a different frame. Quality changes retain shared particle positions.
 All quality levels remain procedural, not video/image playback. Actual frame
 rate still depends on camera workload and your graphics driver.
 
-The core stays amber through listening/thinking/speaking; warmth and energy
-change instead of switching the whole screen to cyan. The bottom signal animation
-reflects assistant state, **not measured microphone amplitude**. The HUD labels
-voice as offline if it cannot start. Grid, corner frames, and large telemetry
-panels are hidden by default. Weather docks beside the core; existing atoms,
-shapes, and solar-system displays remain available.
+HUD accents stay theme-colored through listening/thinking/speaking; warmth and
+energy change instead of switching the whole screen to cyan. The bottom signal
+animation reflects assistant state, **not measured microphone amplitude**. The
+HUD labels voice as offline if it cannot start. A faint space grid and the
+per-frame telemetry readout (zoom/FPS/gestures) are always on; the large
+diagnostics panels still require F3. Weather docks beside the core; existing
+atoms, shapes, and solar-system displays remain available.
 
 ![Animated software preview of the particle flow](docs/core-motion.gif)
 
@@ -150,6 +156,13 @@ To regenerate it (optional development dependency):
 pip install Pillow
 python tools/render_core_preview.py --motion
 ```
+
+![Software preview of the constellation dashboard](docs/dashboard-preview.png)
+
+`tools/render_dashboard_preview.py` executes the real HUD draw code through a
+small software GL rasterizer and writes `dashboard-preview.png` plus
+`dashboard-docked-preview.png` (weather docked). Like the other previews these
+are design previews, **not** desktop captures.
 
 Say **“Aurora”** and your request together, or say the wake word alone and then
 speak during the five-second follow-up listening window.
@@ -230,7 +243,7 @@ geolocation lookup is performed.
 - Hold a fist and move closer/further to zoom; two-hand spreading also zooms.
 - Swipe left/right to change theme; up/down to change brightness.
 - Peace sign saves a webcam snapshot in `snapshots/`.
-- Thumbs down returns to the amber voice core; OK sign toggles media playback on Windows.
+- Thumbs down returns to the nebula voice core; OK sign toggles media playback on Windows.
 
 ## Voice and optional general chat
 
@@ -297,7 +310,7 @@ software preview above is for design review only.
 ## If you still see the old blue dashboard
 
 The wave background and permanently visible blue system/event panels identify
-an older rendering path. The amber build does not draw those in its normal view.
+an older rendering path. The nebula build does not draw those in its normal view.
 Close any running Aurora process, update the **Arena branch** in the folder you
 actually launch, and stop if Git reports conflicting local changes:
 

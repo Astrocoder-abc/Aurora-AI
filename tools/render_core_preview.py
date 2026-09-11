@@ -6,6 +6,7 @@ Point smoothing and bloom approximate the actual OpenGL rasterizer.
 from pathlib import Path
 import argparse
 import math
+import random
 import sys
 
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
@@ -14,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from jarvis_ui.particle_core import ParticleCore
 from jarvis_ui.core_animation import CoreAnimation
+from jarvis_ui.particle_buffers import NEBULA_PALETTE
 
 CORE = ParticleCore()
 
@@ -28,17 +30,29 @@ def render_frame(elapsed=12, width=1200, height=800, state='idle', quality='bala
     frame = CORE.frame(elapsed, state, quality=quality, energy=energy)
     def point(x, y):
         return ((cx + x * radius) * scale, (cy + y * radius) * scale)
-    def amber(alpha, head=False):
-        return tuple(int(min(255, value * alpha)) for value in ((255, 197, 76) if head else (255, 143, 15)))
+    def amber(alpha):
+        return tuple(int(min(255, value * alpha)) for value in (255, 143, 15))
+    # fixed starfield behind the core, like the live dashboard
+    star_rng = random.Random(7)
+    for _ in range(140):
+        sx, sy = star_rng.random() * width, star_rng.random() * height
+        tw = .3 + .7 * star_rng.random()
+        draw.ellipse((sx*scale-1, sy*scale-1, sx*scale+1, sy*scale+1),
+                     fill=(int(120*tw), int(135*tw), int(165*tw)))
+    palette = NEBULA_PALETTE
     for trail in frame.orbits:
         for a, b in zip(trail, trail[1:]):
             draw.line([point(*a[:2]), point(*b[:2])], fill=amber(b[2]), width=scale)
     for x0, y0, x1, y1, alpha in (*frame.rays, *frame.links):
         draw.line([point(x0, y0), point(x1, y1)], fill=amber(alpha), width=scale)
-    for x, y, alpha, diameter in frame.particles:
+    for i, (x, y, alpha, diameter) in enumerate(frame.particles):
+        tint = palette[(i * 31) % len(palette)]
+        if diameter == 3:
+            tint = tuple(min(1, c + .3) for c in tint)
         px, py = point(x, y)
         r = diameter * scale / 2
-        draw.ellipse((px-r, py-r, px+r, py+r), fill=amber(alpha, diameter == 3))
+        draw.ellipse((px-r, py-r, px+r, py+r),
+                     fill=tuple(int(min(255, c * 255 * alpha)) for c in tint))
     image = ImageChops.add(image, light.filter(ImageFilter.GaussianBlur(2 * scale)))
     image = ImageChops.add(image, light.filter(ImageFilter.GaussianBlur(.7 * scale)))
     image = ImageChops.add(image, light)
@@ -48,11 +62,11 @@ def render_frame(elapsed=12, width=1200, height=800, state='idle', quality='bala
         norm = r / (radius * .28 * scale)
         a = math.exp(-norm * 7)
         draw.ellipse((cx*scale-r, cy*scale-r, cx*scale+r, cy*scale+r),
-                     fill=(int(255*a), int(220*a), int(75*a)))
+                     fill=(int(140*a), int(180*a), int(255*a)))
     image = ImageChops.add(image, center)
     draw = ImageDraw.Draw(image)
     r = radius * .021 * scale
-    draw.ellipse((cx*scale-r, cy*scale-r, cx*scale+r, cy*scale+r), fill=(255,246,175))
+    draw.ellipse((cx*scale-r, cy*scale-r, cx*scale+r, cy*scale+r), fill=(225,240,255))
     def font(size):
         for candidate in ('DejaVuSans.ttf', 'C:/Windows/Fonts/segoeui.ttf',
                           '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'):
