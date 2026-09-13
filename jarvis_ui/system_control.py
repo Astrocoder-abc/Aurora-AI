@@ -20,7 +20,7 @@ try:
     from comtypes import CLSCTX_ALL
     from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
     PYCAW_AVAILABLE = True
-except ImportError:
+except (ImportError, OSError):
     PYCAW_AVAILABLE = False
 
 # Virtual key codes for Windows media keys
@@ -89,8 +89,7 @@ def adjust_volume_percent(delta):
     if current is None:
         return None
     new_val = max(0, min(100, current + delta))
-    set_volume_percent(new_val)
-    return new_val
+    return new_val if set_volume_percent(new_val) else None
 
 
 def _send_media_key(vk_code):

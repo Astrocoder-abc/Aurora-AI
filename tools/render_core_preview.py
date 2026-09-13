@@ -1,0 +1,113 @@
+"""Software preview of live 3D geometry, not a captured OpenGL window.
+
+Optional dependency: Pillow. Use --motion for an animated design preview.
+Point smoothing and bloom approximate the actual OpenGL rasterizer.
+"""
+from pathlib import Path
+import argparse
+import math
+import random
+import sys
+
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from jarvis_ui.particle_core import ParticleCore
+from jarvis_ui.core_animation import CoreAnimation
+from jarvis_ui.particle_buffers import NEBULA_PALETTE
+
+CORE = ParticleCore()
+
+
+def render_frame(elapsed=12, width=1200, height=800, state='idle', quality='balanced', energy=None):
+    scale = 2
+    size = (width * scale, height * scale)
+    image = Image.new('RGB', size, (2, 2, 1))
+    light = Image.new('RGB', size)
+    draw = ImageDraw.Draw(light)
+    cx, cy, radius = CORE.layout(width, height)
+    frame = CORE.frame(elapsed, state, quality=quality, energy=energy)
+    def point(x, y):
+        return ((cx + x * radius) * scale, (cy + y * radius) * scale)
+    def amber(alpha):
+        return tuple(int(min(255, value * alpha)) for value in (255, 143, 15))
+    # fixed starfield behind the core, like the live dashboard
+    star_rng = random.Random(7)
+    for _ in range(140):
+        sx, sy = star_rng.random() * width, star_rng.random() * height
+        tw = .3 + .7 * star_rng.random()
+        draw.ellipse((sx*scale-1, sy*scale-1, sx*scale+1, sy*scale+1),
+                     fill=(int(120*tw), int(135*tw), int(165*tw)))
+    palette = NEBULA_PALETTE
+    for trail in frame.orbits:
+        for a, b in zip(trail, trail[1:]):
+            draw.line([point(*a[:2]), point(*b[:2])], fill=amber(b[2]), width=scale)
+    for x0, y0, x1, y1, alpha in (*frame.rays, *frame.links):
+        draw.line([point(x0, y0), point(x1, y1)], fill=amber(alpha), width=scale)
+    for i, (x, y, alpha, diameter) in enumerate(frame.particles):
+        tint = palette[(i * 31) % len(palette)]
+        if diameter == 3:
+            tint = tuple(min(1, c + .3) for c in tint)
+        px, py = point(x, y)
+        r = diameter * scale / 2
+        draw.ellipse((px-r, py-r, px+r, py+r),
+                     fill=tuple(int(min(255, c * 255 * alpha)) for c in tint))
+    image = ImageChops.add(image, light.filter(ImageFilter.GaussianBlur(2 * scale)))
+    image = ImageChops.add(image, light.filter(ImageFilter.GaussianBlur(.7 * scale)))
+    image = ImageChops.add(image, light)
+    center = Image.new('RGB', size)
+    draw = ImageDraw.Draw(center)
+    for r in range(int(radius * .28 * scale), 0, -1):
+        norm = r / (radius * .28 * scale)
+        a = math.exp(-norm * 7)
+        draw.ellipse((cx*scale-r, cy*scale-r, cx*scale+r, cy*scale+r),
+                     fill=(int(140*a), int(180*a), int(255*a)))
+    image = ImageChops.add(image, center)
+    draw = ImageDraw.Draw(image)
+    r = radius * .021 * scale
+    draw.ellipse((cx*scale-r, cy*scale-r, cx*scale+r, cy*scale+r), fill=(225,240,255))
+    def font(size):
+        for candidate in ('DejaVuSans.ttf', 'C:/Windows/Fonts/segoeui.ttf',
+                          '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'):
+            try:
+                return ImageFont.truetype(candidate, size * scale)
+            except OSError:
+                continue
+        return ImageFont.load_default(size=size * scale)
+    def text(content, x, y, size=13, color=(145,120,85), centered=False):
+        draw.text((x*scale, y*scale), content, font=font(size), fill=color,
+                  anchor='mt' if centered else 'lt')
+    text('A U R O R A', width/2, 30, 16, (210,175,115), True)
+    text(f'PARTICLE FLOW / {quality.upper()} / {state.upper()}', width/2, 57, 11, (105,86,61), True)
+    text('"Aurora, show me the solar system"', width/2, height-120,
+         size=11, color=(160,142,113), centered=True)
+    for i in range(41):
+        envelope = math.sin(math.pi*i/40)**2
+        h = 3 + envelope * (7 if state == 'idle' else 20) * abs(math.sin(elapsed*2+i*.48))
+        x, y = width/2 + (i-20)*5, height-80
+        draw.rectangle((x*scale,(y-h/2)*scale,(x+2)*scale,(y+h/2)*scale),fill=amber(.45+envelope*.5))
+    text('SOFTWARE MOTION PREVIEW / NOT A DESKTOP CAPTURE', width/2, height-40,
+         size=9, color=(125,105,75), centered=True)
+    return image.resize((width,height),Image.Resampling.LANCZOS)
+
+
+def render(destination, quality="balanced"):
+    destination.parent.mkdir(parents=True,exist_ok=True)
+    render_frame(quality=quality).save(destination)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--motion', action='store_true')
+    parser.add_argument('--quality', choices=('performance','balanced','cinematic'), default='balanced')
+    args = parser.parse_args()
+    render(ROOT/'docs'/'core-preview.png', args.quality)
+    if args.motion:
+        frames, clock = [], CoreAnimation()
+        for i in range(75):
+            state = ('idle' if i < 30 else 'listening' if i < 45 else 'thinking' if i < 60 else 'speaking')
+            t, energy = clock.advance(i/15, state)
+            frames.append(render_frame(t, 720, 540, state, args.quality, energy))
+        frames[0].save(ROOT/'docs'/'core-motion.gif', save_all=True, append_images=frames[1:],
+                       duration=67, loop=0, optimize=True)

@@ -34,10 +34,12 @@ would be able to unlock your phone if it's plugged in.
 """
 
 import os
+
+from .paths import PROJECT_ROOT
 import subprocess
 
-PIN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "phone_pin.txt")
-CONTACTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "contacts.json")
+PIN_FILE = os.path.join(str(PROJECT_ROOT), "phone_pin.txt")
+CONTACTS_FILE = os.path.join(str(PROJECT_ROOT), "contacts.json")
 
 
 def _adb(args):
@@ -55,7 +57,7 @@ def is_device_connected():
     if not ok:
         return False, output
     lines = [l for l in output.strip().split("\n")[1:] if l.strip()]
-    connected = any("device" in l and "unauthorized" not in l for l in lines)
+    connected = len(lines) == 1 and len(lines[0].split()) >= 2 and lines[0].split()[1] == "device"
     return connected, output
 
 
@@ -72,8 +74,8 @@ def unlock_with_pin():
         return False, "No phone_pin.txt found — see phone_control.py for setup"
     with open(PIN_FILE, "r") as f:
         pin = f.read().strip()
-    if not pin:
-        return False, "phone_pin.txt is empty"
+    if not pin.isascii() or not pin.isdigit():
+        return False, "phone_pin.txt must contain only digits"
 
     wake_screen()
     _adb(["shell", "input", "swipe", "500", "1500", "500", "500"])  # swipe up
@@ -89,7 +91,11 @@ def load_contacts():
         return {}
     try:
         with open(CONTACTS_FILE, "r") as f:
-            return json.load(f)
+            data = json.load(f)
+            if not isinstance(data, dict):
+                return {}
+            return {str(name).strip().lower(): str(number) for name, number in data.items()
+                    if isinstance(number, (str, int))}
     except Exception:
         return {}
 
