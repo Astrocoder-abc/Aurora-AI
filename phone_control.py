@@ -27,10 +27,16 @@ WHAT THIS CAN ACTUALLY DO:
     for some Android versions — ADB can start the call intent, but the
     phone may still require the CALL_PHONE permission grant screen once)
 
-SECURITY NOTE: pin.txt stores your PIN in plaintext on this PC. Only use
-this if you're comfortable with that tradeoff, and keep this machine
-physically secure. Anyone with access to this PC and your USB cable
-would be able to unlock your phone if it's plugged in.
+"CALL ME": my_number.txt (create it yourself, one line, e.g.
++15551234567) lets "Aurora, call me" dial your own number from the
+connected phone — handy as a makeshift "find my phone" or reminder call.
+It's just a shortcut for calling a specific number; contacts.json works
+the same way for named contacts.
+
+SECURITY NOTE: pin.txt and my_number.txt store plaintext on this PC.
+Only use this if you're comfortable with that tradeoff, and keep this
+machine physically secure. Anyone with access to this PC and your USB
+cable would be able to unlock your phone if it's plugged in.
 """
 
 import os
@@ -38,6 +44,7 @@ import subprocess
 
 PIN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "phone_pin.txt")
 CONTACTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "contacts.json")
+MY_NUMBER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "my_number.txt")
 
 
 def _adb(args):
@@ -92,6 +99,22 @@ def load_contacts():
             return json.load(f)
     except Exception:
         return {}
+
+
+def load_my_number():
+    """Your own phone number, from my_number.txt (create it yourself,
+    one line, e.g. +15551234567). Lets 'Aurora, call me' work without
+    needing a contacts.json entry named 'me'. Falls back to a 'me' entry
+    in contacts.json if that file doesn't exist."""
+    if os.path.exists(MY_NUMBER_FILE):
+        try:
+            with open(MY_NUMBER_FILE, "r") as f:
+                number = f.read().strip()
+                if number:
+                    return number
+        except Exception:
+            pass
+    return load_contacts().get("me")
 
 
 def call_number(number):

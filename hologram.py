@@ -17,12 +17,13 @@ showed "Not Responding" in Windows — fixed here.)
 """
 
 import math
+import os
 import random
 import time
 import pygame
 from pygame.locals import DOUBLEBUF, OPENGL, FULLSCREEN
 from OpenGL.GL import *
-from OpenGL.GLU import gluPerspective
+from OpenGL.GLU import gluPerspective, gluProject
 from collections import deque
 import threading
 
@@ -164,6 +165,50 @@ PLANETS = [
     ("Uranus", 2.05, -22), ("Neptune", 2.3, 18),
 ]
 
+# Roughly true-to-life planet colors, so the solar system reads as eight
+# distinct worlds instead of eight identically-tinted rings — previously
+# every planet rendered in the same flat "sunlight" orange regardless of
+# which one it was.
+PLANET_COLORS = {
+    "Mercury": (0.65, 0.62, 0.58), "Venus": (0.85, 0.75, 0.45),
+    "Earth": (0.35, 0.6, 1.0), "Mars": (0.9, 0.4, 0.25),
+    "Jupiter": (0.85, 0.65, 0.4), "Saturn": (0.85, 0.75, 0.55),
+    "Uranus": (0.55, 0.85, 0.9), "Neptune": (0.3, 0.45, 0.95),
+}
+
+# Cycled palette for exoplanets (real curated ones and procedurally
+# generated ones alike) — no real color data exists for most of these,
+# so a consistent varied palette at least keeps each planet visually
+# distinct rather than one flat tint.
+EXOPLANET_PALETTE = [
+    (0.9, 0.5, 0.4), (0.4, 0.75, 0.9), (0.85, 0.8, 0.4), (0.6, 0.45, 0.95),
+    (0.45, 0.9, 0.6), (0.95, 0.55, 0.75), (0.5, 0.6, 0.95), (0.85, 0.65, 0.35),
+]
+
+# Network/constellation view: Aurora's own subsystems as connected nodes,
+# scattered organically (seeded random, not a perfect circle/sphere) so
+# it reads as a real node-graph rather than a geometric primitive.
+NETWORK_NODE_LABELS = [
+    "Voice Engine", "Face Recognition", "Hand Gestures", "Weather System",
+    "Atom Models", "Solar Systems", "Shape Library", "System Control",
+    "Web Search", "Event Log",
+]
+
+
+def _build_network_nodes():
+    rng = random.Random(42)  # fixed seed - same layout every run
+    nodes = []
+    for label in NETWORK_NODE_LABELS:
+        theta = rng.uniform(0, 2 * math.pi)
+        phi = rng.uniform(0.3, math.pi - 0.3)  # avoid poles for a less spherical, scattered look
+        radius = rng.uniform(1.3, 2.6)
+        x = radius * math.sin(phi) * math.cos(theta)
+        y = radius * math.cos(phi)
+        z = radius * math.sin(phi) * math.sin(theta)
+        drift_phase = rng.uniform(0, 2 * math.pi)
+        nodes.append({"label": label, "pos": (x, y, z), "drift_phase": drift_phase})
+    return nodes
+
 # Curated real star systems with their actual (approximate) known planet
 # counts/naming. Anything NOT in this list still works — see
 # _generate_procedural_system — so "every star system" is handled either
@@ -286,6 +331,14 @@ class Hologram:
         self.fullscreen = fullscreen
         self._set_display_mode(fullscreen)
 
+        # Optional real background image instead of the procedural
+        # starfield/nebula. Drop a "background.jpg" (or .jpeg/.png) into
+        # the project root — next to main.py, not inside jarvis_ui/ —
+        # and it's used automatically. Nothing to configure if you don't
+        # add one; the procedural background is used as-is.
+        self.background_texture = None
+        self._load_background_image()
+
         # Bahnschrift/Agency FB have a geometric, technical HUD look closer
         # to sci-fi interfaces than a plain monospace font — both ship
         # with Windows, so this is a free upgrade with no install needed.
@@ -343,6 +396,8 @@ class Hologram:
         self.mode = "empty"
         self.mode_label = "AWAITING COMMAND"
         self.shape_name = "sphere"
+        self.network_nodes = []
+        self._network_label_positions = []  # (screen_x, screen_y, label) computed each frame
         self.orbits = []
         self.selected_index = None
         self.protons = 1
@@ -376,6 +431,11 @@ class Hologram:
 
         if PSUTIL_AVAILABLE:
             psutil.cpu_percent(interval=None)  # first call always returns 0.0 — prime it now
+
+        # The constellation/nebula view is the polished "hero" display,
+        # so it's what greets you on launch instead of a bare breathing
+        # circle — you shouldn't have to ask for it first.
+        self.load_network()
 
     # ---- display mode / fullscreen -----------------------------------------
 
@@ -646,7 +706,7 @@ class Hologram:
         for name, radius, speed in PLANETS:
             new_orbits.append({
                 "radius": radius, "tilt": 2, "speed": speed, "electrons": [0],
-                "label": name,
+                "label": name, "color": PLANET_COLORS.get(name, (1.0, 0.8, 0.5)),
             })
         self.orbits = new_orbits
         self.selected_index = None
@@ -674,8 +734,11 @@ class Hologram:
             self.current_star_index = key_list.index(key)
 
         new_orbits = []
-        for pname, radius, speed in planets:
-            new_orbits.append({"radius": radius, "tilt": 2, "speed": speed, "electrons": [0], "label": pname})
+        for i, (pname, radius, speed) in enumerate(planets):
+            new_orbits.append({
+                "radius": radius, "tilt": 2, "speed": speed, "electrons": [0], "label": pname,
+                "color": EXOPLANET_PALETTE[i % len(EXOPLANET_PALETTE)],
+            })
         self.orbits = new_orbits
         self.selected_index = None
         self.mode = "solar_system"
@@ -699,6 +762,18 @@ class Hologram:
         self.selected_index = None
         self.mode = "demo"
         self.mode_label = "DEMO DISPLAY"
+        self._trigger_materialize()
+
+    def load_network(self):
+        """Constellation/node-graph view — Aurora's own subsystems shown
+        as connected glowing nodes scattered in 3D space, each with a
+        real screen-projected text label."""
+        self.hide_weather()
+        self.network_nodes = _build_network_nodes()
+        self.orbits = []
+        self.selected_index = None
+        self.mode = "network"
+        self.mode_label = "SYSTEM NETWORK"
         self._trigger_materialize()
 
     def load_shape(self, shape_name):
@@ -1004,6 +1079,18 @@ class Hologram:
             glColor4f(r, g, b, alpha)
             self._draw_node_fan(base_radius * scale)
 
+    def _draw_glow_ring(self, radius, r, g, b, passes=3):
+        """Soft additive halo behind an orbit ring — same idea as
+        _draw_glow_fan but for line loops, so orbit paths get a subtle
+        bloom instead of reading as a single flat-width line."""
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+        for i in range(passes, 0, -1):
+            glLineWidth(2.0 + i * 2.5)
+            glColor4f(r, g, b, 0.06 / i)
+            self._draw_ring(radius)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glLineWidth(2.0)
+
     NUCLEON_RENDER_CAP = 40
 
     def _nucleon_positions(self, count, cluster_radius=0.22):
@@ -1022,6 +1109,164 @@ class Hologram:
             z = math.sin(theta) * radius_at_y
             positions.append((x * cluster_radius, y * cluster_radius, z * cluster_radius))
         return positions
+
+    # Warm/cool accent palette cycled across nebula burst particles and
+    # node label pills — echoes the colorful "data core" look rather than
+    # everything being one flat theme color.
+    NEBULA_PARTICLE_COLORS = [
+        (1.0, 0.55, 0.85), (0.6, 0.4, 1.0), (1.0, 0.75, 0.3), (0.4, 0.85, 1.0),
+        (1.0, 0.4, 0.5), (0.5, 1.0, 0.75),
+    ]
+
+    def _draw_nebula_burst(self, scale):
+        """Glowing 'data core' at the network hub. Previously this drew
+        6 offset, rotating translucent discs — which reads as a lumpy,
+        asymmetric blob rather than a clean glow. Replaced with a
+        smooth centered radial gradient (the actual 'core' feel), a
+        handful of clearly bright hero sparks, and a quiet scatter of
+        dim background dust — a layered, intentional look instead of
+        uniform noise."""
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+        breathe = 0.9 + 0.1 * math.sin(self.elapsed * 1.1)
+
+        # smooth centered glow, blended through a few colors from the
+        # inside out — always centered, never offset, so it reads as one
+        # cohesive core rather than a cluster of separate blobs.
+        core_layers = [
+            (1.0, 0.9, 0.95, 0.10 * scale, 0.11),
+            (0.85, 0.55, 1.0, 0.20 * scale, 0.075),
+            (0.55, 0.5, 1.0, 0.32 * scale, 0.045),
+            (0.4, 0.65, 1.0, 0.48 * scale, 0.025),
+        ]
+        for r, g, b, radius, alpha in core_layers:
+            glColor4f(r, g, b, alpha * breathe)
+            self._draw_node_fan(radius, segments=28)
+
+        # a handful of bright hero sparks — few enough to read as
+        # deliberate highlights, each with its own soft halo
+        hero_positions = self._nucleon_positions(7, cluster_radius=0.16 * scale)
+        for i, (x, y, z) in enumerate(hero_positions):
+            pcolor = self.NEBULA_PARTICLE_COLORS[i % len(self.NEBULA_PARTICLE_COLORS)]
+            twinkle = 0.5 + 0.5 * max(0.0, math.sin(self.elapsed * 1.8 + i * 1.7))
+            glPushMatrix()
+            glTranslatef(x, y, z)
+            glColor4f(pcolor[0], pcolor[1], pcolor[2], 0.15 * twinkle)
+            self._draw_node_fan(0.09 * scale, segments=16)
+            glColor4f(min(1.0, pcolor[0] + 0.3), min(1.0, pcolor[1] + 0.3), min(1.0, pcolor[2] + 0.3), 0.85 * twinkle)
+            self._draw_node_fan(0.03, segments=10)
+            glPopMatrix()
+
+        # quiet scattered dust for texture, kept dim so it never
+        # competes with the core or the hero sparks
+        dust_positions = self._nucleon_positions(40, cluster_radius=0.30 * scale)
+        for i, (x, y, z) in enumerate(dust_positions):
+            pcolor = self.NEBULA_PARTICLE_COLORS[i % len(self.NEBULA_PARTICLE_COLORS)]
+            twinkle = 0.25 + 0.4 * max(0.0, math.sin(self.elapsed * 2.4 + i * 0.9))
+            glPushMatrix()
+            glTranslatef(x, y, z)
+            glColor4f(pcolor[0], pcolor[1], pcolor[2], 0.22 * twinkle)
+            self._draw_node_fan(0.014, segments=6)
+            glPopMatrix()
+
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+
+    def _draw_pill_label(self, x, y, text, text_color=(210, 235, 255), accent=(0.3, 0.85, 1.0)):
+        """Rounded pill-shaped tag for a node label — small accent dot +
+        text on a translucent dark capsule, instead of bare floating
+        text, matching a dashboard-tag look."""
+        if not self.font_small:
+            return
+        surf = self.font_small.render(text, True, text_color)
+        tw, th = surf.get_size()
+        pad_x, pad_y = 10, 5
+        w, h = tw + pad_x * 2 + 8, th + pad_y * 2
+        r = h / 2
+
+        glColor4f(0.02, 0.05, 0.09, 0.78)
+        self._draw_circle_2d(x + r, y + r, r, segments=16)
+        self._draw_circle_2d(x + w - r, y + r, r, segments=16)
+        glBegin(GL_QUADS)
+        glVertex2f(x + r, y); glVertex2f(x + w - r, y)
+        glVertex2f(x + w - r, y + h); glVertex2f(x + r, y + h)
+        glEnd()
+
+        glColor4f(accent[0], accent[1], accent[2], 0.5)
+        glLineWidth(1.0)
+        self._draw_circle_2d(x + r, y + r, r, segments=16, filled=False)
+        self._draw_circle_2d(x + w - r, y + r, r, segments=16, filled=False)
+        glBegin(GL_LINES)
+        glVertex2f(x + r, y); glVertex2f(x + w - r, y)
+        glVertex2f(x + r, y + h); glVertex2f(x + w - r, y + h)
+        glEnd()
+
+        glColor4f(accent[0], accent[1], accent[2], 0.95)
+        self._draw_circle_2d(x + pad_x, y + h / 2, 3)
+        self._blit_text(self.font_small, text, x + pad_x + 8, y + pad_y - 2, color=text_color)
+
+    def _draw_network(self, color, brightness, scale):
+        """Draws the constellation/node-graph view: a central hub, nodes
+        scattered organically in 3D, connecting lines, and — the key
+        detail — captures each node's actual on-screen position via
+        gluProject so real text labels can be drawn right next to them
+        in the 2D pass, rather than a static overlay that doesn't track
+        the rotating 3D content."""
+        self._network_label_positions = []
+
+        modelview = glGetDoublev(GL_MODELVIEW_MATRIX)
+        projection = glGetDoublev(GL_PROJECTION_MATRIX)
+        viewport = glGetIntegerv(GL_VIEWPORT)
+
+        # central hub — soft base glow underneath, then a colorful
+        # twinkling particle burst on top for a real "data core" look
+        # instead of one flat glowing disc.
+        glColor4f(color[0] * brightness, color[1] * brightness, color[2] * brightness, 1.0)
+        self._draw_glow_fan(0.16 * scale, color[0] * brightness, color[1] * brightness, color[2] * brightness, passes=7)
+        self._draw_node_fan(0.07 * scale, segments=20)
+        self._draw_nebula_burst(scale)
+
+        for i, node in enumerate(self.network_nodes):
+            nx, ny, nz = node["pos"]
+            drift = 0.06 * math.sin(self.elapsed * 0.5 + node["drift_phase"])
+            px, py, pz = nx * scale, (ny + drift) * scale, nz * scale
+            accent = self.NEBULA_PARTICLE_COLORS[i % len(self.NEBULA_PARTICLE_COLORS)]
+
+            # thin warm connecting thread, fading toward the node end —
+            # additive blending so overlapping threads actually glow
+            # brighter instead of just alpha-stacking, closer to the
+            # fine glowing lines radiating out in the reference look.
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+            glLineWidth(1.2)
+            glBegin(GL_LINES)
+            glColor4f(accent[0], accent[1], accent[2], 0.6)
+            glVertex3f(0, 0, 0)
+            glColor4f(accent[0], accent[1], accent[2], 0.12)
+            glVertex3f(px, py, pz)
+            glEnd()
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+
+            glPushMatrix()
+            glTranslatef(px, py, pz)
+            nc = tuple(min(1.0, c * 0.5 + accent[j] * 0.5) for j, c in enumerate(color))
+            self._draw_glow_fan(0.065, *nc, passes=4)
+            glColor4f(*nc, 1.0)
+            self._draw_node_fan(0.045, segments=14)
+            # small bright core so each node reads as a distinct star
+            # rather than a flat-colored disc
+            glColor4f(1.0, 1.0, 1.0, 0.85)
+            self._draw_node_fan(0.016, segments=10)
+            glPopMatrix()
+
+            try:
+                screen_x, screen_y, screen_z = gluProject(px, py, pz, modelview, projection, viewport)
+                if 0 <= screen_z <= 1:  # in front of the camera, not clipped behind it
+                    # OpenGL's screen-space Y is flipped vs. our 2D ortho pass
+                    self._network_label_positions.append((screen_x, self.height - screen_y, node["label"], accent))
+            except Exception:
+                pass
+
+    def _draw_network_labels(self):
+        for sx, sy, label, accent in self._network_label_positions:
+            self._draw_pill_label(sx + 8, sy - 10, label, accent=accent)
 
     def _draw_nucleus_particles(self, protons, neutrons, brightness):
         """Real proton/neutron particle cluster instead of a single dot —
@@ -1099,11 +1344,80 @@ class Hologram:
         glMatrixMode(GL_PROJECTION); glPopMatrix()
         glMatrixMode(GL_MODELVIEW); glPopMatrix()
 
+    def _load_background_image(self):
+        """Looks for background.jpg / background.jpeg / background.png
+        in the project root (one level up from jarvis_ui/) and uploads
+        it as an OpenGL texture. Silently does nothing if none is found
+        or it fails to load — the procedural background is always the
+        fallback, so this is purely additive."""
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        for fname in ("background.jpg", "background.jpeg", "background.png"):
+            path = os.path.join(base_dir, "..", fname)
+            if not os.path.exists(path):
+                continue
+            try:
+                surf = pygame.image.load(path)
+                surf = pygame.transform.smoothscale(surf, (self.width, self.height)).convert_alpha()
+                data = pygame.image.tostring(surf, "RGBA", True)
+                tex_id = glGenTextures(1)
+                glBindTexture(GL_TEXTURE_2D, tex_id)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, surf.get_width(), surf.get_height(),
+                             0, GL_RGBA, GL_UNSIGNED_BYTE, data)
+                self.background_texture = tex_id
+                return
+            except Exception:
+                self.background_texture = None
+                return
+
+    def _draw_background_image(self):
+        """Full-screen textured quad, drawn slightly darkened so the HUD
+        panels and hologram content stay readable on top of it, with a
+        very slow drift/zoom so it doesn't feel like a static wallpaper."""
+        drift = 6 * math.sin(self.elapsed * 0.05)
+        zoom = 1.03 + 0.02 * math.sin(self.elapsed * 0.03)
+        cx, cy = self.width / 2, self.height / 2
+        half_w, half_h = (self.width / 2) * zoom, (self.height / 2) * zoom
+
+        glEnable(GL_TEXTURE_2D)
+        glBindTexture(GL_TEXTURE_2D, self.background_texture)
+        glColor4f(0.55, 0.55, 0.6, 1.0)  # dim it so foreground HUD text stays legible
+        glBegin(GL_QUADS)
+        glTexCoord2f(0, 0); glVertex2f(cx - half_w + drift, cy - half_h)
+        glTexCoord2f(1, 0); glVertex2f(cx + half_w + drift, cy - half_h)
+        glTexCoord2f(1, 1); glVertex2f(cx + half_w + drift, cy + half_h)
+        glTexCoord2f(0, 1); glVertex2f(cx - half_w + drift, cy + half_h)
+        glEnd()
+        glDisable(GL_TEXTURE_2D)
+
     def _draw_starfield(self):
         for fx, fy, phase, size in self.stars:
             twinkle = 0.35 + 0.65 * max(0.0, math.sin(self.elapsed * 1.2 + phase))
             glColor4f(0.8, 0.9, 1.0, 0.55 * twinkle)
             self._draw_circle_2d(fx * self.width, fy * self.height, size * 0.9)
+
+    def _draw_nebula(self):
+        """Soft colored glow clouds drifting slowly behind everything —
+        additive blending so they layer like real nebula gas rather than
+        flat colored blobs. Denser and more saturated than the original
+        pass, which read as too flat/dull at normal brightness."""
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+        clouds = [
+            (0.20, 0.28, 0.45, 0.2, 0.85, 1.15),   # deep purple, upper-left, large+slow
+            (0.75, 0.5, 0.75, 0.4, 0.2, 0.9),      # warm magenta-amber, mid-right
+            (0.5, 0.8, 0.15, 0.4, 0.75, 1.0),      # blue, lower-center
+            (0.15, 0.65, 0.5, 0.15, 0.8, 0.75),    # teal, left-mid, smaller+faster
+            (0.85, 0.2, 0.85, 0.35, 0.55, 0.8),    # pink, upper-right, smaller+faster
+        ]
+        for fx, fy, r, g, b, size_mult in clouds:
+            drift_x = fx * self.width + 55 * math.sin(self.elapsed * 0.07 + r * 10)
+            drift_y = fy * self.height + 40 * math.cos(self.elapsed * 0.05 + g * 10)
+            radius = min(self.width, self.height) * 0.24 * size_mult
+            for i in range(5, 0, -1):
+                glColor4f(r, g, b, 0.032 / i)
+                self._draw_circle_2d(drift_x, drift_y, radius * (1 + i * 0.4), segments=32)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 
     def _draw_aurora_background(self):
         """Flowing aurora borealis backdrop — translucent glowing ribbons
@@ -1144,13 +1458,6 @@ class Hologram:
 
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)  # restore normal blending
 
-    def _draw_rect(self, x, y, w, h, r, g, b, a, filled=True):
-        glBegin(GL_QUADS if filled else GL_LINE_LOOP)
-        glColor4f(r, g, b, a)
-        glVertex2f(x, y); glVertex2f(x + w, y)
-        glVertex2f(x + w, y + h); glVertex2f(x, y + h)
-        glEnd()
-
     def _materialize_progress(self):
         t = min(1.0, (self.elapsed - self._materialize_start) / self._materialize_duration)
         return 1 - (1 - t) ** 3  # ease-out cubic
@@ -1166,18 +1473,47 @@ class Hologram:
             (x + chamfer, y), (x + w, y), (x + w, y + h - chamfer),
             (x + w - chamfer, y + h), (x, y + h), (x, y + chamfer),
         ]
-        glColor4f(0.02, 0.05, 0.09, fill_alpha * alpha_mult)
+
+        # subtle drop shadow behind the panel — a soft dark offset
+        # duplicate of the outline — gives the panel real depth against
+        # the busy 3D scene instead of looking pasted flat on top of it.
+        shadow_off = 5
+        glColor4f(0.0, 0.0, 0.0, 0.28 * alpha_mult)
         glBegin(GL_POLYGON)
+        for px, py in pts:
+            glVertex2f(px + shadow_off, py + shadow_off)
+        glEnd()
+
+        # Vertical gradient fill (darker at the bottom) instead of a flat
+        # single color — reads as a lit glass panel rather than a solid
+        # cutout, with barely any extra cost.
+        top_alpha = fill_alpha * alpha_mult
+        bottom_alpha = fill_alpha * alpha_mult * 0.55
+        glBegin(GL_POLYGON)
+        for px, py in pts:
+            frac = max(0.0, min(1.0, (py - y) / h)) if h else 0.0
+            a = top_alpha + (bottom_alpha - top_alpha) * frac
+            glColor4f(0.03 * (1 - frac) + 0.015, 0.07 * (1 - frac) + 0.03, 0.12 * (1 - frac) + 0.06, a)
+            glVertex2f(px, py)
+        glEnd()
+
+        border_pulse = 0.5 + 0.12 * math.sin(self.elapsed * 1.3)
+        glColor4f(r, g, b, border_pulse * alpha_mult)
+        glLineWidth(1.4)
+        glBegin(GL_LINE_LOOP)
         for px, py in pts:
             glVertex2f(px, py)
         glEnd()
 
-        border_pulse = 0.45 + 0.15 * math.sin(self.elapsed * 1.5)
-        glColor4f(r, g, b, border_pulse * alpha_mult)
-        glLineWidth(1.3)
+        # faint inner hairline just inside the border — reads as a
+        # beveled edge rather than a single flat outline
+        inset = 3
+        glColor4f(r, g, b, 0.18 * alpha_mult)
+        glLineWidth(1.0)
         glBegin(GL_LINE_LOOP)
         for px, py in pts:
-            glVertex2f(px, py)
+            cx, cy = x + w / 2, y + h / 2
+            glVertex2f(px + (cx - px) * (inset / max(w, 1)) * 2, py + (cy - py) * (inset / max(h, 1)) * 2)
         glEnd()
 
         # small bright accent tick at the chamfered corner
@@ -1246,15 +1582,56 @@ class Hologram:
     def _draw_top_bar(self, theme_color):
         self._draw_panel(16, 12, self.width - 32, 66, theme_color, chamfer=18, fill_alpha=0.45)
 
+        # live theme-color accent dot + small breathing ring, so the top
+        # bar visibly reflects the active color theme rather than being
+        # purely functional text.
+        dot_x, dot_y = 20 + 10, 12 + 33
+        pulse = 0.5 + 0.5 * math.sin(self.elapsed * 2.0)
+        glColor4f(theme_color[0], theme_color[1], theme_color[2], 0.25 + 0.15 * pulse)
+        self._draw_circle_2d(dot_x, dot_y, 9 + 2 * pulse)
+        glColor4f(theme_color[0], theme_color[1], theme_color[2], 1.0)
+        self._draw_circle_2d(dot_x, dot_y, 4)
+
         title = "A U R O R A"
         self._blit_text(self.font_big, title, self.width / 2 - 70, 16, color=(150, 225, 255))
 
-        self._blit_text(self.font_small, time.strftime("%H:%M:%S"), self.width - 120, 20, color=(140, 190, 220))
+        # thin divider under the title for a bit more hierarchy
+        glColor4f(theme_color[0], theme_color[1], theme_color[2], 0.3)
+        glLineWidth(1.0)
+        glBegin(GL_LINES)
+        glVertex2f(self.width / 2 - 90, 50)
+        glVertex2f(self.width / 2 + 90, 50)
+        glEnd()
+
+        # "LIVE" broadcast-style badge under the title — blinking red dot
+        # + timestamp, echoing a live-briefing HUD strip. One shared
+        # localtime() call feeds both this and the clock readout below
+        # instead of calling strftime twice per frame.
+        now_struct = time.localtime()
+        blink = 0.5 + 0.5 * math.sin(self.elapsed * 3.0)
+        live_text = f"LIVE  {time.strftime('%m/%d  %I:%M %p', now_struct)}"
+        if self.font_small:
+            lw = self.font_small.size(live_text)[0]
+        else:
+            lw = 0
+        live_x = self.width / 2 - lw / 2 - 10
+        live_y = 56
+        glColor4f(1.0, 0.25, 0.25, 0.55 + 0.4 * blink)
+        self._draw_circle_2d(live_x, live_y + 6, 3.5)
+        self._blit_text(self.font_small, live_text, live_x + 9, live_y, color=(255, 195, 195))
+
+        self._blit_text(self.font_small, time.strftime("%H:%M:%S", now_struct), self.width - 120, 20, color=(140, 190, 220))
         self._blit_text(self.font_small, f"FPS {self._fps:.0f}", self.width - 120, 40, color=(90, 130, 160))
 
         mode_text = self._truncate(self.mode_label, 42)
-        self._blit_text(self.font_small, "DISPLAYING", 32, 20, color=(90, 130, 160))
-        self._blit_text(self.font, mode_text, 32, 36, color=(200, 235, 255))
+        self._blit_text(self.font_small, "DISPLAYING", 44, 20, color=(90, 130, 160))
+        self._blit_text(self.font, mode_text, 44, 36, color=(200, 235, 255))
+
+        # Electron shell breakdown (e.g. "K:2  L:8  M:1") was being
+        # computed on every atom rebuild but never actually shown
+        # anywhere — surfacing it here rather than just discarding it.
+        if self.mode == "atom" and self.shell_summary:
+            self._blit_text(self.font_small, self._truncate(self.shell_summary, 40), 44, 55, color=(140, 190, 220))
 
     def _get_system_stats(self):
         """Real system stats via psutil. Falls back to a clearly-labeled
@@ -1298,6 +1675,19 @@ class Hologram:
             glVertex2f(vx, vy)
         glEnd()
 
+    # Small color-coded status dot per system stat — quick "is this
+    # healthy?" read at a glance instead of only a number.
+    def _stat_status_color(self, label, frac):
+        if frac is None:
+            return (0.4, 0.45, 0.5)
+        if "BATT" in label and frac < 0.2:
+            return (1.0, 0.35, 0.3)
+        if frac > 0.85:
+            return (1.0, 0.45, 0.25)
+        if frac > 0.6:
+            return (1.0, 0.85, 0.3)
+        return (0.3, 1.0, 0.55)
+
     def _draw_system_panel(self, theme_color):
         px, py, pw, ph = 16, 92, 230, 180
         self._draw_panel(px, py, pw, ph, theme_color, chamfer=14)
@@ -1306,18 +1696,22 @@ class Hologram:
         self._blit_text(self.font_small, "SYSTEM", x, y, color=(90, 130, 160))
         y += 24
         for label, frac in self._get_system_stats():
+            status_color = self._stat_status_color(label, frac)
+            glColor4f(*status_color, 0.95)
+            self._draw_circle_2d(x + 4, y + 7, 3.5)
+
             if frac is None:
-                self._blit_text(self.font_small, f"{label}", x, y, color=(150, 200, 230))
+                self._blit_text(self.font_small, f"{label}", x + 14, y, color=(150, 200, 230))
                 self._blit_text(self.font_small, "N/A", x + bar_w - 30, y, color=(90, 110, 130))
                 y += 16
                 self._draw_segmented_bar(x, y, bar_w, 7, 0.0, (0.2, 0.3, 0.4))
                 y += 24
                 continue
             frac = max(0.0, min(1.0, frac))
-            self._blit_text(self.font_small, label, x, y, color=(150, 200, 230))
+            self._blit_text(self.font_small, label, x + 14, y, color=(150, 200, 230))
             self._blit_text(self.font_small, f"{int(frac*100)}%", x + bar_w - 30, y, color=(200, 235, 255))
             y += 16
-            self._draw_segmented_bar(x, y, bar_w, 7, frac, theme_color)
+            self._draw_segmented_bar(x, y, bar_w, 7, frac, status_color)
             y += 24
 
         # live CPU history graph — actual trend over the last ~20 seconds,
@@ -1325,6 +1719,22 @@ class Hologram:
         self._blit_text(self.font_small, "CPU HISTORY", x, y, color=(90, 130, 160))
         y += 16
         self._draw_sparkline(x, y, bar_w, 26, list(self.cpu_history), theme_color)
+
+    # Category -> accent color for the event log's left tick bar, so
+    # different kinds of events are distinguishable at a glance.
+    _LOG_CATEGORY_COLORS = {
+        "FACE": (0.4, 0.9, 1.0), "VOICE": (0.6, 0.8, 1.0), "DISPLAY": (0.5, 1.0, 0.6),
+        "EDIT": (1.0, 0.85, 0.3), "VOLUME": (0.85, 0.5, 1.0), "MEDIA": (0.85, 0.5, 1.0),
+        "SELECT": (1.0, 1.0, 1.0), "SNAPSHOT": (1.0, 1.0, 1.0), "RESET": (1.0, 0.4, 0.4),
+        "TIMER": (1.0, 0.7, 0.3), "PHONE": (0.5, 1.0, 0.8), "APP": (0.6, 0.9, 1.0),
+        "CALC": (0.7, 0.85, 1.0),
+    }
+
+    def _log_category_color(self, line):
+        for key, color in self._LOG_CATEGORY_COLORS.items():
+            if key in line:
+                return color
+        return (0.5, 0.6, 0.7)
 
     def _draw_event_log(self):
         pw, ph = 300, 180
@@ -1342,6 +1752,15 @@ class Hologram:
             fade = max(0.35, 1.0 - i * 0.16)
             base = (170, 220, 245) if i == 0 else (150, 190, 215)
             color = tuple(int(c * fade) for c in base)
+
+            cat_color = self._log_category_color(line)
+            glColor4f(cat_color[0], cat_color[1], cat_color[2], fade * 0.9)
+            glLineWidth(2.5)
+            glBegin(GL_LINES)
+            glVertex2f(x - 8, y + 2)
+            glVertex2f(x - 8, y + 13)
+            glEnd()
+
             self._blit_text(self.font_small, self._truncate(line, 38), x, y, color=color)
             y += 19
 
@@ -1366,8 +1785,19 @@ class Hologram:
         self._blit_text(self.font_big, label, 155, self.height - bar_h + 18,
                          color=(int(c[0] * 255), int(c[1] * 255), int(c[2] * 255)))
 
+        # vertical divider between the status readout and the hint/HUD
+        # text, so the bar reads as distinct zones instead of one run-on
+        # line of text.
+        div_x = 330
+        glColor4f(theme_color[0], theme_color[1], theme_color[2], 0.25)
+        glLineWidth(1.0)
+        glBegin(GL_LINES)
+        glVertex2f(div_x, self.height - bar_h + 12)
+        glVertex2f(div_x, self.height - 16)
+        glEnd()
+
         hint = "Try: \"Aurora, show the Eiffel Tower\" or \"a skyscraper\"   F11 fullscreen   ESC quit"
-        self._blit_text(self.font_small, self._truncate(hint, 68), 34, self.height - 22, color=(100, 140, 165))
+        self._blit_text(self.font_small, self._truncate(hint, 68), div_x + 16, self.height - 22, color=(100, 140, 165))
 
         if self.hud_lines:
             panel_w = 320
@@ -1391,7 +1821,8 @@ class Hologram:
             (m, m, 1, 1), (self.width - m, m, -1, 1),
             (m, self.height - m, 1, -1), (self.width - m, self.height - m, -1, -1),
         ]
-        glColor4f(0.25, 0.85, 1.0, 0.85)
+        pulse = 0.7 + 0.3 * math.sin(self.elapsed * 1.4)
+        glColor4f(0.25, 0.85, 1.0, 0.85 * pulse)
         glLineWidth(2.0)
         glBegin(GL_LINES)
         for x, y, dx, dy in corners:
@@ -1401,7 +1832,7 @@ class Hologram:
 
         # thinner inset accent line, offset slightly for a layered look
         off = 6
-        glColor4f(0.25, 0.85, 1.0, 0.35)
+        glColor4f(0.25, 0.85, 1.0, 0.35 * pulse)
         glLineWidth(1.0)
         glBegin(GL_LINES)
         for x, y, dx, dy in corners:
@@ -1409,6 +1840,45 @@ class Hologram:
             glVertex2f(ix, iy); glVertex2f(ix + dx * (L - off), iy)
             glVertex2f(ix, iy); glVertex2f(ix, iy + dy * (L - off))
         glEnd()
+
+    def _draw_vignette(self):
+        """Darkens the screen edges/corners — a cheap, standard trick
+        that makes the center content pop and gives the whole dashboard
+        a more cinematic, intentional frame instead of flat full-bright
+        corners."""
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        w, h = self.width, self.height
+        steps = 6
+        max_alpha = 0.4
+        for i in range(steps):
+            frac_out = i / steps
+            frac_in = (i + 1) / steps
+            alpha = max_alpha * (frac_in ** 2)
+            inset_out = 0
+            # draw a shrinking-inward rectangular frame band; simplest
+            # robust approach is four border strips per step
+            band = min(w, h) * 0.5 * (frac_in - frac_out)
+            glColor4f(0.0, 0.0, 0.0, alpha / steps * 3)
+            # top strip
+            glBegin(GL_QUADS)
+            glVertex2f(0, i * (h * 0.5 / steps)); glVertex2f(w, i * (h * 0.5 / steps))
+            glVertex2f(w, (i + 1) * (h * 0.5 / steps)); glVertex2f(0, (i + 1) * (h * 0.5 / steps))
+            glEnd()
+            # bottom strip
+            glBegin(GL_QUADS)
+            glVertex2f(0, h - (i + 1) * (h * 0.5 / steps)); glVertex2f(w, h - (i + 1) * (h * 0.5 / steps))
+            glVertex2f(w, h - i * (h * 0.5 / steps)); glVertex2f(0, h - i * (h * 0.5 / steps))
+            glEnd()
+            # left strip
+            glBegin(GL_QUADS)
+            glVertex2f(i * (w * 0.5 / steps), 0); glVertex2f((i + 1) * (w * 0.5 / steps), 0)
+            glVertex2f((i + 1) * (w * 0.5 / steps), h); glVertex2f(i * (w * 0.5 / steps), h)
+            glEnd()
+            # right strip
+            glBegin(GL_QUADS)
+            glVertex2f(w - (i + 1) * (w * 0.5 / steps), 0); glVertex2f(w - i * (w * 0.5 / steps), 0)
+            glVertex2f(w - i * (w * 0.5 / steps), h); glVertex2f(w - (i + 1) * (w * 0.5 / steps), h)
+            glEnd()
 
     # ---- weather widget (docks the hologram left, shows this on the right) --
 
@@ -1426,14 +1896,26 @@ class Hologram:
         for dx, dy, r in [(-0.5, 0.1, 0.55), (0.1, -0.15, 0.7), (0.7, 0.1, 0.5), (0, 0.3, 0.6)]:
             self._draw_circle_2d(cx + dx * scale, cy + dy * scale, r * scale, segments=20)
 
+    def _condition_accent_color(self, condition):
+        """Backdrop glow tint per weather condition — used behind the
+        icon so the weather panel reads warm/cool/stormy at a glance
+        instead of every condition sharing the same neutral background."""
+        return {
+            "sunny": (1.0, 0.75, 0.25), "partly_cloudy": (0.9, 0.8, 0.4),
+            "cloudy": (0.55, 0.65, 0.75), "fog": (0.6, 0.68, 0.75),
+            "rain": (0.25, 0.55, 0.9), "snow": (0.65, 0.8, 0.95),
+            "storm": (0.55, 0.35, 0.85),
+        }.get(condition, (0.5, 0.6, 0.7))
+
     def _draw_weather_icon(self, condition, cx, cy, scale, color):
         if condition == "sunny":
             glColor4f(1.0, 0.85, 0.3, 0.95)
             self._draw_circle_2d(cx, cy, 0.55 * scale, segments=28)
             glLineWidth(3.0)
             glBegin(GL_LINES)
+            spin = self.elapsed * 12  # slow rotating rays instead of a static burst
             for i in range(8):
-                a = math.radians(i * 45)
+                a = math.radians(i * 45 + spin)
                 x1, y1 = cx + math.cos(a) * 0.7 * scale, cy + math.sin(a) * 0.7 * scale
                 x2, y2 = cx + math.cos(a) * 0.95 * scale, cy + math.sin(a) * 0.95 * scale
                 glVertex2f(x1, y1); glVertex2f(x2, y2)
@@ -1453,7 +1935,9 @@ class Hologram:
             for i, dy in enumerate([-0.4, -0.1, 0.2, 0.5]):
                 glBegin(GL_LINE_STRIP)
                 for j in range(9):
-                    x = -1.0 * scale + j * 0.25 * scale
+                    # drifting sideways over time rather than a static
+                    # wavy line — reads much more like moving fog banks
+                    x = -1.0 * scale + j * 0.25 * scale + 0.15 * scale * math.sin(self.elapsed * 0.5 + i)
                     y = cy + dy * scale + math.sin(j + i) * 0.04 * scale
                     glVertex2f(cx + x, y)
                 glEnd()
@@ -1463,17 +1947,25 @@ class Hologram:
             glColor4f(0.3, 0.65, 1.0, 0.9)
             glLineWidth(3.0)
             glBegin(GL_LINES)
-            for dx in (-0.5, -0.1, 0.3, 0.7):
-                glVertex2f(cx + dx * scale, cy + 0.35 * scale)
-                glVertex2f(cx + dx * scale - 0.1 * scale, cy + 0.75 * scale)
+            for i, dx in enumerate((-0.5, -0.1, 0.3, 0.7)):
+                # each drop loops from just below the cloud to the bottom
+                # of the icon, offset per-drop so they don't fall in sync
+                fall = ((self.elapsed * 1.6 + i * 0.27) % 1.0)
+                y0 = cy + 0.30 * scale + fall * 0.55 * scale
+                glVertex2f(cx + dx * scale, y0)
+                glVertex2f(cx + dx * scale - 0.08 * scale, y0 + 0.22 * scale)
             glEnd()
 
         elif condition == "snow":
             self._draw_cloud_icon(cx, cy - 0.25 * scale, scale * 0.85, (0.75, 0.8, 0.9))
             glColor4f(0.9, 0.95, 1.0, 0.95)
             glLineWidth(2.5)
-            for dx in (-0.5, -0.1, 0.3, 0.7):
-                sx, sy = cx + dx * scale, cy + 0.55 * scale
+            for i, dx in enumerate((-0.5, -0.1, 0.3, 0.7)):
+                # gentle drift down + side-to-side sway per flake
+                fall = ((self.elapsed * 0.5 + i * 0.31) % 1.0)
+                sway = 0.05 * scale * math.sin(self.elapsed * 2 + i * 3)
+                sx = cx + dx * scale + sway
+                sy = cy + 0.30 * scale + fall * 0.6 * scale
                 glBegin(GL_LINES)
                 for a in range(3):
                     ang = math.radians(a * 60)
@@ -1483,7 +1975,9 @@ class Hologram:
 
         elif condition == "storm":
             self._draw_cloud_icon(cx, cy - 0.3 * scale, scale * 0.85, (0.5, 0.55, 0.65))
-            glColor4f(1.0, 0.9, 0.2, 1.0)
+            flicker = 0.6 + 0.4 * max(0.0, math.sin(self.elapsed * 6))
+            glColor4f(1.0, 0.9, 0.2, flicker)
+            glLineWidth(3.0)
             glBegin(GL_LINE_STRIP)
             for x, y in [(-0.05, 0.3), (0.15, 0.35), (-0.02, 0.55), (0.15, 0.6), (-0.1, 0.9)]:
                 glVertex2f(cx + x * scale, cy + y * scale)
@@ -1527,6 +2021,16 @@ class Hologram:
         if self.map_highlight:
             self._draw_us_map(px + 20, py + 60, pw - 40, 140, self.map_highlight, theme_color)
         else:
+            # soft condition-tinted glow behind the icon — makes sunny
+            # feel warm, rain/snow feel cool, storm feel purple, instead
+            # of every condition sitting on the same neutral backdrop.
+            accent = self._condition_accent_color(w.get("condition", "cloudy"))
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+            breathe = 0.85 + 0.15 * math.sin(self.elapsed * 1.4)
+            for i in range(5, 0, -1):
+                glColor4f(accent[0], accent[1], accent[2], 0.05 / i)
+                self._draw_circle_2d(cx, py + 130, (60 + i * 16) * breathe, segments=32)
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
             self._draw_weather_icon(w.get("condition", "cloudy"), cx, py + 130, 90, theme_color)
 
         temp = w.get("temp_c")
@@ -1601,9 +2105,23 @@ class Hologram:
         ph = 300
         px = (self.width - pw) / 2
         py = (self.height - ph) / 2 + 10
-        self._draw_panel(px, py, pw, ph, theme_color, chamfer=20, fill_alpha=0.6, alpha_mult=self._materialize_progress())
+        alpha_mult = self._materialize_progress()
+        self._draw_panel(px, py, pw, ph, theme_color, chamfer=20, fill_alpha=0.6, alpha_mult=alpha_mult)
 
-        x, y = px + 24, py + 20
+        # Pulsing accent dot + "AURORA RESPONSE" header, matching the
+        # rest of the dashboard's HUD-panel language instead of the card
+        # jumping straight into text with no header treatment at all.
+        pulse = 0.5 + 0.5 * math.sin(self.elapsed * 2.0)
+        glColor4f(theme_color[0], theme_color[1], theme_color[2], (0.5 + 0.4 * pulse) * alpha_mult)
+        self._draw_circle_2d(px + 26, py + 16, 4 + pulse)
+        self._blit_text(self.font_small, "AURORA RESPONSE", px + 38, py + 8, color=(140, 190, 220))
+        glColor4f(theme_color[0], theme_color[1], theme_color[2], 0.3 * alpha_mult)
+        glLineWidth(1.0)
+        glBegin(GL_LINES)
+        glVertex2f(px + 24, py + 34); glVertex2f(px + pw - 24, py + 34)
+        glEnd()
+
+        x, y = px + 24, py + 46
         self._blit_text(self.font_small, "YOU ASKED", x, y, color=(90, 130, 160))
         y += 18
         for line in self._wrap_text(self.font_small, self.info_card["question"], pw - 48)[:2]:
@@ -1615,7 +2133,7 @@ class Hologram:
         y += 22
 
         a_lines = self._wrap_text(self.font, self.info_card["answer"], pw - 48)
-        max_lines = max(1, (py + ph - 20 - y) // 22)
+        max_lines = max(1, int((py + ph - 20 - y) // 22))
         for line in a_lines[:max_lines]:
             self._blit_text(self.font, line, x, y, color=(210, 235, 255))
             y += 22
@@ -1648,6 +2166,8 @@ class Hologram:
             self._draw_idle_indicator(theme_color)
         if self.mode == "info":
             self._draw_info_card(theme_color)
+        if self.mode == "network":
+            self._draw_network_labels()
         self._draw_top_bar(theme_color)
         self._draw_system_panel(theme_color)
         self._draw_event_log()
@@ -1655,6 +2175,7 @@ class Hologram:
         self._draw_bottom_bar(theme_color)
         self._draw_scanlines()
         self._draw_corner_brackets()
+        self._draw_vignette()
         self._end_ortho()
 
     # ---- main render ------------------------------------------------------
@@ -1663,8 +2184,13 @@ class Hologram:
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
 
         self._begin_ortho()
-        self._draw_starfield()
-        self._draw_aurora_background()
+        if self.background_texture is not None:
+            self._draw_background_image()
+            self._draw_starfield()
+        else:
+            self._draw_nebula()
+            self._draw_starfield()
+            self._draw_aurora_background()
         self._end_ortho()
 
         base_color = {
@@ -1680,7 +2206,7 @@ class Hologram:
         t = self.flash_intensity
         color = tuple(base_color[i] * (1 - t) + self.flash_color[i] * t for i in range(3))
 
-        if self.mode not in ("empty", "info"):
+        if self.mode not in ("empty", "info", "network"):
             self._draw_base_plate(color, brightness * 0.7)
 
         glPushMatrix()
@@ -1702,9 +2228,27 @@ class Hologram:
             # rotation still adds on top of this baseline.
             glRotatef(25, 1, 0, 0)
             glRotatef(35, 0, 1, 0)
+
+            # Soft additive glow pass underneath the crisp wireframe —
+            # a wider, dimmer duplicate of the same geometry — gives the
+            # shape a holographic bloom instead of a flat thin outline.
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+            for i in (3, 2):
+                glLineWidth(i * 2.2)
+                glColor4f(color[0] * brightness, color[1] * brightness, color[2] * brightness, 0.10 / i)
+                self._draw_shape(self.shape_name)
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+
+            glLineWidth(2.0)
             glColor4f(color[0] * brightness, color[1] * brightness, color[2] * brightness, 0.95)
             self._draw_shape(self.shape_name)
             glPopMatrix()
+        elif self.mode == "network":
+            # No extra push/pop here — _draw_network needs the modelview
+            # matrix exactly as it is right now (translate+rotate+roll
+            # already applied) so gluProject reports correct screen
+            # positions for the text labels.
+            self._draw_network(color, brightness, scale)
         else:
             for idx, orbit in enumerate(self.orbits):
                 is_selected = (idx == self.selected_index)
@@ -1715,10 +2259,13 @@ class Hologram:
                 if self.mode == "atom" and "shell" in orbit:
                     shell_color = SHELL_COLORS[orbit["shell"] % len(SHELL_COLORS)]
                     ring_color = tuple(c * brightness for c in shell_color)
+                elif self.mode == "solar_system" and "color" in orbit:
+                    ring_color = tuple(c * brightness for c in orbit["color"])
                 else:
                     ring_color = (color[0] * brightness, color[1] * brightness, color[2] * brightness)
 
                 path_alpha = 1.0 if is_selected else 0.6
+                self._draw_glow_ring(orbit["radius"], *ring_color, passes=3)
                 glColor4f(*ring_color, path_alpha)
                 self._draw_ring(orbit["radius"])
 
@@ -1753,7 +2300,7 @@ class Hologram:
 
                 glPopMatrix()
 
-        if self.mode not in ("shape", "empty", "info"):
+        if self.mode not in ("shape", "empty", "info", "network"):
             glPushMatrix()
             glScalef(scale, scale, scale)
             self._draw_sweep_arc(1.9)

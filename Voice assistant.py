@@ -95,7 +95,6 @@ def find_wake_word(text):
             return True, (after if after else before)
     return False, None
 API_KEY_FILE = os.path.join(os.path.dirname(__file__), "..", "api_key.txt")
-NOTES_FILE = os.path.join(os.path.dirname(__file__), "..", "notes.txt")
 
 # groq/compound does live web search internally, but that reasoning step
 # adds real latency even for questions that don't need it — a plain "hi"
@@ -431,55 +430,6 @@ class VoiceAssistant:
             self._on_log("VOICE: stop command")
             return True
 
-        if t.strip() in ("repeat that", "say that again", "what did you say", "can you repeat that", "repeat"):
-            if self.last_reply:
-                self._speak(self.last_reply)
-            else:
-                self._speak("I haven't said anything yet.")
-            return True
-
-        m = re.search(r"take a note[:\s]+(.+)$", t)
-        if m:
-            note_text = text[m.start(1):m.end(1)].strip()
-            if not note_text:
-                self._speak("What would you like me to note down?")
-                return True
-            try:
-                with open(NOTES_FILE, "a", encoding="utf-8") as f:
-                    f.write(f"[{time.strftime('%Y-%m-%d %H:%M')}] {note_text}\n")
-                self._on_log(f"NOTES: added '{note_text[:60]}'")
-                self._speak("Noted.")
-            except Exception as e:
-                self._on_log(f"NOTES: failed to save ({e})")
-                self._speak("Sorry, I couldn't save that note.")
-            return True
-
-        if any(k in t for k in ("read my notes", "read notes", "what are my notes", "list my notes")):
-            if not os.path.exists(NOTES_FILE):
-                self._speak("You don't have any notes yet.")
-                return True
-            try:
-                with open(NOTES_FILE, "r", encoding="utf-8") as f:
-                    lines = [l.strip() for l in f.readlines() if l.strip()]
-            except Exception:
-                lines = []
-            if not lines:
-                self._speak("You don't have any notes yet.")
-            else:
-                recent = lines[-5:]
-                spoken = "; ".join(re.sub(r"^\[.*?\]\s*", "", l) for l in recent)
-                self._speak(f"Here are your last {len(recent)} notes: {spoken}")
-            return True
-
-        if "clear my notes" in t or ("delete" in t and "notes" in t):
-            try:
-                open(NOTES_FILE, "w").close()
-                self._on_log("NOTES: cleared")
-                self._speak("Cleared your notes.")
-            except Exception:
-                self._speak("I couldn't clear your notes.")
-            return True
-
         m = re.search(r"(?:remember|enroll) (?:my face )?as (\w+)|enroll me as (\w+)", t)
         if m:
             name = (m.group(1) or m.group(2)).strip().title()
@@ -501,26 +451,6 @@ class VoiceAssistant:
         if any(k in t for k in ("who do you know", "who have you enrolled", "list enrolled", "list faces", "who's enrolled")):
             names = list(self.face_id.people.keys())
             self._speak("I know " + ", ".join(names) if names else "I don't have anyone enrolled yet.")
-            return True
-
-        if any(k in t for k in ("check face recognition", "is face recognition working", "face recognition status", "diagnose face")):
-            if not self.face_id.detection_available:
-                self._speak("Face detection isn't available at all — the cascade classifier failed to load. "
-                            "That's almost always an OpenCV install conflict: uninstall opencv-python, "
-                            "opencv-python-headless, and opencv-contrib-python, then reinstall just "
-                            "opencv-contrib-python.")
-            elif not self.face_id.available:
-                self._speak("Face detection works, but recognition doesn't — opencv-contrib-python's face "
-                            "module isn't loading, so I can detect a face but can't match it to a name. "
-                            "Reinstall opencv-contrib-python cleanly to fix it.")
-            else:
-                count = len(self.face_id.people)
-                if count:
-                    self._speak(f"Face recognition is working. {count} {'person is' if count == 1 else 'people are'} enrolled: "
-                                + ", ".join(self.face_id.people.keys()))
-                else:
-                    self._speak("Face recognition is working, but nobody's enrolled yet. "
-                                "Say 'remember my face as' followed by your name.")
             return True
 
         if "what time" in t or "current time" in t:
@@ -605,13 +535,12 @@ class VoiceAssistant:
                 with open(path, "r", encoding="utf-8", errors="ignore") as f:
                     current = f.read()
                 updated = code_control.edit_code(self.client, current, instruction)
-                diff_summary = code_control.summarize_diff(current, updated)
                 code_control.write_file_content(path, updated)
                 opener = code_control.open_in_arduino if path.endswith(".ino") else code_control.open_in_vscode
                 ok, err = opener(path)
-                self._on_log(f"CODE: edited '{name}' ({diff_summary}) -> {path}")
-                self._speak(f"Updated {name}: {diff_summary}. Opened it" if ok
-                            else f"Updated {name} ({diff_summary}), but couldn't open the editor — {err[:80] if err else ''}")
+                self._on_log(f"CODE: edited '{name}' -> {path}")
+                self._speak(f"Done — I updated {name} and opened it" if ok
+                            else f"I updated {name}, but couldn't open the editor — {err[:80] if err else ''}")
             except Exception as e:
                 self._on_log(f"CODE: edit failed ({e})")
                 self._speak("Sorry, I hit an error editing that file.")

@@ -1,15 +1,15 @@
 """
 Aurora Project — Editable Holographic Element Display
-
+ 
 Launches FULLSCREEN by default. Press F11 to toggle windowed mode, ESC to
 quit (or close the debug window / press 'q' there).
-
+ 
 Two windows open:
   1. The hologram dashboard — nucleus with orbiting "element" nodes, a
      glowing projector base plate, scanline flicker, corner-bracket HUD
      frame, and system/event-log side panels.
   2. Webcam debug view with hand landmarks + live gesture/finger labels.
-
+ 
 VOICE (say "Aurora" + your request):
   "Aurora, show me a carbon atom"      -> real Bohr-model diagram
   "Aurora, add a proton"               -> changes the element, keeps it neutral
@@ -24,6 +24,9 @@ VOICE (say "Aurora" + your request):
                                           matches Burj Khalifa, Empire
                                           State Building, etc.)
   "Aurora, show me a double helix"     -> DNA strand model
+  "Aurora, show my systems"            -> constellation/network view of
+                                          Aurora's own subsystems as
+                                          connected glowing nodes
   "Aurora, select orbit one"           -> selects that orbit, confirms aloud
   "Aurora, deselect orbit"             -> clears the selection
   "Aurora, reset the display"          -> back to the demo hologram
@@ -59,7 +62,7 @@ VOICE (say "Aurora" + your request):
   "Aurora, unlock my phone"            -> requires ADB + phone_pin.txt
                                           (see phone_control.py for setup)
   "Aurora, stop"                        -> interrupts it mid-sentence
-
+ 
 GESTURE GUIDE
 --------------
 One hand:
@@ -80,12 +83,11 @@ One hand:
   Rock sign (horns), held + move up/down -> system volume
   Swipe left/right (open palm) -> cycle color theme
   Swipe up/down (open palm)     -> adjust brightness
-
+ 
 Two hands:
   Spread apart / bring together -> zoom in/out
   Both hands rotate together     -> roll the hologram
 """
-
 import os
 import sys
 import time
@@ -171,10 +173,24 @@ def main():
                     enrollment_samples.append(gray[y:y + h, x:x + w])
                     if len(enrollment_samples) >= ENROLLMENT_TARGET_SAMPLES:
                         name = voice.pending_enrollment_name
-                        face_id.enroll(enrollment_samples, name)
+                        success = face_id.enroll(enrollment_samples, name)
                         enrollment_samples = []
                         voice.pending_enrollment_name = None
-                        voice.speak_now(f"Got it, I'll recognize you as {name} from now on.")
+                        if success:
+                            voice.speak_now(f"Got it, I'll recognize you as {name} from now on.")
+                        else:
+                            # face_id.enroll() returns False if opencv-contrib's
+                            # face module never loaded (self.available == False)
+                            # or the samples were empty — previously this was
+                            # silently ignored and Aurora confirmed success
+                            # anyway, which is exactly the kind of bug that
+                            # makes "enrollment worked" but recognition never
+                            # actually works later.
+                            hologram.log_event("FACE: enrollment failed — recognition unavailable")
+                            voice.speak_now(
+                                "Sorry, I couldn't save that enrollment — face recognition isn't "
+                                "available on this system. Say 'check face recognition' for details."
+                            )
 
                 # ---- recognition: throttled, greets + personalizes on a new match ----
                 elif not voice.pending_enrollment_name and len(faces) >= 1 and \
