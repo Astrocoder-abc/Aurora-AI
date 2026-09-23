@@ -1,13 +1,30 @@
-# Jarvis Project — Laptop-Only Build (Phase 1: Hologram UI)
+# Aurora — Voice-Controlled Holographic AI Dashboard
 
-No external hardware needed — everything runs on your Inspiron 5567 using
-its built-in webcam. Your hand's position rotates an on-screen wireframe
-"hologram" HUD, pinching makes it glow/pulse, and later phases will hook
-voice + the LLM brain into the same UI.
+A local, laptop-only AI assistant with a hand-gesture-controlled 3D
+holographic UI. Runs entirely on your machine's webcam and mic — no
+external hardware required.
 
-## 1. Install Python dependencies
+## Features
 
-Open a terminal in this folder and run:
+- **Hologram display** (pygame + OpenGL): atoms, the solar system, real
+  star systems, wireframe shapes, an Eiffel Tower / skyscraper / DNA
+  model, and a live constellation view of Aurora's own subsystems.
+- **Hand tracking** (MediaPipe): gestures rotate, zoom, pan, and edit the
+  display; a full static-pose gesture set (fist, open palm, pinch, peace,
+  thumbs up/down, OK, rock sign, point).
+- **Voice assistant** (Groq API): wake word "Aurora", speech-to-text,
+  streamed spoken replies, and built-in web search for time-sensitive
+  questions.
+- **Face recognition** (OpenCV/LBPH): consent-based enrollment only —
+  nobody is identified unless they explicitly ask to be remembered.
+- **System control**: volume, media keys, launching apps, timers, quick
+  math, notes, screenshots, locking the PC.
+- **Phone control** (ADB, optional): calls, WhatsApp calls, opening apps,
+  wifi, and search on a connected Android phone.
+- **Weather** (Open-Meteo, free/keyless): current conditions by city or
+  auto-detected location.
+
+## 1. Install
 
 ```
 python -m venv venv
@@ -17,103 +34,149 @@ Activate it:
 - Windows: `venv\Scripts\activate`
 - Mac/Linux: `source venv/bin/activate`
 
-Then install requirements:
+Install dependencies:
 ```
 pip install -r requirements.txt
 ```
 
-> Note: mediapipe is CPU-friendly and does not need a dedicated GPU — the
-> Inspiron 5567's integrated graphics (or the optional Radeon R7 M445 on
-> some configs) is more than enough for this.
+> MediaPipe is CPU-friendly — no dedicated GPU needed.
 
-## 2. Run it
+If `pyaudio` fails to install on Windows:
+```
+python -m pip install --user pipwin
+python -m pipwin install pyaudio
+```
+
+## 2. Run
 
 ```
 python main.py
 ```
 
-Two windows should open:
-1. **Hologram window** — the rotating wireframe HUD
-2. **Debug window** — your webcam feed with hand landmarks drawn on it,
-   so you can confirm tracking is working
+Two windows open:
+1. **Hologram dashboard** — the main holographic display.
+2. **Debug window** — webcam feed with hand landmarks and live
+   gesture/finger-count labels, to confirm tracking is working.
 
-## 3. Try it
+Press **F11** to toggle fullscreen, **ESC** or **q** (in the debug
+window) to quit.
 
-- Move your hand left/right and up/down in front of the webcam — the
-  hologram should rotate to follow.
-- Pinch your thumb and index finger together — the hologram glows
-  brighter and pulses faster.
-- Open your palm fully — hologram turns cyan ("listening" demo state).
-- Make a fist — hologram turns green ("speaking" demo state).
-- Press `q` in the debug window to quit.
+## 3. Voice setup (optional but recommended — free)
+
+Uses Groq's API, which is free with no credit card required.
+
+1. Get a free key at https://console.groq.com/keys.
+2. Rename `api_key.txt.example` to `api_key.txt` and paste your key in
+   (no quotes, no extra text). Keep this file private.
+3. Run `python main.py` as usual. You should see
+   `VOICE: listening for wake word 'Aurora'` in the log.
+4. Say **"Aurora"** followed by your request.
+
+If voice doesn't activate, check the dashboard's event log or
+`voice_debug.log` — the most common causes are a missing/invalid API
+key, no microphone detected, or a failed `pyaudio` install. Everything
+else (gestures, hologram) keeps working even if voice can't start.
+
+## 4. Optional setup
+
+| Feature | Requirement |
+|---|---|
+| Phone control (calls, WhatsApp, app launch, wifi) | [ADB](https://developer.android.com/tools/releases/platform-tools) installed, USB debugging enabled on your phone — see `jarvis_ui/phone_control.py` |
+| Volume control | `pycaw` (already in `requirements.txt`) |
+| Custom background | drop `background.jpg`/`.png` in the project root |
+| Custom fonts | drop `Rajdhani-*.ttf` / `Orbitron-Bold.ttf` in a `fonts/` folder |
+| Code editing by voice | uses the same Groq key as voice — see `jarvis_ui/code_control.py` |
+
+## Voice commands
+
+```
+"Aurora, show me a carbon atom"          real Bohr-model diagram
+"Aurora, add a proton" / "remove 2 electrons" / "add 3 neutrons"
+"Aurora, start a new element"
+"Aurora, show me the solar system"
+"Aurora, show me a sphere"               (also: cube, torus, pyramid, cylinder)
+"Aurora, show the Eiffel Tower" / "show a skyscraper"
+"Aurora, show me a double helix"
+"Aurora, show my systems"                Aurora's own subsystems, as a network
+"Aurora, select orbit one" / "deselect orbit"
+"Aurora, reset the display"
+"Aurora, what's the weather right now?" / "weather in Tokyo"
+"Aurora, close the weather"
+"Aurora, what time is it?"
+"Aurora, what's 47 times 12" / "15 percent of 200"
+"Aurora, set a timer for 5 minutes" / "how much time is left"
+"Aurora, remember my face as Sam" / "forget Sam's face"
+"Aurora, open notepad"                   (also: calc, spotify, chrome, explorer...)
+"Aurora, volume up/down" / "volume to 50" / "mute"
+"Aurora, play music" / "pause" / "next song" / "previous song"
+"Aurora, take a screenshot" / "system status" / "lock my computer"
+"Aurora, take a note: ..." / "read my notes"
+"Aurora, call mom" / "call me"           requires ADB + contacts.json
+"Aurora, call mom on WhatsApp"           requires ADB
+"Aurora, stop"                           interrupts speech mid-sentence
+"Aurora, hello"                          general chat, shown as a response card
+```
+
+## Gesture guide
+
+**One hand**
+| Gesture | Action |
+|---|---|
+| Move hand | Rotate the hologram |
+| Wrist twist | Roll the hologram |
+| Open palm | "Listening" glow |
+| Fist (held) | "Speaking" glow |
+| Fist + move closer/away | Zoom (grab-and-pull) |
+| Fist → fling open fast | "Throw" flash |
+| Point | Select the next orbit/shell |
+| Pinch (orbit selected) + move | Reshape it — vertical = radius, horizontal = spin speed |
+| Pinch (nothing selected) + move | Pan the whole hologram |
+| Peace sign | Save a snapshot to `snapshots/` |
+| Thumbs up | Green confirm flash |
+| Thumbs down | Red flash + reset display |
+| OK sign | Cyan flash + media play/pause |
+| Rock sign, held + move up/down | System volume |
+| Swipe left/right (open palm) | Cycle color theme |
+| Swipe up/down (open palm) | Adjust brightness |
+
+**Two hands**
+| Gesture | Action |
+|---|---|
+| Spread apart / bring together | Zoom in/out |
+| Both hands rotate together | Roll the hologram |
 
 ## Troubleshooting
 
-- **Webcam doesn't open / black debug window:** another app (Zoom, Teams,
-  browser tab) may be holding the camera. Close those and rerun.
-- **Low frame rate / laggy tracking:** lower the resolution further in
-  `hand_tracker.py` (e.g. 480x360), or make sure no other heavy apps are
-  running in the background.
-- **Hand not detected reliably:** make sure there's decent lighting facing
-  your hand, and keep your hand roughly centered in frame while testing.
-- **`ImportError` on mediapipe/OpenGL:** double check you activated the
-  virtual environment before running `pip install`.
+- **Webcam doesn't open / black debug window** — another app (Zoom,
+  Teams, a browser tab) may be holding the camera. Close it and rerun.
+- **Low frame rate / laggy tracking** — lower the resolution in
+  `jarvis_ui/hand_tracker.py`, or close other heavy background apps.
+- **Hand not detected reliably** — use decent lighting and keep your
+  hand roughly centered in frame.
+- **`ImportError` on mediapipe/OpenGL** — confirm the virtual
+  environment is activated before `pip install`.
+- **Face recognition disabled** — usually an OpenCV install conflict.
+  Run: `pip uninstall opencv-python opencv-python-headless
+  opencv-contrib-python -y && pip install opencv-contrib-python`. Say
+  "Aurora, check face recognition" for a live diagnosis.
+- **Voice never picks up audio** — create `mic_index.txt` with the
+  device number shown in the log at startup.
+- **Groq free tier limit** — rate-limited (not a token/dollar cap),
+  roughly 30 requests/minute with a per-day cap on the search-capable
+  model. Resets the next day.
 
-## What's next
+## Project structure
 
-This phase proves the gesture-to-visual pipeline works end-to-end. Next
-phases will add, without touching this hologram code much:
-- Wake word detection + speech-to-text (mic input)
-- The LLM brain (Claude API or local model) for actual conversation/tasks
-- Text-to-speech output
-- Wiring `hologram.set_state(...)` to real conversation events instead of
-  the demo palm/fist mapping used here
-
-## Voice AI setup (talk to it, it can search the web and reply out loud) — FREE
-
-Uses Groq's API, which is genuinely free — no credit card required, no
-trial period that expires.
-
-1. **Get a free Groq API key**: https://console.groq.com/keys — sign in
-   with email or Google, click "Create API Key". No billing info needed.
-2. **Install the new dependencies**:
-   ```
-   python -m pip install --user -r requirements.txt
-   ```
-   `pyaudio` occasionally fails to install on Windows because it needs a
-   prebuilt wheel for your exact Python version. If `pip install pyaudio`
-   errors out, try:
-   ```
-   python -m pip install --user pipwin
-   python -m pipwin install pyaudio
-   ```
-3. **Add your API key**: rename `api_key.txt.example` to `api_key.txt`
-   and replace its contents with just your key (no quotes, no extra
-   text). Keep this file private — don't share it or commit it anywhere.
-4. **Run it**: `python main.py` as usual. If the key and mic are both
-   set up correctly, you'll see `VOICE: listening for wake word 'Jarvis'`
-   printed and logged to the dashboard's event log panel.
-5. **Talk to it**: say "Jarvis" followed by your question, e.g.
-   - "Jarvis, what's the weather in Tokyo right now?" (the model has
-     built-in web search — groq/compound — and decides on its own when
-     to look something up vs. answer from what it already knows)
-   - "Jarvis, what time is it?" (answered instantly, no API call)
-   - "Jarvis, open youtube" (actually opens it in your browser)
-   - "Jarvis, who won the last F1 race?" (web search again)
-
-While it's listening or replying, the hologram's state (and color) will
-switch to reflect that — same visual language as the gesture-driven
-open-palm/fist states, just driven by voice instead.
-
-**Free tier limits worth knowing**: Groq's free tier is rate-limited
-(not a token/dollar cap) — currently around 30 requests/minute and a
-per-day cap on the compound model specifically (in the low hundreds of
-requests/day, since it's the most capable option). For a personal voice
-assistant that's more than enough; if you ever hit the daily cap you'll
-see the error message spoken back to you, and it resets the next day.
-
-**If voice doesn't activate:** the dashboard's event log will tell you
-why — most commonly a missing/invalid API key, a missing microphone, or
-a `pyaudio` install failure. The rest of the app (gestures, hologram)
-keeps working fine even if voice can't start.
-
+```
+main.py                     entry point, main loop
+jarvis_ui/
+  hologram.py                OpenGL dashboard + all visual models
+  hand_tracker.py             MediaPipe gesture recognition
+  voice_assistant.py          wake word, STT, Groq brain, TTS
+  face_id.py                  consent-based face enrollment/recognition
+  system_control.py           volume, media keys, app launching
+  phone_control.py            ADB-based phone control
+  code_control.py             voice-driven code generation/editing
+requirements.txt
+api_key.txt                  your Groq key (create from .example)
+```
