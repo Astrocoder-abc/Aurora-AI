@@ -935,10 +935,13 @@ class Hologram:
         self.scanline_phase += target_dt * 40
         self.elapsed += target_dt
 
-        # occasional short glitch flicker — makes it feel like a projection
+        # Glitch flicker disabled — was causing the whole hologram
+        # (including the nucleus/electrons) to randomly dim/flash every
+        # few seconds. Kept the timer fields so nothing else that
+        # references them breaks, but they no longer do anything.
         self._glitch_timer -= target_dt
         if self._glitch_timer <= 0:
-            self._glitch = 0.12
+            self._glitch = 0.0
             self._glitch_timer = random.uniform(4.0, 9.0)
         elif self._glitch > 0:
             self._glitch = max(0.0, self._glitch - target_dt)
@@ -2828,9 +2831,11 @@ class Hologram:
         pulse = 0.5 + 0.5 * math.sin(self.pulse_phase)
         brightness = (0.6 + 0.4 * pulse + pinch_amount * 0.3) * self.brightness
 
-        glitching = self._glitch > 0
-        if glitching:
-            brightness *= random.uniform(0.35, 1.0)
+        # Glitch flicker removed: it used to multiply brightness by a
+        # random factor every few seconds, which made the whole
+        # hologram (including the nucleus/electrons) flash/dim
+        # unpredictably. glitching is now always False.
+        glitching = False
 
         t = self.flash_intensity
         color = tuple(base_color[i] * (1 - t) + self.flash_color[i] * t for i in range(3))
@@ -2852,6 +2857,16 @@ class Hologram:
         glRotatef(self.rotation_x, 1, 0, 0)
         glRotatef(self.rotation_y, 0, 1, 0)
         glRotatef(self.roll, 0, 0, 1)
+
+        # Depth testing off for the whole hologram content block below.
+        # Everything here (rings, orbit nodes, nucleus particles, glow
+        # fans) is translucent/additive and drawn back-to-front by hand
+        # already; with depth testing on, overlapping translucent quads
+        # at nearly the same depth (e.g. the nucleus glow halo vs. the
+        # proton/neutron dots drawn right after it) randomly failed the
+        # depth test frame-to-frame, which is what made the nucleus and
+        # electrons flicker in and out / appear invisible.
+        glDisable(GL_DEPTH_TEST)
 
         glLineWidth(2.0)
         materialize_ease = self._materialize_progress()
@@ -2985,6 +3000,11 @@ class Hologram:
                 glColor4f(*core_color, 1.0)
                 self._draw_node_fan(core_radius)
             glPopMatrix()
+
+        # Re-enable depth testing before leaving this transform block —
+        # the base-plate/dashboard drawing after glPopMatrix() below
+        # still relies on normal depth behavior.
+        glEnable(GL_DEPTH_TEST)
 
         glPopMatrix()
 
