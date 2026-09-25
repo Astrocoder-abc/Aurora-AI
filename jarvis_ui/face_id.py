@@ -13,10 +13,20 @@ Histograms — for recognition, via opencv-contrib-python. LBPH was chosen
 specifically because it installs from a prebuilt Windows wheel with no
 compilation step, unlike heavier alternatives like dlib/face_recognition
 which have historically been painful to install on Windows.
+
+v2: confidence smoothing. LBPH's per-frame confidence swings a fair bit
+frame-to-frame (lighting flicker, tiny pose changes), which previously
+caused an enrolled person to occasionally flicker to "not recognized" for
+one tick, or — worse — a borderline stranger's face to occasionally dip
+under the threshold and get misidentified for a single frame. Recognition
+now runs a small rolling vote: a name only counts as confirmed once it
+wins a majority of the last few attempts, and reported confidence is the
+average over that window, not a single noisy sample.
 """
 
 import json
 import os
+from collections import deque, Counter
 
 import cv2
 import numpy as np
@@ -31,6 +41,14 @@ CASCADE_PATH = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
 # guessing wrong.
 RECOGNITION_CONFIDENCE_THRESHOLD = 75
 
+# Smoothing: a name must win at least this many of the last WINDOW
+# attempts to be reported as confirmed. WINDOW attempts happen roughly
+# once per second (main.py throttles calls), so this adds a few seconds
+# of latency before a NEW recognition is confirmed, in exchange for far
+# fewer flicker/false-positive frames.
+VOTE_WINDOW = 5
+VOTE_MIN_WINS = 3
+
 
 class FaceID:
     def __init__(self, on_log=None):
@@ -39,6 +57,9 @@ class FaceID:
 
         self.detector = cv2.CascadeClassifier(CASCADE_PATH)
         self._trained = False
+        self._vote_history = deque(maxlen=VOTE_WINDOW)
+        self._confidence_history = deque(maxlen=VOTE_WINDOW)
+        self.confirmed_name = None
 
         if self.detector.empty():
             self._on_log(f"FACE: could not load face detector from {CASCADE_PATH} — "
@@ -124,6 +145,7 @@ class FaceID:
 
         self.recognizer.save(MODEL_PATH)
         self._save_people()
+        self._reset_votes()
         self._on_log(f"FACE: enrolled '{name}' with {len(faces)} samples")
         return True
 
@@ -138,32 +160,66 @@ class FaceID:
         if name in self.people:
             del self.people[name]
             self._save_people()
+            self._reset_votes()
             return True
         return False
+
+    def _reset_votes(self):
+        self._vote_history.clear()
+        self._confidence_history.clear()
+        self.confirmed_name = None
 
     # ---- recognition --------------------------------------------------------
 
     def recognize(self, gray_frame, face_box):
-        """Returns (name, confidence) if confidently matched to an
-        enrolled person, or (None, confidence) if a face was detected
-        but doesn't match anyone enrolled — this is the deliberate
-        design point: unknown faces are never identified as anything,
-        just silently ignored."""
+        """Runs LBPH on the given face crop and feeds the result into a
+        rolling vote. Returns (name, confidence):
+          - name is only set once it has won a majority of the last
+            VOTE_WINDOW attempts (None otherwise — including on the very
+            first few calls, and while nobody is enrolled).
+          - confidence is the average LBPH score over the window (still
+            LOWER = more confident), or None if nothing to average yet.
+        This is deliberately conservative: a stranger's face that
+        occasionally slips under the raw threshold for one frame won't
+        get reported unless it keeps happening across several attempts."""
         if not self.available or not self.people or not self._trained:
+            self._reset_votes()
             return None, None
 
         x, y, w, h = face_box
         face_crop = cv2.resize(gray_frame[y:y + h, x:x + w], (200, 200))
         try:
-            label, confidence = self.recognizer.predict(face_crop)
+            label, raw_confidence = self.recognizer.predict(face_crop)
         except cv2.error:
             return None, None
 
-        if confidence > RECOGNITION_CONFIDENCE_THRESHOLD:
-            return None, confidence
+        if raw_confidence > RECOGNITION_CONFIDENCE_THRESHOLD:
+            vote = None
+        else:
+            vote = next((n for n, info in self.people.items() if info["label"] == label), None)
 
-        name = next((n for n, info in self.people.items() if info["label"] == label), None)
-        return name, confidence
+        self._vote_history.append(vote)
+        self._confidence_history.append(raw_confidence)
+
+        counts = Counter(v for v in self._vote_history if v is not None)
+        if counts:
+            best_name, best_count = counts.most_common(1)[0]
+        else:
+            best_name, best_count = None, 0
+
+        avg_confidence = sum(self._confidence_history) / len(self._confidence_history)
+
+        if best_name and best_count >= VOTE_MIN_WINS:
+            self.confirmed_name = best_name
+            return best_name, avg_confidence
+
+        # Not enough agreement yet to confirm — if a DIFFERENT person was
+        # previously confirmed and recent votes have gone quiet/mismatched,
+        # drop the confirmation rather than holding onto a stale identity.
+        if self.confirmed_name and best_name != self.confirmed_name and best_count < VOTE_MIN_WINS:
+            self.confirmed_name = None
+
+        return None, avg_confidence
 
     def get_theme_index(self, name):
         info = self.people.get(name)
