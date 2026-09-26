@@ -37,6 +37,22 @@ VOICE (say "Aurora" + your request):
   "Aurora, weather in Tokyo"           -> same, for any location
   "Aurora, close the weather"          -> undocks, hologram returns to center
   "Aurora, what time is it?"           -> instant, no API call
+  "Aurora, what am I looking at?"      -> reads any QR code/barcode in
+                                          view instantly; otherwise sends
+                                          the camera frame to Groq vision
+                                          for a short spoken description
+  "Aurora, connect to my Arduino"      -> starts the telemetry link from
+                                          iot_config.json (serial or wifi
+                                          JSON) — see jarvis_ui/telemetry.py
+  "Aurora, show my Mars station telemetry" -> live dashboard of whatever
+                                          fields the device is sending
+  "Aurora, close the telemetry"        -> hides the telemetry dashboard
+  "Aurora, show Orion"                 -> Astronomy Mode star map (also:
+                                          the Big Dipper, Cassiopeia, Leo,
+                                          Scorpius, Cygnus, Gemini, Crux)
+  "Aurora, show a water molecule"      -> Lab Mode ball-and-stick model
+  "Aurora, graph sine of x"            -> Lab Mode math graph
+  "Aurora, simulate a pendulum"        -> Lab Mode physics simulation
   "Aurora, hello"                      -> just chats, but still shows a
                                           response card with what you
                                           asked and the answer, not just
@@ -99,6 +115,7 @@ from jarvis_ui.hologram import Hologram
 from jarvis_ui.voice_assistant import VoiceAssistant
 from jarvis_ui.face_id import FaceID
 from jarvis_ui import system_control
+from jarvis_ui import telemetry
 
 GESTURE_TO_STATE = {
     "open_palm": "listening",
@@ -135,6 +152,8 @@ def main():
         voice.state = "idle"
         voice.enabled = False
         voice.pending_enrollment_name = None
+        voice.latest_frame = None
+        voice.telemetry = telemetry.TelemetryReader()
 
     print(__doc__)
 
@@ -163,9 +182,18 @@ def main():
             result, debug_frame = tracker.read()
             if debug_frame is not None:
                 last_debug_frame = debug_frame
+                # keep the voice assistant's "what am I looking at?" /
+                # QR-scan command supplied with the latest camera frame
+                voice.latest_frame = debug_frame
 
                 gray = cv2.cvtColor(debug_frame, cv2.COLOR_BGR2GRAY)
                 faces = face_id.detect_faces(gray)
+
+                # feed the latest Arduino/IoT reading into the telemetry
+                # dashboard when it's on screen; harmless no-op otherwise
+                if hologram.mode == "telemetry":
+                    reader = voice.telemetry
+                    hologram.update_telemetry(reader.latest, reader.connected and not reader.is_stale())
 
                 # ---- enrollment: collect samples while a request is pending ----
                 if voice.pending_enrollment_name and len(faces) == 1:
