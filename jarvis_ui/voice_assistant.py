@@ -80,6 +80,7 @@ from jarvis_ui import system_control
 from jarvis_ui import phone_control
 from jarvis_ui import code_control
 from jarvis_ui import vision
+from jarvis_ui import telemetry
 
 try:
     from groq import Groq
@@ -272,6 +273,7 @@ class VoiceAssistant:
         self.last_weather_error = None
         self.pending_enrollment_name = None  # set by voice, consumed by main.py's camera loop
         self.latest_frame = None  # set every frame by main.py's camera loop, used by vision commands
+        self.telemetry = telemetry.TelemetryReader(on_log=self._on_log)  # Arduino/IoT Mode
 
         # streaming reply state: the in-flight sentence queue (so a stop
         # command can drain it) and a cancel flag checked between tokens
@@ -1131,6 +1133,32 @@ class VoiceAssistant:
             self.hologram._update_custom_label()
             self._on_log("EDIT: started new custom element from scratch")
             self._speak("Starting a new element with one proton and one electron. Tell me what to add.")
+            return True
+
+        # ---- Arduino/IoT Mode -------------------------------------------------------
+        if any(k in t for k in ("connect to my arduino", "connect my arduino", "connect arduino",
+                                 "connect to my esp32", "connect my esp32", "connect esp32",
+                                 "connect iot device", "connect to my device")):
+            ok, msg = self.telemetry.start()
+            self._on_log(f"IOT: connect requested -> {msg}")
+            self._speak(msg if not ok else "Connected. Say 'show my telemetry' to see it on the display.")
+            return True
+
+        if "telemetry" in t and any(k in t for k in ("hide", "close", "stop", "dismiss")):
+            self.telemetry.stop()
+            self.hologram.hide_telemetry()
+            self._on_log("IOT: telemetry display closed")
+            self._speak("Closing telemetry")
+            return True
+
+        if "telemetry" in t and any(k in t for k in ("show", "display")):
+            name_m = re.search(r"(?:show|display)\s+(?:my\s+|the\s+)?(.+?)\s+telemetry", t)
+            label = name_m.group(1).strip() if name_m and name_m.group(1).strip() else "device"
+            ok, msg = self.telemetry.start()
+            self.hologram.show_telemetry(label)
+            self._on_log(f"IOT: showing '{label}' telemetry (link started={ok}: {msg})")
+            self._speak(f"Connecting to your {label} telemetry now." if ok else
+                        f"Showing the {label} display, but couldn't connect: {msg}")
             return True
 
         # ---- Astronomy Mode: overview ---------------------------------------------

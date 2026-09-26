@@ -685,6 +685,16 @@ class Hologram:
         self.constellation_name = ""
         self._star_label_positions = []
 
+        # Arduino/IoT Mode: latest telemetry dict + per-field sparkline
+        # history, set from main.py's loop via update_telemetry(). Aurora
+        # itself doesn't own the serial/wifi connection (that's
+        # jarvis_ui.telemetry.TelemetryReader) — this is just the display.
+        self.telemetry_label = ""
+        self.telemetry_data = {}
+        self.telemetry_history = {}
+        self.telemetry_connected = False
+        self.telemetry_last_update = 0.0
+
         self.hud_lines = []
         self.event_log = deque(maxlen=6)
         self._event_log_lock = threading.Lock()
@@ -1200,6 +1210,44 @@ class Hologram:
         self.mode_label = f"{key.upper()} — STAR MAP"
         self._trigger_materialize()
         return True
+
+    # ---- Arduino/IoT Mode: telemetry -------------------------------------------
+
+    def show_telemetry(self, label):
+        """Switches to the telemetry dashboard for a device labeled
+        `label` (e.g. "Mars station"). Actual data arrives via repeated
+        calls to update_telemetry() from main.py's loop."""
+        self.hide_weather()
+        self.mode = "telemetry"
+        self.telemetry_label = label
+        self.mode_label = f"{label.upper()} TELEMETRY"
+        self.telemetry_data = {}
+        self.telemetry_history = {}
+        self.telemetry_connected = False
+        self.telemetry_last_update = 0.0
+        self.orbits = []
+        self.selected_index = None
+        self._trigger_materialize()
+
+    def hide_telemetry(self):
+        if self.mode == "telemetry":
+            self.mode = "empty"
+            self.mode_label = 'STANDBY — SAY "AURORA"'
+
+    def update_telemetry(self, data, connected):
+        """Called every frame with the reader's latest dict — a no-op
+        unless telemetry is actually on screen. Numeric fields feed a
+        capped rolling history for the little sparklines."""
+        if self.mode != "telemetry":
+            return
+        self.telemetry_connected = connected
+        if connected and isinstance(data, dict) and data:
+            self.telemetry_data = data
+            self.telemetry_last_update = time.time()
+            for key, value in data.items():
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    hist = self.telemetry_history.setdefault(key, deque(maxlen=40))
+                    hist.append(value)
 
     # ---- orbit editing -----------------------------------------------------
 
@@ -2650,7 +2698,7 @@ class Hologram:
 
     def _draw_info_panel(self, theme_color):
         """Left-side readout of what's on the hologram."""
-        if self.docked or self.mode in ("empty", "info") or not self.font_small:
+        if self.docked or self.mode in ("empty", "info", "telemetry") or not self.font_small:
             return
         rows = self._mode_readout()
         px, py, pw = 16, 286, 230
@@ -3001,6 +3049,65 @@ class Hologram:
             lw = surf.get_size()[0] if surf else 0
             self._blit_text(self.font_small, line, cx - lw / 2, stat_y, color=(150, 200, 230))
 
+    def _normalize_history(self, values):
+        """Scales a value history to 0..1 for _draw_sparkline, which
+        expects fractions rather than raw sensor units."""
+        vals = list(values)
+        lo, hi = min(vals), max(vals)
+        if hi - lo < 1e-9:
+            return [0.5] * len(vals)
+        return [(v - lo) / (hi - lo) for v in vals]
+
+    def _draw_telemetry_panel(self, theme_color):
+        """Live Arduino/IoT dashboard: connection status, then one row
+        per telemetry field (name, current value, tiny trend sparkline
+        for numeric fields). Data itself comes from update_telemetry()."""
+        pw = max(560, min(900, self.width - 500))
+        ph = self.height - 260
+        px, py = (self.width - pw) / 2, (self.height - ph) / 2 + 10
+        alpha_mult = self._materialize_progress()
+        self._draw_panel(px, py, pw, ph, theme_color, chamfer=20, fill_alpha=0.6, alpha_mult=alpha_mult)
+
+        stale = self.telemetry_last_update == 0 or (time.time() - self.telemetry_last_update) > 10
+        live = self.telemetry_connected and not stale
+        status_color = (0.3, 1.0, 0.5) if live else (1.0, 0.35, 0.3)
+        status_text = "LIVE" if live else ("NO SIGNAL" if stale and self.telemetry_last_update else "CONNECTING")
+        pulse = 0.5 + 0.5 * math.sin(self.elapsed * (1.6 if live else 4.0))
+
+        glColor4f(status_color[0], status_color[1], status_color[2], (0.6 + 0.3 * pulse) * alpha_mult)
+        self._draw_circle_2d(px + 26, py + 16, 4 + pulse)
+        self._blit_text(self.font_small, f"{self.telemetry_label.upper()} — {status_text}",
+                         px + 38, py + 8, color=(140, 190, 220))
+        glColor4f(theme_color[0], theme_color[1], theme_color[2], 0.3 * alpha_mult)
+        glLineWidth(1.0)
+        glBegin(GL_LINES)
+        glVertex2f(px + 24, py + 34); glVertex2f(px + pw - 24, py + 34)
+        glEnd()
+
+        x, y = px + 24, py + 50
+        if not self.telemetry_data:
+            msg = "Waiting for the first reading..." if not stale else "No telemetry received — check the connection."
+            self._blit_text(self.font, msg, x, y, color=(160, 190, 220))
+            return
+
+        bar_w = pw - 48
+        row_h = 58
+        max_rows = max(1, int((ph - 70) / row_h))
+        items = list(self.telemetry_data.items())
+        for key, value in items[:max_rows]:
+            display_val = f"{value:.2f}" if isinstance(value, float) else str(value)
+            self._blit_text(self.font, str(key).upper(), x, y, color=(210, 235, 255))
+            vw = self.font.size(display_val)[0] if self.font else 0
+            self._blit_text(self.font, display_val, x + bar_w - vw, y, color=(255, 255, 255))
+            y += 26
+            hist = self.telemetry_history.get(key)
+            if hist and len(hist) > 1:
+                self._draw_sparkline(x, y, bar_w, 20, self._normalize_history(hist), theme_color)
+            y += row_h - 26
+        if len(items) > max_rows:
+            self._blit_text(self.font_small, f"... {len(items) - max_rows} more field(s) not shown",
+                             x, y, color=(120, 150, 175))
+
     def _draw_hud_reticle(self, theme_color):
         """Tick ring + arcs that pulse gently (no rotation)."""
         ppu = self.height / 4.97
@@ -3175,6 +3282,8 @@ class Hologram:
         self._draw_event_log()
         self._draw_info_panel(theme_color)
         self._draw_weather_panel(theme_color)
+        if self.mode == "telemetry":
+            self._draw_telemetry_panel(theme_color)
         self._draw_bottom_bar(theme_color)
         self._draw_scanlines()
         self._draw_corner_brackets()
@@ -3218,7 +3327,7 @@ class Hologram:
 
         # projector base: plate, light beam, materialize shockwave — fixed
         # to the display (doesn't rotate with the hand), but follows dock/pan
-        if self.mode not in ("empty", "info", "network"):
+        if self.mode not in ("empty", "info", "network", "telemetry"):
             glPushMatrix()
             glTranslatef(hx, self.translate_y, 0.0)
             self._draw_base_plate(color, brightness * 0.7)
@@ -3364,7 +3473,8 @@ class Hologram:
             if self.mode == "solar_system":
                 self._draw_asteroid_belt(scale, brightness)
 
-        if self.mode not in ("shape", "empty", "info", "network", "molecule", "graph", "physics", "constellation"):
+        if self.mode not in ("shape", "empty", "info", "network", "molecule", "graph", "physics",
+                             "constellation", "telemetry"):
             glPushMatrix()
             glScalef(scale, scale, scale)
             self._draw_sweep_arc(1.9)
