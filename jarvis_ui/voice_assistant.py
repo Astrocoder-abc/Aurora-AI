@@ -4,25 +4,13 @@ Background voice pipeline: wake word -> speech-to-text -> Groq API brain
 Also handles "show me a diagram of X" and "select orbit N" style commands
 by driving the hologram directly (no API call needed, so it's instant).
 
-INTELLIGENCE (v3, all built in — no separate modules to wire up):
-  - Wake word: fuzzy match with a false-positive blocklist and length
-    gating, plus split-syllable pair matching ("or ora" -> aurora).
-  - Search trigger: not just a fixed keyword list — also catches
-    "who is X", "X vs Y", and any question naming a specific year.
-  - Conversation memory: recent turns kept verbatim, older turns folded
-    into a running summary instead of being silently dropped at a hard
-    message-count cutoff.
-  - Long-term memory: "Aurora, remember that ..." persists real facts
-    to long_term_memory.json, surviving restarts, and is fed back into
-    every chat reply as light context.
-  - Intent fallback: if no local command regex matches, one cheap
-    classification call checks whether the user meant a specific
-    feature (weather/timer/atom/shape) that just didn't parse, so
-    Aurora asks a clarifying question instead of answering blind.
-
 STREAMING: general Q&A replies stream token-by-token from Groq and are
-spoken sentence-by-sentence as they arrive. "Aurora, stop" cancels the
-in-flight generation and clears any sentences still queued to be spoken.
+spoken sentence-by-sentence as they arrive, instead of waiting for the
+whole answer to finish generating before saying a word. True word-by-word
+audio isn't used on purpose — TTS on single words sounds choppy — sentence
+chunks give the same "starts talking almost immediately" win with natural
+speech. "Aurora, stop" cancels the in-flight generation and clears any
+sentences still queued to be spoken, not just the one playing.
 
 PHONE (needs ADB setup — see phone_control.py):
   "Aurora, call mom on WhatsApp" / "video call Sam on WhatsApp"
@@ -34,22 +22,37 @@ PHONE (needs ADB setup — see phone_control.py):
 
 COMPUTER: "system status", "take a screenshot", "lock my computer"
 
-MEMORY:
-  "Aurora, remember that my dog's name is Rex"
-  "Aurora, forget that about my dog"
-  "Aurora, what do you remember about me"
+VISION: "Aurora, what am I looking at?" — decodes any QR code/barcode in
+frame locally (instant, no API call); if none found, sends the current
+camera frame to Groq's vision model for a short spoken description.
 
-WEATHER: uses Open-Meteo (https://open-meteo.com) — free, no API key.
-Geocodes a place name to lat/lon, then pulls current conditions for that
-point. No location given -> IP-based geolocation (ipapi.co, also free).
+WEATHER: uses Open-Meteo (https://open-meteo.com) — a free weather API
+that needs no API key. Two calls: their geocoding endpoint turns a place
+name into latitude/longitude, then the forecast endpoint returns current
+conditions for that point. If no location is given ("what's the weather
+right now"), IP-based geolocation (ipapi.co, also free/keyless) is used
+to guess where you are. This replaced asking the Groq model to search
+the web and format weather into a strict text line, which was slower,
+occasionally hit rate limits, and was one more thing that could return
+malformed output.
 
-TTS: Microsoft Edge's free neural voices via `edge-tts`, with the offline
-Windows voice as an automatic fallback.
+TTS: uses Microsoft Edge's free neural voices via the `edge-tts` package
+(no API key, genuinely free) for a natural, fluent voice, with the
+offline Windows voice as an automatic fallback if that ever fails
+(no internet, package missing, etc).
 
 SETUP:
   1. Get a free API key at https://console.groq.com/ (no credit card).
   2. Put it in api_key.txt in this same folder, or set GROQ_API_KEY.
-  3. Say "Aurora" + your request.
+  3. Say "Aurora" + your request, e.g.:
+     "Aurora, what's the weather like right now?"
+     "Aurora, show me a carbon atom"
+     "Aurora, show me the solar system"
+     "Aurora, select orbit one"
+     "Aurora, what time is it?"
+
+Weather needs no separate setup — Open-Meteo and ipapi.co are both
+free and keyless.
 """
 
 import asyncio
@@ -71,10 +74,12 @@ import webbrowser
 import speech_recognition as sr
 import pygame
 
-from jarvis_ui.hologram import ELEMENTS, SHAPES, SHAPE_ALIASES, US_STATE_POSITIONS, STAR_SYSTEMS
+from jarvis_ui.hologram import (ELEMENTS, SHAPES, SHAPE_ALIASES, US_STATE_POSITIONS, STAR_SYSTEMS,
+                                 MOLECULES, MOLECULE_ALIASES, CONSTELLATIONS, CONSTELLATION_ALIASES)
 from jarvis_ui import system_control
 from jarvis_ui import phone_control
 from jarvis_ui import code_control
+from jarvis_ui import vision
 
 try:
     from groq import Groq
@@ -92,77 +97,60 @@ try:
 except ImportError:
     pyttsx3 = None
 
-# ============================================================================
-# Wake word — fuzzy, with a false-positive blocklist and length gating
-# ============================================================================
-
 WAKE_WORD_CORE = "aurora"
-WAKE_WORD_FUZZY_THRESHOLD = 0.76
-WAKE_WORD_MAX_LEN_DIFF = 2
-
-WAKE_WORD_BLOCKLIST = {
-    "adora", "aroma", "arena", "aurora's", "arrow", "arora's",
-    "aura", "arrears", "aroura",
-}
-
-
-def _wake_ratio_ok(word):
-    if word in WAKE_WORD_BLOCKLIST:
-        return False
-    if abs(len(word) - len(WAKE_WORD_CORE)) > WAKE_WORD_MAX_LEN_DIFF:
-        return False
-    return difflib.SequenceMatcher(None, word, WAKE_WORD_CORE).ratio() >= WAKE_WORD_FUZZY_THRESHOLD
+WAKE_WORD_FUZZY_THRESHOLD = 0.72  # tuned so "arora" (a common mishearing) matches
 
 
 def find_wake_word(text):
     """Returns (True, remaining_text_after_it) if a wake word is found —
-    exact match, fuzzy single-word match (blocklisted + length-gated), or
-    an adjacent-word-pair match for split mishearings like 'or ora'."""
-    words = [w.strip(",.!?").lower() for w in text.split()]
-
+    using fuzzy matching per-word, not just an exact substring check,
+    since speech recognition commonly mangles "Aurora" into similar-
+    sounding words ("Arora" is a frequent one, since it's a real name
+    Google's model is biased toward). Exact matches for "aurora" still
+    work as before; this just also catches near-misses instead of
+    requiring an ever-growing hardcoded alias list."""
+    words = text.split()
     for i, w in enumerate(words):
-        if not w:
-            continue
-        if w == WAKE_WORD_CORE or _wake_ratio_ok(w):
+        clean = w.strip(",.!?").lower()
+        matched = clean == WAKE_WORD_CORE or \
+            difflib.SequenceMatcher(None, clean, WAKE_WORD_CORE).ratio() >= WAKE_WORD_FUZZY_THRESHOLD
+        if matched:
             after = " ".join(words[i + 1:])
             before = " ".join(words[:i])
             return True, (after if after else before)
-
-    for i in range(len(words) - 1):
-        if _wake_ratio_ok(words[i] + words[i + 1]):
-            after = " ".join(words[i + 2:])
-            before = " ".join(words[:i])
-            return True, (after if after else before)
-
     return False, None
-
-
 API_KEY_FILE = os.path.join(os.path.dirname(__file__), "..", "api_key.txt")
 NOTES_FILE = os.path.join(os.path.dirname(__file__), "..", "notes.txt")
-LTM_FILE = os.path.join(os.path.dirname(__file__), "..", "long_term_memory.json")
 
-MODEL_FAST = "groq/compound"
+# groq/compound does live web search internally, but that reasoning step
+# adds real latency even for questions that don't need it — a plain "hi"
+# was going through the same search-capable pipeline as "what's the
+# weather", which is why replies felt slow. Fast model for normal chat,
+# compound reserved for the one place that actually needs search.
+# (Weather no longer uses this at all — see WEATHER section below.)
+MODEL_FAST = "groq/compound-mini"
 MODEL_SEARCH = "groq/compound"
 
+# en-GB-RyanNeural is a natural British male voice. Swap for any other
+# Edge neural voice name if you prefer a different one (run
+# `edge-tts --list-voices` to see all options).
 EDGE_VOICE = "en-GB-RyanNeural"
 
 SYSTEM_PROMPT = (
-    "You are Aurora, a witty, concise voice assistant speaking out loud "
-    "through text-to-speech. Keep replies short, 1 to 3 sentences, since "
-    "long replies are tedious to listen to. Be direct and helpful. Always "
-    "respond to greetings warmly, even briefly.\n"
-    "Reason from the actual conversation context before answering rather "
-    "than pattern-matching the question in isolation — if the user says "
-    "'what about tomorrow', check what was being discussed. If you don't "
-    "know something or it depends on current information you don't have, "
-    "say so plainly instead of guessing with false confidence.\n"
-    "IMPORTANT: never use markdown formatting — no asterisks, bullet "
-    "points, numbered lists, headers, or backticks. Plain spoken sentences "
-    "only, since this text is read aloud, not displayed."
+    "You are Aurora, a witty, concise voice assistant speaking out loud to "
+    "your user through text-to-speech. Keep replies short — 1 to 3 "
+    "sentences — since long replies are tedious to listen to. Be direct "
+    "and helpful. Always respond to greetings like 'hi' or 'hello' warmly, "
+    "even briefly. IMPORTANT: never use markdown formatting — no asterisks, "
+    "bullet points, numbered lists, headers, or backticks. Write in plain "
+    "spoken sentences only, since this text is read aloud, not displayed."
 )
 
 
 def clean_for_speech(text):
+    """Strip markdown formatting so TTS doesn't read out '*', '#', etc.
+    literally. Belt-and-suspenders alongside the system prompt asking the
+    model not to use markdown in the first place."""
     text = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
     text = re.sub(r"`([^`]+)`", r"\1", text)
     text = re.sub(r"\*\*\*(.+?)\*\*\*", r"\1", text)
@@ -193,6 +181,9 @@ _SAFE_OPS = {
 
 
 def _safe_eval_node(node):
+    """Evaluates only basic arithmetic — no function calls, no names, no
+    attribute access — so this is safe to run on raw speech text, unlike
+    a bare eval()."""
     if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
         return node.value
     if isinstance(node, ast.BinOp) and type(node.op) in _SAFE_OPS:
@@ -203,6 +194,8 @@ def _safe_eval_node(node):
 
 
 def try_calculate(text):
+    """Returns (result, display_expression) or None if the text doesn't
+    look like a calculable expression."""
     t = text.lower()
 
     m = re.search(r"([\d.]+)\s*percent of\s*([\d.]+)", t)
@@ -248,222 +241,11 @@ async def _edge_tts_save(text, path):
     await communicate.save(path)
 
 
-# ============================================================================
-# Smarter search-need detection
-# ============================================================================
-
-_RECENCY_WORDS = (
-    "latest", "current", "currently", "today", "tonight", "right now",
-    "this week", "this month", "this year", "recent", "recently",
-    "news", "score", "scores", "who won", "stock price", "stock",
-    "happening now", "upcoming", "just released", "just announced",
-)
-_QUESTION_ENTITY_RE = re.compile(
-    r"\b(who is|who's|what is|what's|where is|where's|when is|when's|"
-    r"how much (is|does|are)|how many|is there|has .* (released|launched|announced))\b"
-)
-_COMPARISON_RE = re.compile(r"\b(vs\.?|versus|compared to|better than|difference between)\b")
-_YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
-
-
-def needs_search(text):
-    t = text.lower()
-    if any(k in t for k in _RECENCY_WORDS):
-        return True
-    if _QUESTION_ENTITY_RE.search(t) or _COMPARISON_RE.search(t) or _YEAR_RE.search(t):
-        return True
-    return False
-
-
-# ============================================================================
-# Rolling conversation memory (recent turns + a folded summary of the rest)
-# ============================================================================
-
-_SUMMARY_PROMPT = (
-    "Summarize this conversation so far in 2-3 short sentences, capturing "
-    "any facts, names, or preferences the user shared that might matter "
-    "later. Plain text, no markdown, no preamble."
-)
-
-
-class RollingMemory:
-    def __init__(self, client, keep_recent=8, compress_above=14):
-        self.client = client
-        self.keep_recent = keep_recent
-        self.compress_above = compress_above
-        self.summary = None
-        self.recent = []
-
-    def add(self, role, content):
-        self.recent.append({"role": role, "content": content})
-
-    def maybe_compress(self, model, on_log=None):
-        if len(self.recent) <= self.compress_above or not self.client:
-            return
-        to_fold = self.recent[: len(self.recent) - self.keep_recent]
-        self.recent = self.recent[len(self.recent) - self.keep_recent:]
-
-        transcript = "\n".join(f"{m['role']}: {m['content']}" for m in to_fold)
-        prior = f"Earlier summary: {self.summary}\n\n" if self.summary else ""
-        try:
-            resp = self.client.chat.completions.create(
-                model=model,
-                max_tokens=150,
-                messages=[
-                    {"role": "system", "content": _SUMMARY_PROMPT},
-                    {"role": "user", "content": prior + transcript},
-                ],
-            )
-            new_summary = (resp.choices[0].message.content or "").strip()
-            if new_summary:
-                self.summary = new_summary
-        except Exception as e:
-            if on_log:
-                on_log(f"MEMORY: summarization failed ({e}), keeping raw history only")
-
-    def get_messages(self):
-        msgs = []
-        if self.summary:
-            msgs.append({"role": "system", "content": f"Earlier in this conversation: {self.summary}"})
-        msgs.extend(self.recent)
-        return msgs
-
-    def clear_but_last(self):
-        last = self.recent[-1] if self.recent else None
-        self.recent = [last] if last else []
-        self.summary = None
-
-
-# ============================================================================
-# Long-term memory — persists across restarts (long_term_memory.json)
-# ============================================================================
-
-_MAX_FACTS = 200
-_MAX_INJECTED_CHARS = 800
-_REMEMBER_RE = re.compile(r"^remember (?:that )?(.+)$")
-_FORGET_FACT_RE = re.compile(r"^forget (?:that )?(.+)$")
-
-
-def _slugify(text, max_words=4):
-    words = re.sub(r"[^a-z0-9\s]", "", text.lower()).split()[:max_words]
-    return "_".join(words) or f"fact_{int(time.time())}"
-
-
-class LongTermMemory:
-    """Plain facts Aurora remembers across restarts — separate from
-    RollingMemory, which resets every session."""
-
-    def __init__(self, on_log=None):
-        self._on_log = on_log or (lambda msg: None)
-        self.facts = self._load()
-
-    def _load(self):
-        if os.path.exists(LTM_FILE):
-            try:
-                with open(LTM_FILE, "r", encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception as e:
-                self._on_log(f"MEMORY: could not load long_term_memory.json ({e})")
-        return {}
-
-    def _save(self):
-        try:
-            with open(LTM_FILE, "w", encoding="utf-8") as f:
-                json.dump(self.facts, f, indent=2)
-        except Exception as e:
-            self._on_log(f"MEMORY: could not save long_term_memory.json ({e})")
-
-    def remember(self, fact_text):
-        fact_text = fact_text.strip().rstrip(".")
-        if not fact_text:
-            return False
-        key = _slugify(fact_text)
-        if len(self.facts) >= _MAX_FACTS and key not in self.facts:
-            del self.facts[next(iter(self.facts))]
-        self.facts[key] = {"text": fact_text, "saved_at": time.strftime("%Y-%m-%d")}
-        self._save()
-        return True
-
-    def forget_matching(self, topic):
-        topic = topic.strip().lower()
-        if not topic:
-            return []
-        removed = []
-        for key in [k for k, v in self.facts.items() if topic in v["text"].lower()]:
-            removed.append(self.facts[key]["text"])
-            del self.facts[key]
-        if removed:
-            self._save()
-        return removed
-
-    def all_facts(self):
-        return [v["text"] for v in self.facts.values()]
-
-    def as_context_block(self):
-        if not self.facts:
-            return None
-        block = "Known facts about the user (only mention if relevant): " + "; ".join(self.all_facts())
-        return block[:_MAX_INJECTED_CHARS]
-
-
-# ============================================================================
-# Intent fallback — one cheap classification call when no local regex fires
-# ============================================================================
-
-_INTENTS = {
-    "weather": "asking about current weather/temperature/forecast anywhere",
-    "timer": "setting, checking, or cancelling a timer",
-    "atom": "asking to see/build a chemical element or atom model",
-    "shape": "asking to see a 3d shape/model (sphere, cube, tower, dna, etc.)",
-    "chat": "none of the above — general conversation or a question",
-}
-
-_INTENT_PROMPT = (
-    "Classify the user's voice command into exactly one of these intents: "
-    + ", ".join(_INTENTS) + ".\n"
-    "Reply with ONLY JSON: {\"intent\": \"<one of the above>\"}. No explanation."
-)
-
-_CLARIFY_TEMPLATES = {
-    "weather": "Sounds like you're asking about weather, but I couldn't catch a location — try 'weather in Tokyo'.",
-    "timer": "Sounds like you want a timer, but I couldn't catch the duration — try 'timer for 5 minutes'.",
-    "atom": "Sounds like you want an element shown, but I didn't recognize the name — which element?",
-    "shape": "Sounds like you want a shape shown — sphere, cube, torus, pyramid, cylinder, the Eiffel Tower, a skyscraper, or DNA?",
-}
-
-
-def classify_intent(client, model, text, on_log=None):
-    if not client:
-        return "chat"
-    try:
-        resp = client.chat.completions.create(
-            model=model,
-            max_tokens=30,
-            messages=[
-                {"role": "system", "content": _INTENT_PROMPT},
-                {"role": "user", "content": text},
-            ],
-        )
-        content = (resp.choices[0].message.content or "").strip().strip("`")
-        if content.lower().startswith("json"):
-            content = content[4:].strip()
-        intent = json.loads(content).get("intent", "chat")
-        return intent if intent in _INTENTS else "chat"
-    except Exception as e:
-        if on_log:
-            on_log(f"INTENT: classification failed ({e}), falling back to chat")
-        return "chat"
-
-
-# ============================================================================
-# Voice assistant
-# ============================================================================
-
 class VoiceAssistant:
     def __init__(self, hologram, face_id, on_log=None):
         self.hologram = hologram
         self.face_id = face_id
-        self.state = "idle"
+        self.state = "idle"       # idle | listening | speaking
         self.last_heard = ""
         self.last_reply = ""
         self.enabled = False
@@ -485,10 +267,15 @@ class VoiceAssistant:
 
         self._running = False
         self._thread = None
-        self.active_timers = []
+        self.history = []
+        self.active_timers = []  # list of dicts: label, ends_at (time.time())
         self.last_weather_error = None
-        self.pending_enrollment_name = None
+        self.pending_enrollment_name = None  # set by voice, consumed by main.py's camera loop
+        self.latest_frame = None  # set every frame by main.py's camera loop, used by vision commands
 
+        # streaming reply state: the in-flight sentence queue (so a stop
+        # command can drain it) and a cancel flag checked between tokens
+        # and before each queued sentence is spoken.
         self._active_tts_queue = None
         self._stream_cancel = threading.Event()
 
@@ -501,9 +288,6 @@ class VoiceAssistant:
             self.client = None
         else:
             self.client = Groq(api_key=self.api_key)
-
-        self.memory = RollingMemory(self.client)
-        self.ltm = LongTermMemory(on_log=self._on_log)
 
         try:
             self.recognizer = sr.Recognizer()
@@ -580,6 +364,10 @@ class VoiceAssistant:
     # ---- speech output -----------------------------------------------------
 
     def speak_now(self, text):
+        """Public entry point for other threads (main.py's camera loop)
+        to trigger speech — e.g. greeting someone the moment face
+        recognition identifies them. Safe to call cross-thread the same
+        way the mid-speech 'stop' watcher already does."""
         self._speak(text)
 
     def _speak(self, text):
@@ -615,6 +403,11 @@ class VoiceAssistant:
             pygame.mixer.music.load(path)
             pygame.mixer.music.play()
 
+            # The main listening loop isn't touching the mic right now
+            # (it's blocked here, waiting on us), so it's safe to use it
+            # for a short-lived "did they say stop?" listener during
+            # playback — this is what lets "Aurora, stop" actually
+            # interrupt mid-sentence instead of only working between turns.
             stop_watcher = threading.Thread(target=self._watch_for_stop, daemon=True)
             stop_watcher.start()
 
@@ -631,6 +424,10 @@ class VoiceAssistant:
                 pass
 
     def _interrupt_all_speech(self):
+        """Stops whatever's playing right now AND cancels an in-flight
+        streamed reply, draining any sentences still queued to be spoken.
+        Without the drain, 'stop' would only cut the current sentence and
+        the rest of the answer would keep talking."""
         self._stream_cancel.set()
         q = self._active_tts_queue
         if q is not None:
@@ -642,6 +439,8 @@ class VoiceAssistant:
         pygame.mixer.music.stop()
 
     def _watch_for_stop(self):
+        """Runs only while audio is playing. Listens for a short phrase and
+        interrupts playback immediately if it hears 'stop'."""
         try:
             while pygame.mixer.music.get_busy():
                 with self.microphone as source:
@@ -652,7 +451,7 @@ class VoiceAssistant:
                     self._interrupt_all_speech()
                     return
         except Exception:
-            pass
+            pass  # timeouts / no speech / mic hiccups are all fine here
 
     # ---- timers -----------------------------------------------------------
 
@@ -669,19 +468,17 @@ class VoiceAssistant:
         threading.Thread(target=run, daemon=True).start()
         self._on_log(f"VOICE: timer started — {label} ({seconds}s)")
 
-    # ---- streaming Groq replies ---------------------------------------------
+    # ---- streaming Groq replies: speak sentence-by-sentence as tokens arrive ---
 
     _SENTENCE_END = re.compile(r"[.!?]\s|\n")
 
-    def _build_messages(self):
-        msgs = []
-        ltm_block = self.ltm.as_context_block()
-        if ltm_block:
-            msgs.append({"role": "system", "content": ltm_block})
-        msgs.extend(self.memory.get_messages())
-        return msgs
-
     def _stream_and_speak(self, messages, use_search, question_for_card):
+        """Streams a reply from Groq. As soon as a sentence boundary shows
+        up in the accumulating text, that sentence is handed to a
+        background worker thread that speaks it — so speech starts after
+        the first sentence, not after the whole reply. Also keeps the
+        on-screen info card updated live as text streams in. Returns the
+        full reply text; raises on API errors (caller retries/reports)."""
         model = MODEL_SEARCH if use_search else MODEL_FAST
         max_tokens = 800 if use_search else 300
 
@@ -740,19 +537,23 @@ class VoiceAssistant:
         return reply or "I didn't get a text response back."
 
     def _ask_groq_stream(self, text):
-        self.memory.add("user", text)
-        use_search = needs_search(text)
+        """Streaming counterpart to _ask_groq: same history bookkeeping
+        and the same request-too-large retry, but speaks as it goes
+        instead of waiting for the full reply."""
+        self.history.append({"role": "user", "content": text})
+        use_search = self._needs_search(text)
         already_spoken = False
         try:
-            reply = self._stream_and_speak(self._build_messages(), use_search, text)
+            reply = self._stream_and_speak(self.history, use_search, text)
             already_spoken = True
         except Exception as e:
             msg = str(e)
             if "413" in msg or "too large" in msg.lower() or "request_too_large" in msg.lower():
                 self._on_log("VOICE: request too large, clearing conversation memory and retrying")
-                self.memory.clear_but_last()
+                last_user = self.history[-1]
+                self.history = [last_user]
                 try:
-                    reply = self._stream_and_speak(self._build_messages(), use_search, text)
+                    reply = self._stream_and_speak(self.history, use_search, text)
                     already_spoken = True
                 except Exception as e2:
                     reply = f"Sorry, still hit an error after clearing memory: {e2}"
@@ -763,8 +564,9 @@ class VoiceAssistant:
             self._speak(reply)
 
         trimmed = reply if len(reply) < 400 else reply[:400] + "..."
-        self.memory.add("assistant", trimmed)
-        self.memory.maybe_compress(MODEL_FAST, self._on_log)
+        self.history.append({"role": "assistant", "content": trimmed})
+        if len(self.history) > 12:
+            self.history = self.history[-12:]
         return reply
 
     # ---- phone: WhatsApp calls, apps, wifi, search (see phone_control.py) ----
@@ -780,6 +582,7 @@ class VoiceAssistant:
         t = re.sub(r"wi[\s-]fi", "wifi", t)
         t = re.sub(r"what'?s\s?app", "whatsapp", t)
 
+        # WhatsApp call: "call mom on whatsapp", "video call sam on whatsapp", "whatsapp call mom"
         m = re.search(r"(video )?call (.+?) (?:on|via|using|through|in) whatsapp", t) or \
             re.search(r"whatsapp (video )?call (?:to )?(.+)$", t)
         if m:
@@ -791,6 +594,7 @@ class VoiceAssistant:
             self._speak(f"Starting a WhatsApp {'video ' if video else ''}call with {info}." if ok else info)
             return True
 
+        # Wireless ADB: "connect to my phone over wifi"
         if re.search(r"connect (?:to )?(?:my )?phone (?:over|via|through|on) wifi|"
                      r"connect (?:to )?(?:my )?phone wirelessly|go wireless", t):
             self._speak("Connecting to your phone over wifi.")
@@ -799,6 +603,7 @@ class VoiceAssistant:
             self._speak("Connected wirelessly. You can unplug the cable now." if ok else info)
             return True
 
+        # Phone joins a saved network: "connect my phone to home wifi"
         m = re.search(r"connect (?:my )?phone to (?:the )?wifi (?:network )?(?:called |named )?(.+)$", t) or \
             re.search(r"connect (?:my )?phone to (?:the )?(.+?) wifi", t)
         if m:
@@ -809,6 +614,7 @@ class VoiceAssistant:
             self._speak(msg)
             return True
 
+        # Phone wifi on/off
         m = re.search(r"(?:turn|switch) (on|off) (?:the )?wifi (?:on|in) (?:my )?phone|"
                       r"(?:turn|switch) (on|off) (?:my )?phone(?:'s)? wifi", t)
         if m:
@@ -820,6 +626,7 @@ class VoiceAssistant:
             self._speak(f"Phone wifi turned {'on' if on else 'off'}." if ok else "I couldn't change the phone's wifi.")
             return True
 
+        # Open an app on the phone: "open instagram on my phone"
         m = re.search(r"(?:open|launch|start) (.+?) (?:on|in) (?:my |the )?(?:phone|mobile)", t)
         if m:
             name = m.group(1).strip()
@@ -830,6 +637,7 @@ class VoiceAssistant:
             self._speak(f"Opening {name} on your phone." if ok else f"I couldn't find an app called {name} on your phone.")
             return True
 
+        # Google search on the phone: "google best pizza on my phone"
         m = re.search(r"(?:google|search google for|search the web for) (.+?) (?:on|in) (?:my |the )?(?:phone|mobile)", t)
         if m:
             query = m.group(1).strip()
@@ -840,6 +648,7 @@ class VoiceAssistant:
             self._speak(f"Searching for {query} on your phone." if ok else "I couldn't start that search on your phone.")
             return True
 
+        # Search the phone: "search my phone for contact john", "find resume on my phone"
         m = re.search(r"(?:search|find|look)\s+(?:on\s+)?(?:my\s+|the\s+)?(?:phone|mobile)\s+for\s+(.+)$", t) or \
             re.search(r"(?:search for|find|look for)\s+(.+?)\s+(?:on|in)\s+(?:my\s+|the\s+)?(?:phone|mobile)", t)
         if m:
@@ -889,27 +698,10 @@ class VoiceAssistant:
             return True
 
         if t.strip() in ("repeat that", "say that again", "what did you say", "can you repeat that", "repeat"):
-            self._speak(self.last_reply if self.last_reply else "I haven't said anything yet.")
-            return True
-
-        if t.strip() in ("what do you remember about me", "what do you know about me",
-                         "what have you remembered", "list what you remember"):
-            facts = self.ltm.all_facts()
-            self._speak("I remember: " + "; ".join(facts) if facts else "I don't have anything saved about you yet.")
-            return True
-
-        m = _REMEMBER_RE.match(t.strip())
-        if m:
-            self.ltm.remember(m.group(1))
-            self._on_log(f"MEMORY: saved fact '{m.group(1)[:60]}'")
-            self._speak("Got it, I'll remember that.")
-            return True
-
-        m = _FORGET_FACT_RE.match(t.strip())
-        if m and "face" not in t:
-            removed = self.ltm.forget_matching(m.group(1))
-            self._on_log(f"MEMORY: forgot {len(removed)} fact(s) matching '{m.group(1)[:40]}'")
-            self._speak("Forgot it." if removed else "I didn't have anything matching that saved.")
+            if self.last_reply:
+                self._speak(self.last_reply)
+            else:
+                self._speak("I haven't said anything yet.")
             return True
 
         m = re.search(r"take a note[:\s]+(.+)$", t)
@@ -952,6 +744,39 @@ class VoiceAssistant:
                 self._speak("Cleared your notes.")
             except Exception:
                 self._speak("I couldn't clear your notes.")
+            return True
+
+        # ---- vision: QR/barcode + scene description ("what am I looking at") ----
+        if any(k in t for k in ("what am i looking at", "what is this", "what's this",
+                                 "scan this", "read this qr", "read this code",
+                                 "read this barcode", "what do you see", "what's in front of me",
+                                 "describe what you see", "describe the camera")):
+            frame = self.latest_frame
+            if frame is None:
+                self._speak("I don't have a camera frame right now.")
+                return True
+            try:
+                codes = vision.read_codes(frame)
+            except Exception as e:
+                self._on_log(f"VISION: code scan failed ({e})")
+                codes = []
+            if codes:
+                self._on_log(f"VISION: decoded {codes}")
+                self.hologram.show_info_card("What am I looking at?", "Code found: " + "; ".join(codes))
+                self._speak("I found a code: " + "; ".join(codes))
+                return True
+            if not self.client:
+                self._speak("I need the Groq API connected to describe what I'm looking at.")
+                return True
+            self._speak("Let me take a look.")
+            try:
+                description = vision.describe_scene(self.client, frame)
+                self.hologram.show_info_card("What am I looking at?", description)
+                self._on_log(f"VISION: {description}")
+                self._speak(description)
+            except Exception as e:
+                self._on_log(f"VISION: describe_scene failed ({e})")
+                self._speak("Sorry, I hit an error looking at the camera.")
             return True
 
         m = re.search(r"(?:remember|enroll) (?:my face )?as (\w+)|enroll me as (\w+)", t)
@@ -1001,6 +826,7 @@ class VoiceAssistant:
             self._speak(time.strftime("It's %I:%M %p"))
             return True
 
+        # ---- computer utilities: status, screenshot, lock -------------------------
         if any(k in t for k in ("system status", "system stats", "battery", "how's my computer", "how is my computer")):
             status = system_control.get_system_status()
             self._on_log("SYSTEM: status readout")
@@ -1013,12 +839,14 @@ class VoiceAssistant:
             self._speak("Screenshot saved to your Pictures folder." if ok else "I couldn't take a screenshot.")
             return True
 
+        # \block\b so "unlock my phone" doesn't lock the PC
         if re.search(r"\block\b", t) and any(k in t for k in ("computer", "pc", "laptop", "screen")):
             self._speak("Locking your computer.")
             self._on_log("SYSTEM: locking workstation")
             system_control.lock_workstation()
             return True
 
+        # ---- timers ---------------------------------------------------------
         m = re.search(r"(?:set a |set )?timer for (\d+)\s*(second|minute|hour)s?(?:\s+(?:for|called|named)\s+(.+))?", t)
         if m:
             amount, unit, label = int(m.group(1)), m.group(2), m.group(3)
@@ -1047,6 +875,7 @@ class VoiceAssistant:
                 self._speak("; ".join(parts))
             return True
 
+        # ---- quick math -------------------------------------------------------
         if any(k in t for k in ("plus", "minus", "times", "multiplied", "divided", "percent of")) or \
                 re.search(r"\d\s*[+\-*/]\s*\d", t):
             calc = try_calculate(t)
@@ -1057,6 +886,7 @@ class VoiceAssistant:
                 self._speak(f"That's {result_str}")
                 return True
 
+        # ---- code editing (VS Code / Arduino IDE) --------------------------------
         m = re.search(r"write (?:(python|javascript|js|cpp|c\+\+|c|html|arduino) )?code called (.+?) that (.+)$", t)
         if m:
             language, name, description = (m.group(1) or "python"), m.group(2).strip(), m.group(3).strip()
@@ -1151,9 +981,12 @@ class VoiceAssistant:
             self._speak(f"Opening {name} in the Arduino IDE" if ok else f"I couldn't open the Arduino IDE — {err[:80] if err else ''}")
             return True
 
+        # ---- phone: WhatsApp / apps / wifi / search (must come BEFORE PC app
+        # launching, or "open chrome on my phone" would open Chrome on the PC) ----
         if self._handle_phone_command(t):
             return True
 
+        # ---- app launching ------------------------------------------------------
         app_hit = next((a for a in system_control.APP_COMMANDS if a in t), None)
         if app_hit and any(k in t for k in ("open", "launch", "start")):
             ok = system_control.launch_app(app_hit)
@@ -1161,6 +994,7 @@ class VoiceAssistant:
             self._speak(f"Opening {app_hit}" if ok else f"I couldn't open {app_hit}")
             return True
 
+        # ---- volume ---------------------------------------------------------
         if "volume" in t:
             m = re.search(r"volume to (\d+)", t)
             if m:
@@ -1181,6 +1015,7 @@ class VoiceAssistant:
                 self._speak(f"Volume at {new_val} percent" if new_val is not None else "Volume control isn't available")
                 return True
 
+        # ---- media playback -----------------------------------------------------
         if any(k in t for k in ("pause music", "play music", "pause the music", "play the music")) or t.strip() in ("play", "pause"):
             system_control.media_play_pause()
             self._on_log("MEDIA: play/pause")
@@ -1197,6 +1032,7 @@ class VoiceAssistant:
             self._speak("Going back")
             return True
 
+        # ---- phone (requires ADB setup — see phone_control.py) ------------------
         if re.search(r"\b(call me|give me a call|call my phone|ring me)\b", t):
             number = phone_control.load_my_number()
             if not number:
@@ -1297,6 +1133,79 @@ class VoiceAssistant:
             self._speak("Starting a new element with one proton and one electron. Tell me what to add.")
             return True
 
+        # ---- Astronomy Mode: overview ---------------------------------------------
+        if any(k in t for k in ("astronomy mode", "what can astronomy mode show")):
+            names = ", ".join(sorted(CONSTELLATIONS.keys())).title()
+            self.hologram.show_info_card("Astronomy Mode", f"Star maps for: {names}.")
+            self._on_log("DISPLAY: astronomy mode overview")
+            self._speak(f"Astronomy mode can show star maps for constellations like Orion, "
+                        f"the Big Dipper, Cassiopeia, and more. Just say 'show Orion', for example.")
+            return True
+
+        # ---- Astronomy Mode: constellations -----------------------------------------
+        constellation_hit = next((c for c in CONSTELLATIONS if c in t), None)
+        if not constellation_hit:
+            alias_hit = next((a for a in CONSTELLATION_ALIASES if a in t), None)
+            constellation_hit = CONSTELLATION_ALIASES.get(alias_hit)
+        if constellation_hit and any(k in t for k in ("show", "display", "find", "locate")):
+            self.hologram.load_constellation(constellation_hit)
+            self._on_log(f"DISPLAY: {constellation_hit} constellation")
+            self._speak(f"Displaying {constellation_hit.title()}")
+            return True
+
+        # ---- Lab Mode: overview -------------------------------------------------
+        if any(k in t for k in ("lab mode", "what can lab mode show", "lab mode options")):
+            summary = ("Molecules like water or methane, atoms, planets, satellites, DNA, "
+                       "math graphs, physics simulations like a pendulum or projectile, and 3D shapes.")
+            self.hologram.show_info_card("Lab Mode", summary)
+            self._on_log("DISPLAY: lab mode overview")
+            self._speak("Lab mode can show " + summary + " Just ask, like 'show a water molecule' "
+                        "or 'graph sine of x'.")
+            return True
+
+        # ---- Lab Mode: molecules -------------------------------------------------
+        molecule_hit = next((m for m in MOLECULES if m in t), None)
+        if not molecule_hit:
+            alias_hit = next((a for a in MOLECULE_ALIASES if a in t), None)
+            molecule_hit = MOLECULE_ALIASES.get(alias_hit)
+        if molecule_hit and any(k in t for k in ("show", "display", "model", "molecule", "draw")):
+            self.hologram.load_molecule(molecule_hit)
+            self._on_log(f"DISPLAY: {molecule_hit} molecule")
+            self._speak(f"Displaying a {molecule_hit} molecule")
+            return True
+
+        # ---- Lab Mode: math graphs ------------------------------------------------
+        m = re.search(r"(?:graph|plot)\s+(?:me\s+)?(?:y\s*=\s*)?(.+)$", t)
+        if m and any(k in t for k in ("graph", "plot")):
+            expr = m.group(1).strip()
+            if self.hologram.load_math_graph(expr):
+                self._on_log(f"DISPLAY: graph y={expr}")
+                self._speak(f"Graphing y equals {expr}")
+            else:
+                self._speak("I couldn't graph that expression. Try something like 'graph sine of x' or 'graph x squared'.")
+            return True
+
+        # ---- Lab Mode: physics simulations -----------------------------------------
+        if "pendulum" in t and any(k in t for k in ("show", "simulate", "display")):
+            self.hologram.load_physics_sim("pendulum")
+            self._on_log("DISPLAY: pendulum simulation")
+            self._speak("Simulating a pendulum")
+            return True
+        if any(k in t for k in ("projectile", "trajectory")) and any(k in t for k in ("show", "simulate", "display")):
+            self.hologram.load_physics_sim("projectile")
+            self._on_log("DISPLAY: projectile simulation")
+            self._speak("Simulating a projectile")
+            return True
+
+        # ---- Lab Mode: satellites ---------------------------------------------------
+        if "satellite" in t and any(k in t for k in ("show", "display")):
+            name_m = re.search(r"(?:show|display)\s+(?:a\s+|the\s+)?(.+?)\s+satellite", t)
+            sat_name = name_m.group(1).strip().upper() if name_m and name_m.group(1).strip() else "ISS"
+            self.hologram.load_satellite(sat_name)
+            self._on_log(f"DISPLAY: satellite {sat_name}")
+            self._speak(f"Displaying {sat_name} orbiting Earth")
+            return True
+
         if "solar system" in t:
             self.hologram.load_solar_system()
             self._on_log("DISPLAY: solar system")
@@ -1327,6 +1236,10 @@ class VoiceAssistant:
             self._speak(f"The {label} system, {count} planets.")
             return True
 
+        # Named star system, real or not — curated real data for
+        # well-known ones, a consistent generated layout for anything
+        # else. Checks known names first, then falls back to a generic
+        # "[star system/system] called/named/of X" pattern.
         star_hit = next((s for s in STAR_SYSTEMS if s in t or s.replace("-", " ") in t), None)
         if star_hit and any(k in t for k in ("show", "display", "system")):
             label, count, generated = self.hologram.load_star_system(star_hit)
@@ -1353,6 +1266,9 @@ class VoiceAssistant:
             m = re.search(r"weather (?:in|at|for)\s+([a-zA-Z\s]+)", t)
             location_query = m.group(1).strip() if m else None
 
+            # If the location matches a US state, ask for weather at its
+            # capital-ish/general area and flag it so the display shows a
+            # US map with that state highlighted instead of the icon.
             state_key = None
             if location_query:
                 state_key = next((s for s in US_STATE_POSITIONS if s in location_query), None)
@@ -1378,6 +1294,7 @@ class VoiceAssistant:
                     self._speak("Sorry, I couldn't get the weather right now — check the log for details.")
             return True
 
+        # Explicit shape name (sphere, cube, torus, pyramid, cylinder)
         shape_hit = next((s for s in SHAPES if s in t), None)
         if not shape_hit:
             alias_hit = next((a for a in SHAPE_ALIASES if a in t), None)
@@ -1388,6 +1305,9 @@ class VoiceAssistant:
             self._speak(f"Displaying a {shape_hit} model")
             return True
 
+        # Generic "anything round" -> sphere, when no specific shape/atom
+        # name was given. This is the catch-all for "show me a globe/ball/
+        # planet-looking thing" style requests.
         if any(k in t for k in ("sphere", "globe", "ball", "orb", "round thing")) \
                 and any(k in t for k in ("show", "display", "model", "draw", "load")):
             self.hologram.load_shape("sphere")
@@ -1395,6 +1315,11 @@ class VoiceAssistant:
             self._speak("Displaying a sphere")
             return True
 
+        # Match an element name anywhere in the phrase, as long as some
+        # display-intent keyword is also present. This is deliberately
+        # forgiving because speech recognition often clips trailing words
+        # like "atom" — "show me a carbon" should still work, not just
+        # the perfectly-transcribed "show me a carbon atom".
         element_hit = next((name for name in ELEMENTS if name in t), None)
         if element_hit:
             result = self.hologram.load_atom(element_hit)
@@ -1416,24 +1341,46 @@ class VoiceAssistant:
 
     # ---- weather (Open-Meteo — free, no API key) ---------------------------
 
+    # WMO weather codes (used by Open-Meteo's forecast API) mapped onto
+    # the small set of icon categories the hologram widget knows how to
+    # draw, plus a short human-readable description for each code.
+    # Reference: https://open-meteo.com/en/docs (see "WMO Weather
+    # interpretation codes").
     WMO_CODE_MAP = {
-        0: ("sunny", "clear sky"), 1: ("sunny", "mainly clear"),
-        2: ("partly_cloudy", "partly cloudy"), 3: ("cloudy", "overcast"),
-        45: ("fog", "fog"), 48: ("fog", "depositing rime fog"),
-        51: ("rain", "light drizzle"), 53: ("rain", "moderate drizzle"),
-        55: ("rain", "dense drizzle"), 56: ("rain", "light freezing drizzle"),
-        57: ("rain", "dense freezing drizzle"), 61: ("rain", "slight rain"),
-        63: ("rain", "moderate rain"), 65: ("rain", "heavy rain"),
-        66: ("rain", "light freezing rain"), 67: ("rain", "heavy freezing rain"),
-        71: ("snow", "slight snow fall"), 73: ("snow", "moderate snow fall"),
-        75: ("snow", "heavy snow fall"), 77: ("snow", "snow grains"),
-        80: ("rain", "slight rain showers"), 81: ("rain", "moderate rain showers"),
-        82: ("rain", "violent rain showers"), 85: ("snow", "slight snow showers"),
-        86: ("snow", "heavy snow showers"), 95: ("storm", "thunderstorm"),
-        96: ("storm", "thunderstorm with slight hail"), 99: ("storm", "thunderstorm with heavy hail"),
+        0: ("sunny", "clear sky"),
+        1: ("sunny", "mainly clear"),
+        2: ("partly_cloudy", "partly cloudy"),
+        3: ("cloudy", "overcast"),
+        45: ("fog", "fog"),
+        48: ("fog", "depositing rime fog"),
+        51: ("rain", "light drizzle"),
+        53: ("rain", "moderate drizzle"),
+        55: ("rain", "dense drizzle"),
+        56: ("rain", "light freezing drizzle"),
+        57: ("rain", "dense freezing drizzle"),
+        61: ("rain", "slight rain"),
+        63: ("rain", "moderate rain"),
+        65: ("rain", "heavy rain"),
+        66: ("rain", "light freezing rain"),
+        67: ("rain", "heavy freezing rain"),
+        71: ("snow", "slight snow fall"),
+        73: ("snow", "moderate snow fall"),
+        75: ("snow", "heavy snow fall"),
+        77: ("snow", "snow grains"),
+        80: ("rain", "slight rain showers"),
+        81: ("rain", "moderate rain showers"),
+        82: ("rain", "violent rain showers"),
+        85: ("snow", "slight snow showers"),
+        86: ("snow", "heavy snow showers"),
+        95: ("storm", "thunderstorm"),
+        96: ("storm", "thunderstorm with slight hail"),
+        99: ("storm", "thunderstorm with heavy hail"),
     }
 
     def _geocode_location(self, query):
+        """Open-Meteo's free geocoding endpoint: place name -> lat/lon.
+        Returns (lat, lon, display_name) or None if nothing matched or
+        the request failed."""
         try:
             url = "https://geocoding-api.open-meteo.com/v1/search?" + urllib.parse.urlencode({
                 "name": query, "count": 1, "language": "en", "format": "json",
@@ -1459,6 +1406,9 @@ class VoiceAssistant:
         return r["latitude"], r["longitude"], display_name
 
     def _ip_geolocate(self):
+        """Guesses the user's location from their public IP via ipapi.co
+        (free, keyless) — used when no location was named, e.g. 'what's
+        the weather right now'. Returns (lat, lon, display_name) or None."""
         try:
             req = urllib.request.Request(
                 "https://ipapi.co/json/", headers={"User-Agent": "aurora-hologram/1.0"}
@@ -1479,6 +1429,12 @@ class VoiceAssistant:
         return lat, lon, display_name
 
     def _fetch_weather_data(self, location_query):
+        """Current conditions from Open-Meteo. Geocodes location_query
+        first (or falls back to IP geolocation if no location was given),
+        then pulls current temperature/humidity/wind/weather-code for
+        that point. Sets self.last_weather_error to one of
+        'not_found' | 'no_location' | 'network' | None on failure, so the
+        caller can give a specific spoken response."""
         self.last_weather_error = None
 
         if location_query:
@@ -1519,16 +1475,74 @@ class VoiceAssistant:
             "condition": condition,
             "description": description,
             "humidity": current.get("relative_humidity_2m"),
+            # wind_speed_10m is already km/h by default in Open-Meteo's API
             "wind_kph": current.get("wind_speed_10m"),
             "updated_at": time.strftime("%H:%M"),
         }
         self._on_log(f"VOICE: weather parsed -> {result}")
         return result
 
+    # ---- Groq brain ---------------------------------------------------------
+
+    NEEDS_SEARCH_KEYWORDS = (
+        "latest", "current", "today", "right now", "this week", "recent",
+        "news", "score", "who won", "stock price", "happening now",
+    )
+
+    def _needs_search(self, text):
+        t = text.lower()
+        return any(k in t for k in self.NEEDS_SEARCH_KEYWORDS)
+
+    def _ask_groq(self, text):
+        self.history.append({"role": "user", "content": text})
+        use_search = self._needs_search(text)
+        reply = self._call_groq_safe(use_search)
+
+        # Store a trimmed copy in history (not the full reply) so
+        # search-augmented answers don't balloon future request sizes.
+        trimmed = reply if len(reply) < 400 else reply[:400] + "..."
+        self.history.append({"role": "assistant", "content": trimmed})
+        if len(self.history) > 12:
+            self.history = self.history[-12:]
+        return reply
+
+    def _call_groq_safe(self, use_search=False):
+        try:
+            return self._call_groq(self.history, use_search)
+        except Exception as e:
+            msg = str(e)
+            if "413" in msg or "too large" in msg.lower() or "request_too_large" in msg.lower():
+                self._on_log("VOICE: request too large, clearing conversation memory and retrying")
+                last_user = self.history[-1]
+                self.history = [last_user]
+                try:
+                    return self._call_groq(self.history, use_search)
+                except Exception as e2:
+                    return f"Sorry, still hit an error after clearing memory: {e2}"
+            return f"Sorry, I hit an error talking to the API: {e}"
+
+    def _call_groq(self, messages, use_search=False):
+        model = MODEL_SEARCH if use_search else MODEL_FAST
+        # compound needs headroom for its internal search step before it
+        # can write the final answer; the fast model doesn't need as much
+        max_tokens = 800 if use_search else 300
+        response = self.client.chat.completions.create(
+            model=model,
+            max_tokens=max_tokens,
+            messages=[{"role": "system", "content": SYSTEM_PROMPT}] + messages,
+        )
+        if not response.choices:
+            return "I didn't get a response back from the API."
+        content = response.choices[0].message.content
+        if content is None:
+            return "I searched for that but didn't get a final answer back — try asking again."
+        reply = content.strip()
+        return reply or "I didn't get a text response back."
+
     # ---- main listen loop -----------------------------------------------------
 
     MIN_ENERGY_THRESHOLD = 50
-    MAX_ENERGY_THRESHOLD = 600
+    MAX_ENERGY_THRESHOLD = 600  # calibration can never require shouting past this
 
     def _load_energy_override(self):
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "energy_threshold.txt")
@@ -1549,6 +1563,14 @@ class VoiceAssistant:
         self.recognizer.energy_threshold = clamped
 
     def _run_loop(self):
+        # dynamic_energy_threshold sounds good in theory (auto-adapt to
+        # ambient noise) but on a laptop with the mic and speakers close
+        # together, it also "learns" Aurora's OWN voice through the
+        # speakers as loud ambient noise and keeps ratcheting the
+        # threshold up in response — that's very likely why it took
+        # shouting to register. Using a fixed, clamped threshold instead
+        # (re-measured periodically, but never runaway) is far more
+        # predictable.
         self.recognizer.dynamic_energy_threshold = False
         self.recognizer.pause_threshold = 0.9
         self.recognizer.non_speaking_duration = 0.4
@@ -1574,6 +1596,11 @@ class VoiceAssistant:
         while self._running:
             loop_count += 1
 
+            # Ambient noise drifts over a long-running session (AC turning
+            # on, other people talking, etc.) — a one-time calibration at
+            # startup goes stale. Recalibrate periodically in the
+            # background, but only if there's no manual override, and
+            # always clamped so it can never drift up to shouting levels.
             if override is None and time.time() - last_recalibration > 120:
                 try:
                     with self.microphone as source:
@@ -1618,12 +1645,6 @@ class VoiceAssistant:
                 if self._handle_local_command(command):
                     continue
 
-                intent = classify_intent(self.client, MODEL_FAST, command, self._on_log) if self.client else "chat"
-                if intent in _CLARIFY_TEMPLATES:
-                    self._on_log(f"INTENT: guessed '{intent}' but no local handler matched")
-                    self._speak(_CLARIFY_TEMPLATES[intent])
-                    continue
-
                 self.state = "speaking"
                 reply = self._ask_groq_stream(command)
                 self.hologram.show_info_card(command, reply)
@@ -1633,3 +1654,6 @@ class VoiceAssistant:
                 self._on_log(f"VOICE: command handling crashed ({type(e).__name__}: {e})")
                 traceback.print_exc()
                 self.state = "idle"
+                # keep the loop alive no matter what went wrong above —
+                # losing one command is much better than the whole voice
+                # thread silently dying
