@@ -22,6 +22,17 @@ PHONE (needs ADB setup — see phone_control.py):
 
 COMPUTER: "system status", "take a screenshot", "lock my computer"
 
+GAME COMPANION MODE (see jarvis_ui/telemetry.py's GameSessionReader and
+jarvis_ui/system_control.py's recording/temp/foreground helpers):
+  "Aurora, game companion" / "game stats"  -> non-cheating live dashboard:
+      FPS (Aurora's own, if fed in), CPU/RAM load, CPU temp (if exposed),
+      session timer, foreground app, recording status. Reuses the same
+      telemetry panel as Arduino/IoT mode.
+  "Aurora, stop game companion"            -> closes it
+  "Aurora, start recording" / "stop recording" -> whole-desktop screen
+      capture via ffmpeg (must be on PATH). Deliberately reads nothing
+      out of the game process itself.
+
 VISION: "Aurora, what am I looking at?" — decodes any QR code/barcode in
 frame locally (instant, no API call); if none found, sends the current
 camera frame to Groq's vision model for a short spoken description.
@@ -274,6 +285,8 @@ class VoiceAssistant:
         self.pending_enrollment_name = None  # set by voice, consumed by main.py's camera loop
         self.latest_frame = None  # set every frame by main.py's camera loop, used by vision commands
         self.telemetry = telemetry.TelemetryReader(on_log=self._on_log)  # Arduino/IoT Mode
+        self.game_session = telemetry.GameSessionReader(on_log=self._on_log)  # Game Companion Mode
+        self.active_reader = self.telemetry  # whichever reader main.py should poll for the telemetry panel
 
         # streaming reply state: the in-flight sentence queue (so a stop
         # command can drain it) and a cancel flag checked between tokens
@@ -848,6 +861,35 @@ class VoiceAssistant:
             system_control.lock_workstation()
             return True
 
+        # ---- Game Companion Mode: FPS/CPU/RAM/temp, session timer, recording ----
+        if "game companion" in t and any(k in t for k in ("stop", "close", "hide", "dismiss")):
+            self.game_session.stop()
+            self.hologram.hide_telemetry()
+            self.active_reader = self.telemetry
+            self._on_log("GAME: companion mode closed")
+            self._speak("Closing game companion.")
+            return True
+
+        if any(k in t for k in ("game companion", "game mode", "show game stats", "game stats", "gaming mode")):
+            ok, msg = self.game_session.start()
+            self.hologram.show_telemetry("Game Companion")
+            self.active_reader = self.game_session
+            self._on_log(f"GAME: companion mode -> {msg}")
+            self._speak(msg + " Say 'start recording' to capture the session.")
+            return True
+
+        if any(k in t for k in ("start recording", "start screen recording", "record my screen", "begin recording")):
+            ok, info = system_control.start_recording()
+            self._on_log(f"GAME: recording {'started' if ok else 'failed'} — {info}")
+            self._speak("Recording started." if ok else info)
+            return True
+
+        if any(k in t for k in ("stop recording", "stop screen recording", "end recording")):
+            ok, info = system_control.stop_recording()
+            self._on_log(f"GAME: {info}")
+            self._speak(info)
+            return True
+
         # ---- timers ---------------------------------------------------------
         m = re.search(r"(?:set a |set )?timer for (\d+)\s*(second|minute|hour)s?(?:\s+(?:for|called|named)\s+(.+))?", t)
         if m:
@@ -1140,6 +1182,7 @@ class VoiceAssistant:
                                  "connect to my esp32", "connect my esp32", "connect esp32",
                                  "connect iot device", "connect to my device")):
             ok, msg = self.telemetry.start()
+            self.active_reader = self.telemetry
             self._on_log(f"IOT: connect requested -> {msg}")
             self._speak(msg if not ok else "Connected. Say 'show my telemetry' to see it on the display.")
             return True
@@ -1147,6 +1190,7 @@ class VoiceAssistant:
         if "telemetry" in t and any(k in t for k in ("hide", "close", "stop", "dismiss")):
             self.telemetry.stop()
             self.hologram.hide_telemetry()
+            self.active_reader = self.telemetry
             self._on_log("IOT: telemetry display closed")
             self._speak("Closing telemetry")
             return True
@@ -1155,6 +1199,7 @@ class VoiceAssistant:
             name_m = re.search(r"(?:show|display)\s+(?:my\s+|the\s+)?(.+?)\s+telemetry", t)
             label = name_m.group(1).strip() if name_m and name_m.group(1).strip() else "device"
             ok, msg = self.telemetry.start()
+            self.active_reader = self.telemetry
             self.hologram.show_telemetry(label)
             self._on_log(f"IOT: showing '{label}' telemetry (link started={ok}: {msg})")
             self._speak(f"Connecting to your {label} telemetry now." if ok else
