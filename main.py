@@ -47,6 +47,12 @@ VOICE (say "Aurora" + your request):
   "Aurora, show my Mars station telemetry" -> live dashboard of whatever
                                           fields the device is sending
   "Aurora, close the telemetry"        -> hides the telemetry dashboard
+  "Aurora, game companion"             -> non-cheating live dashboard:
+                                          FPS/CPU/RAM/temp, session timer,
+                                          foreground app, recording status
+                                          (reuses the telemetry panel)
+  "Aurora, start recording" / "stop recording" -> whole-desktop capture
+                                          via ffmpeg
   "Aurora, show Orion"                 -> Astronomy Mode star map (also:
                                           the Big Dipper, Cassiopeia, Leo,
                                           Scorpius, Cygnus, Gemini, Crux)
@@ -154,6 +160,8 @@ def main():
         voice.pending_enrollment_name = None
         voice.latest_frame = None
         voice.telemetry = telemetry.TelemetryReader()
+        voice.game_session = telemetry.GameSessionReader()  # Game Companion Mode fallback
+        voice.active_reader = voice.telemetry
 
     print(__doc__)
 
@@ -189,11 +197,20 @@ def main():
                 gray = cv2.cvtColor(debug_frame, cv2.COLOR_BGR2GRAY)
                 faces = face_id.detect_faces(gray)
 
-                # feed the latest Arduino/IoT reading into the telemetry
-                # dashboard when it's on screen; harmless no-op otherwise
+                # feed the latest reading into whichever telemetry-style
+                # dashboard is on screen (Arduino/IoT or Game Companion) —
+                # active_reader points at whichever one is running, so this
+                # single block drives both without extra branching.
                 if hologram.mode == "telemetry":
-                    reader = voice.telemetry
+                    reader = getattr(voice, "active_reader", voice.telemetry)
                     hologram.update_telemetry(reader.latest, reader.connected and not reader.is_stale())
+
+                # Feed Aurora's own render FPS into Game Companion Mode, if
+                # it's the active reader — gives an honest FPS number
+                # without reading anything out of the actual game process.
+                game_session = getattr(voice, "game_session", None)
+                if game_session is not None:
+                    game_session.set_fps(hologram._fps)
 
                 # ---- enrollment: collect samples while a request is pending ----
                 if voice.pending_enrollment_name and len(faces) == 1:
