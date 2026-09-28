@@ -53,6 +53,13 @@ VOICE (say "Aurora" + your request):
                                           (reuses the telemetry panel)
   "Aurora, start recording" / "stop recording" -> whole-desktop capture
                                           via ffmpeg
+  "Aurora, start experiment"           -> Experiment Recorder: logs
+                                          timestamp/sensor data/notes/
+                                          screenshots to experiments/
+  "Aurora, log observation: ..."       -> adds a timestamped note
+  "Aurora, take an experiment screenshot"
+  "Aurora, generate my experiment report" -> compiles report.txt
+  "Aurora, stop experiment"
   "Aurora, show Orion"                 -> Astronomy Mode star map (also:
                                           the Big Dipper, Cassiopeia, Leo,
                                           Scorpius, Cygnus, Gemini, Crux)
@@ -161,6 +168,7 @@ def main():
         voice.latest_frame = None
         voice.telemetry = telemetry.TelemetryReader()
         voice.game_session = telemetry.GameSessionReader()  # Game Companion Mode fallback
+        voice.experiment = telemetry.ExperimentRecorder()   # Experiment Recorder fallback
         voice.active_reader = voice.telemetry
 
     print(__doc__)
@@ -211,6 +219,13 @@ def main():
                 game_session = getattr(voice, "game_session", None)
                 if game_session is not None:
                     game_session.set_fps(hologram._fps)
+
+                # Experiment Recorder: while an experiment is running,
+                # auto-log whatever telemetry data is currently available
+                # (throttled internally — writes at most every few seconds).
+                experiment = getattr(voice, "experiment", None)
+                if experiment is not None and experiment.active:
+                    experiment.maybe_log_sensor(voice.telemetry.latest)
 
                 # ---- enrollment: collect samples while a request is pending ----
                 if voice.pending_enrollment_name and len(faces) == 1:
