@@ -33,6 +33,13 @@ jarvis_ui/system_control.py's recording/temp/foreground helpers):
       capture via ffmpeg (must be on PATH). Deliberately reads nothing
       out of the game process itself.
 
+EXPERIMENT RECORDER (see jarvis_ui/telemetry.py's ExperimentRecorder):
+  "Aurora, start experiment" / "start experiment called <name>"
+  "Aurora, log observation: <text>"
+  "Aurora, take an experiment screenshot"
+  "Aurora, generate my experiment report"
+  "Aurora, stop experiment"
+
 VISION: "Aurora, what am I looking at?" — decodes any QR code/barcode in
 frame locally (instant, no API call); if none found, sends the current
 camera frame to Groq's vision model for a short spoken description.
@@ -286,6 +293,7 @@ class VoiceAssistant:
         self.latest_frame = None  # set every frame by main.py's camera loop, used by vision commands
         self.telemetry = telemetry.TelemetryReader(on_log=self._on_log)  # Arduino/IoT Mode
         self.game_session = telemetry.GameSessionReader(on_log=self._on_log)  # Game Companion Mode
+        self.experiment = telemetry.ExperimentRecorder(on_log=self._on_log)  # Experiment Recorder
         self.active_reader = self.telemetry  # whichever reader main.py should poll for the telemetry panel
 
         # streaming reply state: the in-flight sentence queue (so a stop
@@ -759,6 +767,42 @@ class VoiceAssistant:
                 self._speak("Cleared your notes.")
             except Exception:
                 self._speak("I couldn't clear your notes.")
+            return True
+
+        # ---- experiment recorder (see telemetry.ExperimentRecorder) ------------
+        m = re.search(r"start experiment(?:\s+(?:called|named)\s+(.+))?$", t)
+        if m:
+            ok, info = self.experiment.start(m.group(1))
+            self._on_log(f"EXPERIMENT: start requested -> {info}")
+            self._speak(f"Experiment '{info}' started. Say 'log observation' to record notes."
+                        if ok else info)
+            return True
+
+        if "stop experiment" in t or ("end" in t and "experiment" in t):
+            ok, info = self.experiment.stop()
+            self._speak(f"Experiment '{info}' stopped." if ok else info)
+            return True
+
+        m = re.search(r"log observation[:\s]+(.+)$", t)
+        if m:
+            note = text[m.start(1):m.end(1)].strip()
+            if self.experiment.log_observation(note):
+                self._speak("Observation logged.")
+            else:
+                self._speak("No experiment is running. Say 'start experiment' first.")
+            return True
+
+        if "experiment" in t and "screenshot" in t:
+            ok, info = self.experiment.capture_screenshot(self.latest_frame)
+            self._speak(f"Screenshot saved: {info}" if ok else info)
+            return True
+
+        if "experiment report" in t or ("generate" in t and "report" in t and "experiment" in t):
+            path, err = self.experiment.generate_report()
+            if path:
+                self._speak(f"Report generated in the {os.path.basename(os.path.dirname(path))} folder.")
+            else:
+                self._speak(err)
             return True
 
         # ---- vision: QR/barcode + scene description ("what am I looking at") ----

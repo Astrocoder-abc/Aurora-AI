@@ -1,5 +1,6 @@
 """
-Arduino/IoT telemetry bridge for Aurora, plus Game Companion Mode.
+Arduino/IoT telemetry bridge for Aurora, plus Game Companion Mode and the
+Experiment Recorder.
 
 Two transports for Arduino/IoT, chosen by iot_config.json (next to
 api_key.txt):
@@ -28,13 +29,26 @@ system-level stats instead of Arduino data — FPS/CPU/RAM load, CPU
 temp, session timer, foreground app, and recording status. Deliberately
 does NOT read anything out of the game process itself (no hooks/memory
 reads), so it stays "non-cheating" — informational only.
+
+EXPERIMENT RECORDER (ExperimentRecorder, below): timestamped log of
+observations, sensor readings, and screenshots for a school-science
+style experiment, plus a compiled report.txt.
+  "Aurora, start experiment" / "start experiment called <name>"
+  "Aurora, log observation: <text>"
+  "Aurora, take an experiment screenshot"
+  "Aurora, generate my experiment report"
+  "Aurora, stop experiment"
+Files land in experiments/<name>/ (log.jsonl, screenshots/, report.txt).
 """
 
 import json
 import os
+import re
 import threading
 import time
 import urllib.request
+
+import cv2
 
 from jarvis_ui import system_control
 
@@ -52,6 +66,7 @@ except ImportError:
     PSUTIL_AVAILABLE = False
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "iot_config.json")
+EXPERIMENTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "experiments")
 
 
 def load_config():
@@ -246,3 +261,129 @@ class GameSessionReader:
 
     def is_stale(self, max_age=5):
         return self.last_update == 0 or (time.time() - self.last_update) > max_age
+
+
+class ExperimentRecorder:
+    """Timestamped log of observations, sensor data, and screenshots for
+    a school-science-project style experiment, plus a compiled report.
+    'Aurora, start experiment' / 'log observation: ...' /
+    'take an experiment screenshot' / 'generate my experiment report'."""
+
+    def __init__(self, on_log=None):
+        self._on_log = on_log or (lambda m: None)
+        self.active = False
+        self.name = None
+        self.dir = None
+        self.log_path = None
+        self._shot_count = 0
+        self._last_sensor_log = 0.0
+
+    def start(self, name=None):
+        if self.active:
+            return False, f"Experiment '{self.name}' is already running."
+        self.name = (re.sub(r"[^a-zA-Z0-9_\- ]", "", name).strip().replace(" ", "_")
+                     if name else time.strftime("experiment_%Y%m%d_%H%M%S"))
+        self.dir = os.path.join(EXPERIMENTS_DIR, self.name)
+        os.makedirs(os.path.join(self.dir, "screenshots"), exist_ok=True)
+        self.log_path = os.path.join(self.dir, "log.jsonl")
+        self._shot_count = 0
+        self._last_sensor_log = 0.0
+        self.active = True
+        self._write({"type": "start", "time": self._ts()})
+        self._on_log(f"EXPERIMENT: started '{self.name}'")
+        return True, self.name
+
+    def stop(self):
+        if not self.active:
+            return False, "No experiment is running."
+        self._write({"type": "stop", "time": self._ts()})
+        self.active = False
+        self._on_log(f"EXPERIMENT: stopped '{self.name}'")
+        return True, self.name
+
+    def log_observation(self, text):
+        if not self.active or not text:
+            return False
+        self._write({"type": "observation", "time": self._ts(), "text": text})
+        self._on_log("EXPERIMENT: observation logged")
+        return True
+
+    def log_sensor(self, data):
+        if not self.active or not data:
+            return False
+        self._write({"type": "sensor", "time": self._ts(), "data": data})
+        return True
+
+    def maybe_log_sensor(self, data, interval=5):
+        """Throttled auto-log — call every frame; only writes every
+        `interval` seconds while an experiment is active."""
+        if not self.active or not data:
+            return
+        now = time.time()
+        if now - self._last_sensor_log < interval:
+            return
+        self._last_sensor_log = now
+        self.log_sensor(data)
+
+    def capture_screenshot(self, frame):
+        if not self.active:
+            return False, "No experiment is running."
+        if frame is None:
+            return False, "No camera frame available."
+        self._shot_count += 1
+        fname = f"shot_{self._shot_count:03d}.png"
+        cv2.imwrite(os.path.join(self.dir, "screenshots", fname), frame)
+        self._write({"type": "screenshot", "time": self._ts(), "file": fname})
+        self._on_log(f"EXPERIMENT: screenshot {fname}")
+        return True, fname
+
+    def generate_report(self):
+        if not self.name or not self.log_path or not os.path.exists(self.log_path):
+            return None, "No experiment data to report on yet."
+        entries = self._read_all()
+        obs = [e for e in entries if e["type"] == "observation"]
+        sensors = [e for e in entries if e["type"] == "sensor"]
+        shots = [e for e in entries if e["type"] == "screenshot"]
+        starts = [e for e in entries if e["type"] == "start"]
+        stops = [e for e in entries if e["type"] == "stop"]
+
+        lines = [f"EXPERIMENT REPORT: {self.name}", "=" * 40, ""]
+        if starts:
+            lines.append(f"Started: {starts[0]['time']}")
+        if stops:
+            lines.append(f"Stopped: {stops[-1]['time']}")
+        lines.append(f"Observations: {len(obs)}  Sensor readings: {len(sensors)}  Screenshots: {len(shots)}")
+        lines.append("")
+        lines.append("-- OBSERVATIONS --")
+        lines += [f"[{e['time']}] {e['text']}" for e in obs] or ["(none)"]
+        lines.append("")
+        lines.append("-- SENSOR DATA --")
+        lines += [f"[{e['time']}] {e['data']}" for e in sensors] or ["(none)"]
+        lines.append("")
+        lines.append("-- SCREENSHOTS --")
+        lines += [f"[{e['time']}] screenshots/{e['file']}" for e in shots] or ["(none)"]
+
+        report_path = os.path.join(self.dir, "report.txt")
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines))
+        self._on_log(f"EXPERIMENT: report generated -> {report_path}")
+        return report_path, None
+
+    def _ts(self):
+        return time.strftime("%Y-%m-%d %H:%M:%S")
+
+    def _write(self, entry):
+        with open(self.log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+
+    def _read_all(self):
+        entries = []
+        with open(self.log_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        entries.append(json.loads(line))
+                    except Exception:
+                        pass
+        return entries
