@@ -12,3 +12,5 @@ edge-tts>=6.1.9
 psutil>=5.9.0
 pycaw>=20240210
 comtypes>=1.4.0
+numpy>=1.26.4
+pocketsphinx

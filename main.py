@@ -129,6 +129,7 @@ from jarvis_ui.voice_assistant import VoiceAssistant
 from jarvis_ui.face_id import FaceID
 from jarvis_ui import system_control
 from jarvis_ui import telemetry
+from jarvis_ui import aurora_plus
 
 GESTURE_TO_STATE = {
     "open_palm": "listening",
@@ -155,6 +156,7 @@ def main():
         voice = VoiceAssistant(hologram, face_id, on_log=hologram.log_event)
         print(f"DEBUG: VoiceAssistant constructed OK, client={voice.client is not None}, "
               f"mic={voice.microphone is not None}", flush=True)
+
         voice.start()
         print(f"DEBUG: voice.start() returned, enabled={voice.enabled}", flush=True)
     except Exception as e:
