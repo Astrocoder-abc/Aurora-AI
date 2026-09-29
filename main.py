@@ -1,121 +1,10 @@
 """
-Aurora Project — Editable Holographic Element Display
- 
-Launches FULLSCREEN by default. Press F11 to toggle windowed mode, ESC to
-quit (or close the debug window / press 'q' there).
- 
-Two windows open:
-  1. The hologram dashboard — nucleus with orbiting "element" nodes, a
-     glowing projector base plate, scanline flicker, corner-bracket HUD
-     frame, and system/event-log side panels.
-  2. Webcam debug view with hand landmarks + live gesture/finger labels.
- 
-VOICE (say "Aurora" + your request):
-  "Aurora, show me a carbon atom"      -> real Bohr-model diagram
-  "Aurora, add a proton"               -> changes the element, keeps it neutral
-  "Aurora, remove 2 electrons"         -> turns it into an ion
-  "Aurora, add 3 neutrons"             -> changes the isotope
-  "Aurora, start a new element"        -> resets to 1 proton, build from there
-  "Aurora, show me the solar system"   -> sun + 8 planets
-  "Aurora, show me a sphere"           -> wireframe globe (also: cube,
-                                          torus, pyramid, cylinder)
-  "Aurora, show the Eiffel Tower"      -> tapering lattice tower model
-  "Aurora, show a skyscraper"          -> generic tower model (also
-                                          matches Burj Khalifa, Empire
-                                          State Building, etc.)
-  "Aurora, show me a double helix"     -> DNA strand model
-  "Aurora, show my systems"            -> constellation/network view of
-                                          Aurora's own subsystems as
-                                          connected glowing nodes
-  "Aurora, select orbit one"           -> selects that orbit, confirms aloud
-  "Aurora, deselect orbit"             -> clears the selection
-  "Aurora, reset the display"          -> back to the demo hologram
-  "Aurora, what's the weather right now?" -> docks the hologram left,
-                                             shows an animated weather
-                                             panel (icon, temp, humidity,
-                                             wind), and speaks a summary
-  "Aurora, weather in Tokyo"           -> same, for any location
-  "Aurora, close the weather"          -> undocks, hologram returns to center
-  "Aurora, what time is it?"           -> instant, no API call
-  "Aurora, what am I looking at?"      -> reads any QR code/barcode in
-                                          view instantly; otherwise sends
-                                          the camera frame to Groq vision
-                                          for a short spoken description
-  "Aurora, connect to my Arduino"      -> starts the telemetry link from
-                                          iot_config.json (serial or wifi
-                                          JSON) — see jarvis_ui/telemetry.py
-  "Aurora, show my Mars station telemetry" -> live dashboard of whatever
-                                          fields the device is sending
-  "Aurora, close the telemetry"        -> hides the telemetry dashboard
-  "Aurora, game companion"             -> non-cheating live dashboard:
-                                          FPS/CPU/RAM/temp, session timer,
-                                          foreground app, recording status
-                                          (reuses the telemetry panel)
-  "Aurora, start recording" / "stop recording" -> whole-desktop capture
-                                          via ffmpeg
-  "Aurora, start experiment"           -> Experiment Recorder: logs
-                                          timestamp/sensor data/notes/
-                                          screenshots to experiments/
-  "Aurora, log observation: ..."       -> adds a timestamped note
-  "Aurora, take an experiment screenshot"
-  "Aurora, generate my experiment report" -> compiles report.txt
-  "Aurora, stop experiment"
-  "Aurora, show Orion"                 -> Astronomy Mode star map (also:
-                                          the Big Dipper, Cassiopeia, Leo,
-                                          Scorpius, Cygnus, Gemini, Crux)
-  "Aurora, show a water molecule"      -> Lab Mode ball-and-stick model
-  "Aurora, graph sine of x"            -> Lab Mode math graph
-  "Aurora, simulate a pendulum"        -> Lab Mode physics simulation
-  "Aurora, hello"                      -> just chats, but still shows a
-                                          response card with what you
-                                          asked and the answer, not just
-                                          speech (any general question
-                                          gets this — specific categories
-                                          like atoms/shapes/weather still
-                                          get their own dedicated visual)
-  "Aurora, remember my face as Sam"    -> enrolls your face (look at the
-                                          camera, hold still ~1 second) —
-                                          only people who explicitly
-                                          enroll get recognized, ever
-  "Aurora, forget Sam's face"          -> removes that enrollment
-  "Aurora, set a timer for 5 minutes"  -> counts down, speaks when done
-  "Aurora, how much time is left"      -> checks active timers
-  "Aurora, what's 47 times 12"         -> instant local calculation
-  "Aurora, 15 percent of 200"          -> instant local calculation
-  "Aurora, open notepad"               -> launches the app (also: calc,
-                                          spotify, chrome, explorer, etc.)
-  "Aurora, volume up" / "volume down" / "volume to 50" / "mute"
-  "Aurora, play music" / "pause" / "next song" / "previous song"
-  "Aurora, call mom"                   -> requires phone connected via
-                                          ADB and contacts.json set up
-  "Aurora, unlock my phone"            -> requires ADB + phone_pin.txt
-                                          (see phone_control.py for setup)
-  "Aurora, stop"                        -> interrupts it mid-sentence
- 
-GESTURE GUIDE
---------------
-One hand:
-  Move hand                -> rotate the hologram (yaw/pitch)
-  Wrist twist               -> roll the hologram
-  Open palm                 -> "listening" glow (cyan)
-  Fist (held)                -> "speaking" glow (green)
-  Fist + move closer/away    -> grab-and-pull zoom
-  Fist -> fling open fast     -> "throw" flash
-  Point                       -> select the next orbit/shell to edit
-  Pinch (orbit selected) + move -> reshape it: vertical = radius,
-                                    horizontal = spin speed
-  Pinch (nothing selected) + move -> pan/drag the whole hologram instead
-  Peace sign                  -> saves a snapshot to snapshots/
-  Thumbs up                   -> green confirm flash
-  Thumbs down                  -> red flash AND resets display to demo
-  OK sign                      -> cyan flash + media play/pause
-  Rock sign (horns), held + move up/down -> system volume
-  Swipe left/right (open palm) -> cycle color theme
-  Swipe up/down (open palm)     -> adjust brightness
- 
-Two hands:
-  Spread apart / bring together -> zoom in/out
-  Both hands rotate together     -> roll the hologram
+Aurora - voice + gesture holographic dashboard.  python main.py
+F11 fullscreen | ESC or 'q' (debug window) quits.
+Say "Aurora ..." (see README / jarvis_ui/voice_assistant.py for the full command list).
+Gestures: move hand = rotate, twist = roll, fist+pull = zoom, point = select orbit, pinch = reshape/pan,
+peace = snapshot, thumbs down = reset, OK = play/pause, rock sign + up/down = volume,
+swipe = theme/brightness, two hands = zoom/roll.
 """
 import os
 import sys
@@ -123,69 +12,50 @@ import time
 
 import cv2
 
-from jarvis_ui.hand_tracker import HandTracker
 from jarvis_ui.hologram import Hologram
-from jarvis_ui.voice_assistant import VoiceAssistant
+from jarvis_ui.voice_assistant import VoiceAssistant, NullVoice
 from jarvis_ui.face_id import FaceID
-from jarvis_ui import system_control
-from jarvis_ui import telemetry
-from jarvis_ui import aurora_plus
+from jarvis_ui.gesture_draw import GestureDrawer
+from jarvis_ui import system_control, glue
 
-GESTURE_TO_STATE = {
-    "open_palm": "listening",
-    "fist": "speaking",
-}
-
+GESTURE_TO_STATE = {"open_palm": "listening", "fist": "speaking"}
 SNAPSHOT_DIR = "snapshots"
+DETECT_EVERY = 3            # run face detection every Nth frame (big FPS win, recognition is 2 Hz anyway)
+RECOGNITION_INTERVAL = 0.5
+FORGET_AFTER = 20.0         # seconds without a match before the same person is greeted again
 
 
 def save_snapshot(frame):
     os.makedirs(SNAPSHOT_DIR, exist_ok=True)
-    filename = os.path.join(SNAPSHOT_DIR, f"jarvis_{int(time.time())}.png")
-    cv2.imwrite(filename, frame)
-    print(f"Snapshot saved: {filename}")
+    path = os.path.join(SNAPSHOT_DIR, f"jarvis_{int(time.time())}.png")
+    cv2.imwrite(path, frame)
+    print(f"Snapshot saved: {path}")
+
+
+def build_voice(hologram, face_id):
+    try:
+        voice = VoiceAssistant(hologram, face_id, on_log=hologram.log_event)
+        voice.start()
+        return voice
+    except Exception:
+        import traceback
+        print("VoiceAssistant setup failed, continuing without voice:", flush=True)
+        traceback.print_exc()
+        return NullVoice()
 
 
 def main():
-    tracker = HandTracker(camera_index=0)
+    tracker = glue.TipHandTracker(camera_index=0)
     hologram = Hologram()
     face_id = FaceID(on_log=hologram.log_event)
+    voice = build_voice(hologram, face_id)
+    drawer = GestureDrawer(hologram, speak=voice.speak_now, on_log=hologram.log_event)
+    hologram.drawer, voice.drawer = drawer, drawer
+    glue.install(hologram, drawer)
 
-    print("DEBUG: about to construct VoiceAssistant...", flush=True)
-    try:
-        voice = VoiceAssistant(hologram, face_id, on_log=hologram.log_event)
-        print(f"DEBUG: VoiceAssistant constructed OK, client={voice.client is not None}, "
-              f"mic={voice.microphone is not None}", flush=True)
-
-        voice.start()
-        print(f"DEBUG: voice.start() returned, enabled={voice.enabled}", flush=True)
-    except Exception as e:
-        import traceback
-        print("DEBUG: VoiceAssistant setup raised an exception:", flush=True)
-        traceback.print_exc()
-        voice = VoiceAssistant.__new__(VoiceAssistant)
-        voice.state = "idle"
-        voice.enabled = False
-        voice.pending_enrollment_name = None
-        voice.latest_frame = None
-        voice.telemetry = telemetry.TelemetryReader()
-        voice.game_session = telemetry.GameSessionReader()  # Game Companion Mode fallback
-        voice.experiment = telemetry.ExperimentRecorder()   # Experiment Recorder fallback
-        voice.active_reader = voice.telemetry
-
-    print(__doc__)
-
-    last_debug_frame = None
-    prev_time = time.time()
-    volume_drag_prev_pitch = None
-
-    enrollment_samples = []
-    ENROLLMENT_TARGET_SAMPLES = 15
-
-    last_recognition_check = 0.0
-    RECOGNITION_INTERVAL = 1.0  # seconds between recognition attempts - no need to run every frame
-    recognized_person = None
-    person_absent_frames = 0
+    last_debug_frame, prev_time, frame_i = None, time.time(), 0
+    volume_prev_pitch = None
+    faces, last_check, last_seen, last_dbg, recognized = [], 0.0, 0.0, 0.0, None
 
     try:
         while True:
@@ -198,123 +68,88 @@ def main():
                 break
 
             result, debug_frame = tracker.read()
+            drawer.update(result.hands[0] if result.detected else None)
+
             if debug_frame is not None:
                 last_debug_frame = debug_frame
-                # keep the voice assistant's "what am I looking at?" /
-                # QR-scan command supplied with the latest camera frame
                 voice.latest_frame = debug_frame
-
+                frame_i += 1
                 gray = cv2.cvtColor(debug_frame, cv2.COLOR_BGR2GRAY)
-                faces = face_id.detect_faces(gray)
+                if frame_i % DETECT_EVERY == 0 or face_id.enrolling:
+                    faces = face_id.detect_faces(gray)
 
-                # feed the latest reading into whichever telemetry-style
-                # dashboard is on screen (Arduino/IoT or Game Companion) —
-                # active_reader points at whichever one is running, so this
-                # single block drives both without extra branching.
                 if hologram.mode == "telemetry":
                     reader = getattr(voice, "active_reader", voice.telemetry)
                     hologram.update_telemetry(reader.latest, reader.connected and not reader.is_stale())
+                voice.game_session.set_fps(hologram._fps)
+                if voice.experiment.active:
+                    voice.experiment.maybe_log_sensor(voice.telemetry.latest)
 
-                # Feed Aurora's own render FPS into Game Companion Mode, if
-                # it's the active reader — gives an honest FPS number
-                # without reading anything out of the actual game process.
-                game_session = getattr(voice, "game_session", None)
-                if game_session is not None:
-                    game_session.set_fps(hologram._fps)
-
-                # Experiment Recorder: while an experiment is running,
-                # auto-log whatever telemetry data is currently available
-                # (throttled internally — writes at most every few seconds).
-                experiment = getattr(voice, "experiment", None)
-                if experiment is not None and experiment.active:
-                    experiment.maybe_log_sensor(voice.telemetry.latest)
-
-                # ---- enrollment: collect samples while a request is pending ----
-                if voice.pending_enrollment_name and len(faces) == 1:
-                    x, y, w, h = faces[0]
-                    enrollment_samples.append(gray[y:y + h, x:x + w])
-                    if len(enrollment_samples) >= ENROLLMENT_TARGET_SAMPLES:
-                        name = voice.pending_enrollment_name
-                        success = face_id.enroll(enrollment_samples, name)
-                        enrollment_samples = []
-                        voice.pending_enrollment_name = None
-                        if success:
-                            voice.speak_now(f"Got it, I'll recognize you as {name} from now on.")
-                        else:
-                            # face_id.enroll() returns False if opencv-contrib's
-                            # face module never loaded (self.available == False)
-                            # or the samples were empty — previously this was
-                            # silently ignored and Aurora confirmed success
-                            # anyway, which is exactly the kind of bug that
-                            # makes "enrollment worked" but recognition never
-                            # actually works later.
-                            hologram.log_event("FACE: enrollment failed — recognition unavailable")
-                            voice.speak_now(
-                                "Sorry, I couldn't save that enrollment — face recognition isn't "
-                                "available on this system. Say 'check face recognition' for details."
-                            )
-
-                # ---- recognition: throttled, greets + personalizes on a new match ----
-                elif not voice.pending_enrollment_name and len(faces) >= 1 and \
-                        time.time() - last_recognition_check > RECOGNITION_INTERVAL:
-                    last_recognition_check = time.time()
-                    name, confidence = face_id.recognize(gray, faces[0])
+                # ---- face enrollment (explicit request only) ----
+                if voice.pending_enrollment_name and not face_id.enrolling:
+                    name, voice.pending_enrollment_name = voice.pending_enrollment_name, None
+                    if not face_id.start_enrollment(name):
+                        hologram.log_event("FACE: enrollment unavailable")
+                        voice.speak_now("Face recognition isn't available on this system. Say 'check face recognition' for details.")
+                if face_id.enrolling:
+                    res = face_id.feed_enrollment(gray, faces)
+                    if res:
+                        ok, name, msg = res
+                        hologram.log_event(f"FACE: enrollment {'ok' if ok else 'failed'}")
+                        voice.speak_now(f"Got it, I'll recognize you as {name} from now on." if ok else msg)
+                # ---- recognition (throttled) ----
+                elif faces and now - last_check > RECOGNITION_INTERVAL:
+                    last_check = now
+                    name, dist = face_id.recognize(gray, faces[0])
                     if name:
-                        person_absent_frames = 0
-                        if name != recognized_person:
-                            recognized_person = name
-                            theme_idx = face_id.get_theme_index(name)
-                            if theme_idx is not None:
-                                hologram.set_theme_index(theme_idx)
+                        last_seen = now
+                        if name != recognized:
+                            recognized = name
+                            idx = face_id.get_theme_index(name)
+                            if idx is not None:
+                                hologram.set_theme_index(idx)
                             hologram.log_event(f"FACE: recognized {name}")
                             voice.speak_now(f"Welcome back, {name}.")
-                    elif recognized_person:
-                        person_absent_frames += 1
-                        if person_absent_frames > 5:  # a few missed ticks before resetting, avoids flicker
-                            recognized_person = None
+                    elif dist is not None and face_id.people and now - last_dbg > 5:
+                        last_dbg = now
+                        hologram.log_event(f"FACE: no match (distance {dist:.0f}, limit {face_id.threshold:.0f})")
+                if recognized and now - last_seen > FORGET_AFTER:
+                    recognized = None
 
             if result.detected:
-                primary = result.hands[0]
-                hologram.update(primary.yaw_norm, primary.pitch_norm, primary.pinch_amount, target_dt=dt)
-                gesture_state = GESTURE_TO_STATE.get(primary.gesture, "idle")
-                pinch_for_pulse = primary.pinch_amount
+                p = result.hands[0]
+                if drawer.active:       # hold rotation steady while drawing
+                    hologram.update(hologram.rotation_y / 90, hologram.rotation_x / 60, 0.0, target_dt=dt)
+                else:
+                    hologram.update(p.yaw_norm, p.pitch_norm, p.pinch_amount, target_dt=dt)
+                gesture_state, pinch_pulse = GESTURE_TO_STATE.get(p.gesture, "idle"), p.pinch_amount
 
-                if primary.gesture == "pinch":
+                if p.gesture == "pinch":
                     if hologram.selected_index is not None:
-                        hologram.edit_selected_orbit(primary.pitch_norm, primary.yaw_norm, dt)
+                        hologram.edit_selected_orbit(p.pitch_norm, p.yaw_norm, dt)
                     elif result.pan_delta != (0.0, 0.0):
                         hologram.apply_pan_delta(*result.pan_delta)
 
-                # Gesture volume control: hold "rock sign" (horns) and move
-                # your hand up/down to adjust system volume. Chosen because
-                # rock_sign has no other continuous-control use, so there's
-                # no conflict with existing gestures.
-                if primary.gesture == "rock_sign":
-                    if volume_drag_prev_pitch is not None:
-                        delta = volume_drag_prev_pitch - primary.pitch_norm  # hand up = positive = louder
+                if p.gesture == "rock_sign":       # hand up = louder
+                    if volume_prev_pitch is not None:
+                        delta = volume_prev_pitch - p.pitch_norm
                         if abs(delta) > 0.003:
-                            new_vol = system_control.adjust_volume_percent(round(delta * 150))
-                            if new_vol is not None:
-                                hologram.log_event(f"VOLUME: {new_vol}%")
-                    volume_drag_prev_pitch = primary.pitch_norm
+                            v = system_control.adjust_volume_percent(round(delta * 150))
+                            if v is not None:
+                                hologram.log_event(f"VOLUME: {v}%")
+                    volume_prev_pitch = p.pitch_norm
                 else:
-                    volume_drag_prev_pitch = None
+                    volume_prev_pitch = None
             else:
                 hologram.update(0, 0, 0.0, target_dt=dt)
-                gesture_state = "idle"
-                pinch_for_pulse = 0.0
-                volume_drag_prev_pitch = None
+                gesture_state, pinch_pulse, volume_prev_pitch = "idle", 0.0, None
 
-            # Voice state takes priority over gesture state when active —
-            # you don't want the hologram flipping to "idle" mid-reply just
-            # because your hand dropped out of frame.
             hologram.set_state(voice.state if voice.state != "idle" else gesture_state)
 
             if result.zoom_delta:
                 hologram.apply_zoom_delta(result.zoom_delta)
             if result.roll_delta:
                 hologram.apply_roll_delta(result.roll_delta)
-
             if result.swipe == "left":
                 hologram.cycle_theme(-1)
             elif result.swipe == "right":
@@ -324,12 +159,11 @@ def main():
             elif result.swipe == "down":
                 hologram.adjust_brightness(-0.15)
 
-            for hand_index, gesture in result.events:
-                if gesture == "point":
+            for _, gesture in result.events:
+                if gesture == "point" and not drawer.active:
                     hologram.select_next_orbit()
-                    hologram.trigger_flash("point", intensity=0.6)
-                    label = f"orbit {hologram.selected_index+1}" if hologram.selected_index is not None else "none"
-                    hologram.log_event(f"SELECT -> {label}")
+                    hologram.trigger_flash("point", 0.6)
+                    hologram.log_event(f"SELECT -> {'orbit %d' % (hologram.selected_index + 1) if hologram.selected_index is not None else 'none'}")
                 elif gesture == "peace" and last_debug_frame is not None:
                     save_snapshot(last_debug_frame)
                     hologram.trigger_flash("peace")
@@ -346,27 +180,17 @@ def main():
                     hologram.trigger_flash(gesture)
                     hologram.log_event(f"{gesture.upper()} detected")
 
-            selection_label = (
-                f"Editing orbit {hologram.selected_index + 1}/{len(hologram.orbits)}"
-                if hologram.selected_index is not None else "No orbit selected (point to select)"
-            )
-            hud_lines = [
-                f"Zoom {hologram.zoom:.2f}  FPS {hologram._fps:.0f}",
-                selection_label,
-                f"Voice: {'ready' if voice.enabled else 'off'}",
-            ]
-            for i, hand in enumerate(result.hands):
-                hud_lines.append(f"H{i+1} ({hand.handedness[:1]}): {hand.gesture} x{hand.finger_count}")
-            hologram.set_hud_lines(hud_lines)
+            sel = (f"Editing orbit {hologram.selected_index + 1}/{len(hologram.orbits)}"
+                   if hologram.selected_index is not None else "No orbit selected (point to select)")
+            hud = [f"Zoom {hologram.zoom:.2f}  FPS {hologram._fps:.0f}", sel, f"Voice: {'ready' if voice.enabled else 'off'}"]
+            hud += [f"H{i + 1} ({h.handedness[:1]}): {h.gesture} x{h.finger_count}" for i, h in enumerate(result.hands)]
+            hologram.set_hud_lines(hud)
 
-            hologram.render(pinch_amount=pinch_for_pulse)
-
+            hologram.render(pinch_amount=pinch_pulse)
             if debug_frame is not None:
                 cv2.imshow("Aurora - hand tracking debug", debug_frame)
-
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
-
     except KeyboardInterrupt:
         pass
     except Exception:
