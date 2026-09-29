@@ -147,7 +147,7 @@ NOTES_FILE = os.path.join(os.path.dirname(__file__), "..", "notes.txt")
 # weather", which is why replies felt slow. Fast model for normal chat,
 # compound reserved for the one place that actually needs search.
 # (Weather no longer uses this at all — see WEATHER section below.)
-MODEL_FAST = "groq/compound-mini"
+MODEL_FAST = "groq/compound"
 MODEL_SEARCH = "groq/compound"
 
 # en-GB-RyanNeural is a natural British male voice. Swap for any other
