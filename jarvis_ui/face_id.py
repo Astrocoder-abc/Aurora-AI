@@ -1,225 +1,226 @@
 """
-Facial recognition for Aurora — consent-based enrollment only.
+Consent-based face recognition (OpenCV Haar detection + LBPH). Only people who say
+"Aurora, remember my face as <name>" are ever recognised; everything stays in face_data/.
 
-This recognizes people who have explicitly enrolled their own face (via
-"Aurora, remember my face as <name>"). It does NOT identify, track, or
-log unknown/random people caught on camera — faces that don't match an
-enrolled person are simply ignored. All data (face model + names) stays
-local on this machine in face_data/, nothing is uploaded anywhere.
-
-Uses OpenCV's built-in Haar cascade for face detection (ships with
-opencv-python, no extra download) and LBPH — Local Binary Patterns
-Histograms — for recognition, via opencv-contrib-python. LBPH was chosen
-specifically because it installs from a prebuilt Windows wheel with no
-compilation step, unlike heavier alternatives like dlib/face_recognition
-which have historically been painful to install on Windows.
-
-v2: confidence smoothing. LBPH's per-frame confidence swings a fair bit
-frame-to-frame (lighting flicker, tiny pose changes), which previously
-caused an enrolled person to occasionally flicker to "not recognized" for
-one tick, or — worse — a borderline stranger's face to occasionally dip
-under the threshold and get misidentified for a single frame. Recognition
-now runs a small rolling vote: a name only counts as confirmed once it
-wins a majority of the last few attempts, and reported confidence is the
-average over that window, not a single noisy sample.
+Why the old version failed, and what changed:
+  * Enrollment grabbed 15 near-identical frames in ~0.5 s, while Aurora was still talking.
+    Now: 2.5 s delay, then ~36 captures over several seconds (turn your head a little),
+    each stored with 3 brightness variants.
+  * No lighting normalisation. Now: CLAHE on a trimmed, resized crop, for enrolment and matching.
+  * Model file (.yml) could silently fail to save/load on Windows paths with non-ASCII characters.
+    Now: face crops are stored as PNGs and the model is retrained from them at startup.
+  * forget() left the person in the model and label ids could be reused, mixing identities.
+    Now: forget deletes their samples and retrains.
+  * Threshold 75 was too strict for a different-lighting session. Now 80, override with a number
+    in face_threshold.txt (lower = stricter). Distances are logged so you can tune it.
 """
-
 import json
 import os
-from collections import deque, Counter
+import re
+import shutil
+import time
+from collections import Counter, deque
 
 import cv2
 import numpy as np
 
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "face_data")
-MODEL_PATH = os.path.join(DATA_DIR, "lbph_model.yml")
+BASE = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+DATA_DIR = os.path.join(BASE, "face_data")
+SAMPLES_DIR = os.path.join(DATA_DIR, "samples")
 PEOPLE_PATH = os.path.join(DATA_DIR, "people.json")
-CASCADE_PATH = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+THRESHOLD_FILE = os.path.join(BASE, "face_threshold.txt")
 
-# LBPH: LOWER confidence value = more confident match. Above this
-# threshold, treat it as "not confidently recognized" rather than
-# guessing wrong.
-RECOGNITION_CONFIDENCE_THRESHOLD = 75
+FACE_SIZE = 160
+DEFAULT_THRESHOLD = 80.0
+VOTE_WINDOW, VOTE_MIN_WINS = 4, 2
+ENROLL_SAMPLES, ENROLL_DELAY, ENROLL_TIMEOUT = 36, 2.5, 30.0
 
-# Smoothing: a name must win at least this many of the last WINDOW
-# attempts to be reported as confirmed. WINDOW attempts happen roughly
-# once per second (main.py throttles calls), so this adds a few seconds
-# of latency before a NEW recognition is confirmed, in exchange for far
-# fewer flicker/false-positive frames.
-VOTE_WINDOW = 5
-VOTE_MIN_WINS = 3
+_clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4, 4))
+
+
+def prep(gray, box):
+    """Trimmed, resized, contrast-normalised face crop (or None)."""
+    x, y, w, h = (int(v) for v in box)
+    m = int(0.08 * w)
+    crop = gray[max(0, y + m // 2):min(gray.shape[0], y + h - m // 2), max(0, x + m):min(gray.shape[1], x + w - m)]
+    if crop.size == 0:
+        return None
+    return _clahe.apply(cv2.resize(crop, (FACE_SIZE, FACE_SIZE), interpolation=cv2.INTER_AREA))
+
+
+def _read_gray(path):
+    return cv2.imdecode(np.fromfile(path, np.uint8), cv2.IMREAD_GRAYSCALE)     # unicode-path safe
+
+
+def _write_png(path, img):
+    ok, buf = cv2.imencode(".png", img)
+    if ok:
+        buf.tofile(path)
 
 
 class FaceID:
     def __init__(self, on_log=None):
-        self._on_log = on_log or (lambda msg: None)
-        os.makedirs(DATA_DIR, exist_ok=True)
+        self._log = on_log or (lambda m: None)
+        os.makedirs(SAMPLES_DIR, exist_ok=True)
+        self.detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+        self.detection_available = not self.detector.empty()
+        self.available = hasattr(cv2, "face") and hasattr(cv2.face, "LBPHFaceRecognizer_create")
+        if not self.detection_available:
+            self._log("FACE: could not load the face detector - OpenCV install conflict. Run: pip uninstall "
+                      "opencv-python opencv-python-headless opencv-contrib-python -y && pip install opencv-contrib-python")
+        if not self.available:
+            self._log("FACE: cv2.face missing - run: pip install opencv-contrib-python (and uninstall plain opencv-python)")
 
-        self.detector = cv2.CascadeClassifier(CASCADE_PATH)
-        self._trained = False
-        self._vote_history = deque(maxlen=VOTE_WINDOW)
-        self._confidence_history = deque(maxlen=VOTE_WINDOW)
+        self.threshold = self._load_threshold()
+        self.recognizer, self._labels = None, {}
+        self.last_distance = None
+        self._votes, self._dists = deque(maxlen=VOTE_WINDOW), deque(maxlen=VOTE_WINDOW)
         self.confirmed_name = None
-
-        if self.detector.empty():
-            self._on_log(f"FACE: could not load face detector from {CASCADE_PATH} — "
-                         "face recognition disabled (this usually means opencv-python "
-                         "and opencv-contrib-python are both installed and conflicting — "
-                         "run: pip uninstall opencv-python opencv-python-headless "
-                         "opencv-contrib-python -y, then pip install opencv-contrib-python)")
-            self.detection_available = False
-        else:
-            self.detection_available = True
-
-        try:
-            self.recognizer = cv2.face.LBPHFaceRecognizer_create()
-            self.available = True
-        except AttributeError:
-            self._on_log("FACE: opencv-contrib-python not installed — "
-                         "face recognition disabled (pip install opencv-contrib-python)")
-            self.recognizer = None
-            self.available = False
-
+        self._enroll = None
         self.people = self._load_people()
         if self.available:
-            self._load_model()
+            self._retrain()
 
-    # ---- persistence -------------------------------------------------------
+    # ---- storage --------------------------------------------------------------
+    def _load_threshold(self):
+        try:
+            return float(open(THRESHOLD_FILE).read().strip())
+        except Exception:
+            return DEFAULT_THRESHOLD
+
+    @staticmethod
+    def _dirname(name):
+        return re.sub(r"[^\w\-]", "_", name)
+
+    def _dir(self, name):
+        return os.path.join(SAMPLES_DIR, self._dirname(name))
 
     def _load_people(self):
-        if os.path.exists(PEOPLE_PATH):
-            try:
-                with open(PEOPLE_PATH, "r") as f:
-                    return json.load(f)
-            except Exception:
-                return {}
-        return {}
+        try:
+            meta = json.load(open(PEOPLE_PATH, encoding="utf-8"))
+        except Exception:
+            meta = {}
+        people = {}
+        for d in sorted(os.listdir(SAMPLES_DIR)):
+            if os.path.isdir(os.path.join(SAMPLES_DIR, d)) and any(f.endswith(".png") for f in os.listdir(os.path.join(SAMPLES_DIR, d))):
+                name = next((n for n in meta if self._dirname(n) == d), d)
+                people[name] = {"theme_index": meta.get(name, {}).get("theme_index", len(people) % 4)}
+        return people
 
     def _save_people(self):
-        with open(PEOPLE_PATH, "w") as f:
+        with open(PEOPLE_PATH, "w", encoding="utf-8") as f:
             json.dump(self.people, f, indent=2)
 
-    def _load_model(self):
-        if os.path.exists(MODEL_PATH):
-            try:
-                self.recognizer.read(MODEL_PATH)
-                self._trained = True
-                self._on_log(f"FACE: loaded model with {len(self.people)} enrolled people")
-            except Exception as e:
-                self._on_log(f"FACE: could not load face model ({e})")
+    def _retrain(self):
+        imgs, labels, self._labels, self.recognizer = [], [], {}, None
+        for label, name in enumerate(sorted(self.people)):
+            self._labels[label] = name
+            d = self._dir(name)
+            for fn in os.listdir(d):
+                if fn.endswith(".png"):
+                    im = _read_gray(os.path.join(d, fn))
+                    if im is not None and im.shape == (FACE_SIZE, FACE_SIZE):
+                        imgs.append(im)
+                        labels.append(label)
+        self._reset_votes()
+        if not imgs:
+            return
+        rec = cv2.face.LBPHFaceRecognizer_create()
+        rec.train(imgs, np.array(labels, dtype=np.int32))
+        self.recognizer = rec
+        self._log(f"FACE: trained on {len(imgs)} samples of {len(self.people)} people (threshold {self.threshold:.0f})")
 
-    # ---- detection -----------------------------------------------------------
-
-    def detect_faces(self, gray_frame):
-        """Returns a list of (x, y, w, h) boxes for every face found in
-        this frame — just detection, not identification."""
+    # ---- detection ----------------------------------------------------------------
+    def detect_faces(self, gray):
+        """[(x, y, w, h)], largest first."""
         if not self.detection_available:
             return []
-        return self.detector.detectMultiScale(
-            gray_frame, scaleFactor=1.2, minNeighbors=5, minSize=(80, 80)
-        )
+        faces = self.detector.detectMultiScale(cv2.equalizeHist(gray), scaleFactor=1.1, minNeighbors=5, minSize=(70, 70))
+        return sorted((tuple(int(v) for v in f) for f in faces), key=lambda f: -f[2] * f[3])
 
-    # ---- enrollment (explicit consent) ----------------------------------------
+    # ---- enrollment (explicit consent) -----------------------------------------------
+    @property
+    def enrolling(self):
+        return self._enroll is not None
 
-    def enroll(self, gray_face_samples, name):
-        """gray_face_samples: list of grayscale face-crop images, all of
-        the same person, captured with their knowledge. Adds or updates
-        this person in the trained model."""
-        if not self.available or not gray_face_samples:
+    def start_enrollment(self, name):
+        if not (self.available and self.detection_available):
             return False
-
-        if name in self.people:
-            label = self.people[name]["label"]
-        else:
-            label = max([info["label"] for info in self.people.values()], default=-1) + 1
-            self.people[name] = {"label": label, "theme_index": len(self.people) % 4}
-
-        faces = [cv2.resize(f, (200, 200)) for f in gray_face_samples]
-        labels = np.array([label] * len(faces), dtype=np.int32)
-
-        if self._trained:
-            self.recognizer.update(faces, labels)
-        else:
-            self.recognizer.train(faces, labels)
-            self._trained = True
-
-        self.recognizer.save(MODEL_PATH)
-        self._save_people()
-        self._reset_votes()
-        self._on_log(f"FACE: enrolled '{name}' with {len(faces)} samples")
+        self._enroll = {"name": name, "t0": time.time(), "last": 0.0, "imgs": []}
         return True
 
-    def forget(self, name):
-        """Removes a person's enrollment. Note: LBPH doesn't support
-        removing a single label from an existing model cleanly, so this
-        clears them from the name list (they'll no longer be
-        recognized/greeted) but a full re-enroll of everyone else would
-        be needed to fully purge their data from the underlying model
-        file. Good enough for the practical goal: they stop being
-        recognized and greeted."""
-        if name in self.people:
-            del self.people[name]
-            self._save_people()
-            self._reset_votes()
-            return True
-        return False
+    def feed_enrollment(self, gray, faces):
+        """Call every frame while enrolling. None = still collecting, else (ok, name, message)."""
+        e, now = self._enroll, time.time()
+        if now - e["t0"] > ENROLL_TIMEOUT:
+            self._enroll = None
+            return False, e["name"], "I couldn't get a clear look at your face. Face the camera in good light and try again."
+        if now - e["t0"] < ENROLL_DELAY or not faces or now - e["last"] < 0.15:
+            return None
+        img = prep(gray, faces[0])
+        if img is None:
+            return None
+        e["last"] = now
+        e["imgs"].append(img)
+        if len(e["imgs"]) < ENROLL_SAMPLES:
+            return None
+        self._enroll = None
+        try:
+            return self._finish_enrollment(e)
+        except Exception as ex:
+            self._log(f"FACE: enrollment failed ({ex})")
+            return False, e["name"], "Something went wrong saving your face. Say 'check face recognition' for details."
 
+    def _finish_enrollment(self, e):
+        name, d, stamp = e["name"], self._dir(e["name"]), int(time.time())
+        os.makedirs(d, exist_ok=True)
+        for i, img in enumerate(e["imgs"]):
+            for v, variant in enumerate((img, cv2.convertScaleAbs(img, alpha=0.85, beta=-10),
+                                         cv2.convertScaleAbs(img, alpha=1.15, beta=10))):
+                _write_png(os.path.join(d, f"{stamp}_{i:02d}_{v}.png"), variant)
+        self.people.setdefault(name, {"theme_index": len(self.people) % 4})
+        self._save_people()
+        self._retrain()
+        self._log(f"FACE: enrolled '{name}' ({len(e['imgs'])} captures)")
+        return True, name, ""
+
+    def forget(self, name):
+        key = next((n for n in self.people if n.lower() == name.lower()), None)
+        if not key:
+            return False
+        shutil.rmtree(self._dir(key), ignore_errors=True)
+        del self.people[key]
+        self._save_people()
+        self._retrain()
+        return True
+
+    # ---- recognition ----------------------------------------------------------------
     def _reset_votes(self):
-        self._vote_history.clear()
-        self._confidence_history.clear()
+        self._votes.clear()
+        self._dists.clear()
         self.confirmed_name = None
 
-    # ---- recognition --------------------------------------------------------
-
-    def recognize(self, gray_frame, face_box):
-        """Runs LBPH on the given face crop and feeds the result into a
-        rolling vote. Returns (name, confidence):
-          - name is only set once it has won a majority of the last
-            VOTE_WINDOW attempts (None otherwise — including on the very
-            first few calls, and while nobody is enrolled).
-          - confidence is the average LBPH score over the window (still
-            LOWER = more confident), or None if nothing to average yet.
-        This is deliberately conservative: a stranger's face that
-        occasionally slips under the raw threshold for one frame won't
-        get reported unless it keeps happening across several attempts."""
-        if not self.available or not self.people or not self._trained:
-            self._reset_votes()
+    def recognize(self, gray, box):
+        """(name, avg_distance). name only once it wins VOTE_MIN_WINS of the last VOTE_WINDOW attempts."""
+        if not self.recognizer:
             return None, None
-
-        x, y, w, h = face_box
-        face_crop = cv2.resize(gray_frame[y:y + h, x:x + w], (200, 200))
+        img = prep(gray, box)
+        if img is None:
+            return None, None
         try:
-            label, raw_confidence = self.recognizer.predict(face_crop)
+            label, dist = self.recognizer.predict(img)
         except cv2.error:
             return None, None
-
-        if raw_confidence > RECOGNITION_CONFIDENCE_THRESHOLD:
-            vote = None
-        else:
-            vote = next((n for n, info in self.people.items() if info["label"] == label), None)
-
-        self._vote_history.append(vote)
-        self._confidence_history.append(raw_confidence)
-
-        counts = Counter(v for v in self._vote_history if v is not None)
-        if counts:
-            best_name, best_count = counts.most_common(1)[0]
-        else:
-            best_name, best_count = None, 0
-
-        avg_confidence = sum(self._confidence_history) / len(self._confidence_history)
-
-        if best_name and best_count >= VOTE_MIN_WINS:
-            self.confirmed_name = best_name
-            return best_name, avg_confidence
-
-        # Not enough agreement yet to confirm — if a DIFFERENT person was
-        # previously confirmed and recent votes have gone quiet/mismatched,
-        # drop the confirmation rather than holding onto a stale identity.
-        if self.confirmed_name and best_name != self.confirmed_name and best_count < VOTE_MIN_WINS:
-            self.confirmed_name = None
-
-        return None, avg_confidence
+        self.last_distance = dist
+        self._votes.append(self._labels.get(label) if dist <= self.threshold else None)
+        self._dists.append(dist)
+        counts = Counter(v for v in self._votes if v)
+        best, wins = counts.most_common(1)[0] if counts else (None, 0)
+        avg = sum(self._dists) / len(self._dists)
+        if best and wins >= VOTE_MIN_WINS:
+            self.confirmed_name = best
+            return best, avg
+        return None, avg
 
     def get_theme_index(self, name):
         info = self.people.get(name)
