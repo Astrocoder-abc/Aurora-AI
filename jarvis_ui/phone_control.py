@@ -38,85 +38,192 @@ Only use this if you're comfortable with that tradeoff, and keep this
 machine physically secure. Anyone with access to this PC and your USB
 cable would be able to unlock your phone if it's plugged in.
 """
-
+import json
 import os
+import re
 import subprocess
+import urllib.parse
 
-PIN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "phone_pin.txt")
-CONTACTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "contacts.json")
-MY_NUMBER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "my_number.txt")
+BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+PIN_FILE = os.path.join(BASE, "phone_pin.txt")
+CONTACTS_FILE = os.path.join(BASE, "contacts.json")
+MY_NUMBER_FILE = os.path.join(BASE, "my_number.txt")
+WIFI_FILE = os.path.join(BASE, "wifi_networks.json")
+
+KNOWN_APPS = {
+    "instagram": "com.instagram.android", "whatsapp": "com.whatsapp",
+    "youtube": "com.google.android.youtube", "chrome": "com.android.chrome",
+    "spotify": "com.spotify.music", "gmail": "com.google.android.gm",
+    "maps": "com.google.android.apps.maps", "telegram": "org.telegram.messenger",
+    "snapchat": "com.snapchat.android", "camera": "com.android.camera",
+}
 
 
-def _adb(args):
+def _adb(args, timeout=15):
     try:
-        result = subprocess.run(["adb"] + args, capture_output=True, text=True, timeout=15)
-        return result.returncode == 0, result.stdout + result.stderr
+        r = subprocess.run(["adb"] + args, capture_output=True, text=True, timeout=timeout)
+        return r.returncode == 0, r.stdout + r.stderr
     except FileNotFoundError:
         return False, "adb not found — install platform-tools and add it to PATH"
     except Exception as e:
         return False, str(e)
 
 
+def _sh(cmd, timeout=15):
+    return _adb(["shell", cmd], timeout)
+
+
+def _clean(s):
+    return re.sub(r"[^\w\s.\-+]", "", s or "").strip()
+
+
 def is_device_connected():
-    ok, output = _adb(["devices"])
+    ok, out = _adb(["devices"])
     if not ok:
-        return False, output
-    lines = [l for l in output.strip().split("\n")[1:] if l.strip()]
-    connected = any("device" in l and "unauthorized" not in l for l in lines)
-    return connected, output
+        return False, out
+    lines = [l for l in out.strip().split("\n")[1:] if l.strip()]
+    return any(l.split()[-1] == "device" for l in lines), out
 
 
 def wake_screen():
-    ok, _ = _adb(["shell", "input", "keyevent", "KEYCODE_WAKEUP"])
-    return ok
+    return _adb(["shell", "input", "keyevent", "KEYCODE_WAKEUP"])[0]
 
 
 def unlock_with_pin():
-    """Wakes the screen, swipes up (for phones that need it), then types
-    the PIN from phone_pin.txt. Only works if you've created that file
-    yourself with your own PIN — see the module docstring."""
     if not os.path.exists(PIN_FILE):
-        return False, "No phone_pin.txt found — see phone_control.py for setup"
-    with open(PIN_FILE, "r") as f:
-        pin = f.read().strip()
+        return False, "No phone_pin.txt found"
+    pin = open(PIN_FILE).read().strip()
     if not pin:
         return False, "phone_pin.txt is empty"
-
     wake_screen()
-    _adb(["shell", "input", "swipe", "500", "1500", "500", "500"])  # swipe up
-    ok, output = _adb(["shell", "input", "text", pin])
+    _adb(["shell", "input", "swipe", "500", "1500", "500", "500"])
+    ok, out = _adb(["shell", "input", "text", pin])
     if ok:
         _adb(["shell", "input", "keyevent", "KEYCODE_ENTER"])
-    return ok, output
+    return ok, out
 
 
 def load_contacts():
-    import json
-    if not os.path.exists(CONTACTS_FILE):
-        return {}
     try:
-        with open(CONTACTS_FILE, "r") as f:
+        with open(CONTACTS_FILE) as f:
             return json.load(f)
     except Exception:
         return {}
 
 
 def load_my_number():
-    """Your own phone number, from my_number.txt (create it yourself,
-    one line, e.g. +15551234567). Lets 'Aurora, call me' work without
-    needing a contacts.json entry named 'me'. Falls back to a 'me' entry
-    in contacts.json if that file doesn't exist."""
-    if os.path.exists(MY_NUMBER_FILE):
-        try:
-            with open(MY_NUMBER_FILE, "r") as f:
-                number = f.read().strip()
-                if number:
-                    return number
-        except Exception:
-            pass
+    try:
+        n = open(MY_NUMBER_FILE).read().strip()
+        if n:
+            return n
+    except Exception:
+        pass
     return load_contacts().get("me")
 
 
 def call_number(number):
-    ok, output = _adb(["shell", "am", "start", "-a", "android.intent.action.CALL", "-d", f"tel:{number}"])
-    return ok, output
+    return _sh(f"am start -a android.intent.action.CALL -d 'tel:{_clean(number)}'")
+
+
+# ---- WhatsApp calls -----------------------------------------------------------
+
+def _rows(output):
+    return [dict(re.findall(r"(\w+)=([^,]*?)(?:,\s|$)", l)) for l in output.splitlines() if l.startswith("Row:")]
+
+
+def whatsapp_call(target, video=False):
+    """Finds the WhatsApp call entry for a contact (by contacts.json name/number
+    or saved contact name) and starts a voice/video call. Returns (ok, info)."""
+    target = _clean(target).lower()
+    number = re.sub(r"\D", "", load_contacts().get(target, ""))
+    mime = "vnd.android.cursor.item/vnd.com.whatsapp." + ("video.call" if video else "voip.call")
+    ok, out = _sh("content query --uri content://com.android.contacts/data "
+                  "--projection _id:display_name:data1 "
+                  f"--where \"mimetype='{mime}'\"", timeout=20)
+    if not ok:
+        return False, "I couldn't read WhatsApp contacts from the phone."
+    for row in _rows(out):
+        name, jid = row.get("display_name", ""), row.get("data1", "")
+        if (number and number[-10:] in jid) or (target and target in name.lower()):
+            ok, out = _sh(f"am start -a android.intent.action.VIEW -d content://com.android.contacts/data/{row['_id']} "
+                          f"-t '{mime}' -p com.whatsapp")
+            return (True, name) if ok else (False, "WhatsApp wouldn't start the call.")
+    return False, f"I couldn't find {target} in your WhatsApp contacts."
+
+
+# ---- wifi ---------------------------------------------------------------------
+
+def connect_wireless(port=5555):
+    ok, out = _adb(["tcpip", str(port)])
+    if not ok:
+        return False, "Plug the phone in by USB first."
+    ok, out = _sh("ip route")
+    m = re.search(r"src (\d+\.\d+\.\d+\.\d+)", out)
+    if not m:
+        return False, "I couldn't find the phone's wifi address — is it on wifi?"
+    ok, out = _adb(["connect", f"{m.group(1)}:{port}"])
+    return ("connected" in out.lower()), (out.strip() or "Connection failed.")
+
+
+def wifi_set(on):
+    return _sh(f"svc wifi {'enable' if on else 'disable'}")[0]
+
+
+def wifi_connect(name):
+    name = name.strip().lower()
+    wifi_set(True)
+    try:
+        net = json.load(open(WIFI_FILE)).get(name)
+    except Exception:
+        net = None
+    if net:
+        ok, out = _sh(f"cmd wifi connect-network '{_clean(net['ssid'])}' wpa2 '{_clean(net.get('password', ''))}'")
+        return ok, (f"Connecting your phone to {name}." if ok else "The phone rejected that wifi connection.")
+    return True, f"Wifi is on. Add {name} to wifi_networks.json for me to join it; saved networks reconnect on their own."
+
+
+# ---- apps, web, search ----------------------------------------------------------
+
+def _packages():
+    ok, out = _sh("pm list packages")
+    return [l.split(":", 1)[1].strip() for l in out.splitlines() if l.startswith("package:")] if ok else []
+
+
+def open_app(name):
+    name = _clean(name).lower()
+    pkg = KNOWN_APPS.get(name)
+    if not pkg:
+        key = name.replace(" ", "")
+        pkg = next((p for p in _packages() if key in p.lower()), None)
+    if not pkg:
+        return False
+    return _sh(f"monkey -p {pkg} -c android.intent.category.LAUNCHER 1")[0]
+
+
+def web_search(query):
+    url = "https://www.google.com/search?q=" + urllib.parse.quote_plus(query)
+    return _sh(f"am start -a android.intent.action.VIEW -d '{url}'")[0]
+
+
+def search_phone(query, kind=None):
+    """Returns {"contacts": [(name, number)], "apps": [pkg], "files": [path]}."""
+    q = _clean(query)
+    res = {"contacts": [], "apps": [], "files": []}
+    if not q:
+        return res
+    if kind in (None, "contacts"):
+        ok, out = _sh("content query --uri content://com.android.contacts/data/phones "
+                      f"--projection display_name:data1 --where \"display_name like '%{q}%'\"")
+        seen = set()
+        for r in _rows(out) if ok else []:
+            item = (r.get("display_name", "?"), r.get("data1", ""))
+            if item not in seen:
+                seen.add(item)
+                res["contacts"].append(item)
+    if kind in (None, "apps"):
+        key = q.lower().replace(" ", "")
+        res["apps"] = [p for p in _packages() if key in p.lower()][:10]
+    if kind in (None, "files"):
+        ok, out = _sh(f"find /sdcard -maxdepth 5 -iname '*{q.replace(' ', '*')}*' 2>/dev/null | head -10", timeout=30)
+        res["files"] = [l.strip() for l in out.splitlines() if l.startswith("/")] if ok else []
+    return res
