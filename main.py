@@ -15,8 +15,7 @@ import cv2
 from jarvis_ui.hologram import Hologram
 from jarvis_ui.voice_assistant import VoiceAssistant, NullVoice
 from jarvis_ui.face_id import FaceID
-from jarvis_ui.gesture_draw import GestureDrawer
-from jarvis_ui import system_control, glue
+from jarvis_ui import system_control, addons
 
 GESTURE_TO_STATE = {"open_palm": "listening", "fist": "speaking"}
 SNAPSHOT_DIR = "snapshots"
@@ -35,23 +34,30 @@ def save_snapshot(frame):
 def build_voice(hologram, face_id):
     try:
         voice = VoiceAssistant(hologram, face_id, on_log=hologram.log_event)
-        voice.start()
-        return voice
     except Exception:
         import traceback
         print("VoiceAssistant setup failed, continuing without voice:", flush=True)
         traceback.print_exc()
         return NullVoice()
+    try:
+        from jarvis_ui import aurora_plus       # cowork, network hub, offline mode, file search
+        aurora_plus.install(voice, hologram)
+    except Exception:
+        import traceback
+        print("Aurora Plus unavailable, continuing without it:", flush=True)
+        traceback.print_exc()
+    voice.start()
+    return voice
 
 
 def main():
-    tracker = glue.TipHandTracker(camera_index=0)
+    tracker = addons.TipHandTracker(camera_index=0)
     hologram = Hologram()
     face_id = FaceID(on_log=hologram.log_event)
     voice = build_voice(hologram, face_id)
-    drawer = GestureDrawer(hologram, speak=voice.speak_now, on_log=hologram.log_event)
+    drawer = addons.GestureDrawer(hologram, speak=voice.speak_now, on_log=hologram.log_event)
     hologram.drawer, voice.drawer = drawer, drawer
-    glue.install(hologram, drawer)
+    addons.install(hologram, drawer)
 
     last_debug_frame, prev_time, frame_i = None, time.time(), 0
     volume_prev_pitch = None
