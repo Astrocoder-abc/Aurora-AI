@@ -53,6 +53,9 @@ def _optional(name):
 sandbox_labs, addons = (_optional(n) for n in ("sandbox_labs", "addons"))
 
 WAKE_WORD_CORE, WAKE_FUZZY = "aurora", 0.72
+VISION_RE = re.compile(r"\bwhat (?:can |do )?you see\b|\bwhat am i (?:holding|looking at|wearing)\b|\blook at (?:this|me)\b"
+                       r"|\bwhat(?:'s| is) in front of me\b|\bdescribe (?:the |my )?(?:camera|scene|room|view)\b"
+                       r"|\b(?:use|check|open) (?:the |my )?(?:webcam|camera view)\b")
 API_KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "api_key.txt")
 EDGE_VOICE = "en-GB-RyanNeural"
 STOP_WORDS = ("stop", "stop it", "be quiet", "silence", "shut up", "enough")
@@ -518,6 +521,9 @@ class VoiceAssistant:
             if hits is None:
                 return "The vault isn't built yet. Say: add folder <path> to my vault, then rebuild my vault."
             return " | ".join(f"{os.path.basename(h['path'])}: {h['text'][:200]}" for h in hits) or "nothing found"
+        if name == "describe_camera":
+            self._turn_display = True
+            return self._run_local("what do you see")
         kind, n, val, tgt = g("kind"), g("name"), g("value"), g("target")
         phrase = None
         if name == "show_display":
@@ -736,11 +742,11 @@ class VoiceAssistant:
             return True
 
         # vision
-        if has("what am i looking at", "what is this", "what's this", "scan this", "read this qr", "read this code",
+        if VISION_RE.search(t) or has("what am i looking at", "what is this", "what's this", "scan this", "read this qr", "read this code",
                "read this barcode", "what do you see", "what's in front of me", "describe what you see", "describe the camera"):
             frame = self.latest_frame
             if frame is None:
-                speak("I don't have a camera frame right now.")
+                speak("I can't get a camera frame. Close any other app using the webcam and try again.")
                 return True
             codes = []
             try:
@@ -1133,8 +1139,7 @@ class VoiceAssistant:
                 H.hide_weather()
                 speak("Closing the weather display")
                 return True
-            m = re.search(r"weather (?:in|at|for)\s+([a-zA-Z\s]+)", t)
-            loc = m.group(1).strip() if m else None
+            loc = self._weather_place(t)
             state_key = next((s for s in US_STATE_POSITIONS if loc and s in loc), None)
             data = self._fetch_weather_data(loc)
             if data:
@@ -1173,21 +1178,43 @@ class VoiceAssistant:
         return False
 
     # ---- weather (Open-Meteo, free, keyless) ---------------------------------------------------------
+    _PLACE_NOISE = re.compile(r"\b(right now|currently|today|tonight|tomorrow|now|like|please|outside|at the moment|this week)\b.*$")
+    _PLACE_FILLER = {"what", "whats", "what's", "how", "hows", "how's", "the", "is", "show", "me", "tell", "get", "current",
+                     "check", "give", "display", "open", "a", "my", "it", "in"}
+
+    @classmethod
+    def _weather_place(cls, t):
+        """'weather in new york right now' / 'paris weather' / 'what's the weather like in Delhi' -> place, else None (auto-locate)."""
+        m = re.search(r"\b(?:weather|forecast)\b.*?\b(?:in|at|for|of)\s+(.+)$", t) or \
+            re.search(r"\b(?:in|at|for)\s+(.+?)\s+(?:weather|forecast)\b", t)
+        if m:
+            place = m.group(1)
+        else:
+            m = re.search(r"^\s*(.+?)\s+(?:weather|forecast)\s*$", t)
+            place = " ".join(w for w in m.group(1).split() if w not in cls._PLACE_FILLER) if m else ""
+        place = cls._PLACE_NOISE.sub("", place).strip(" ,.?!")
+        return None if place in ("", "here", "me", "home", "my location", "my area", "my city") else place
+
     def _get_json(self, url, headers=None):
         req = urllib.request.Request(url, headers=headers or {"User-Agent": "aurora-hologram/1.0"})
         with urllib.request.urlopen(req, timeout=8) as r:
             return json.loads(r.read().decode())
 
     def _geocode_location(self, query):
+        name, _, hint = query.partition(",")
+        name, hint = name.strip(), hint.strip().lower()
         try:
             data = self._get_json("https://geocoding-api.open-meteo.com/v1/search?" + urllib.parse.urlencode(
-                {"name": query, "count": 1, "language": "en", "format": "json"}))
+                {"name": name, "count": 10, "language": "en", "format": "json"}))
         except Exception as e:
             self._log(f"VOICE: geocoding failed ({e})")
             return None
-        if not data.get("results"):
+        results = data.get("results") or []
+        if hint:
+            results = [r for r in results if hint in " ".join(str(r.get(k, "")) for k in ("country", "admin1", "country_code")).lower()] or results
+        if not results:
             return None
-        r = data["results"][0]
+        r = results[0]
         parts = [r.get("name")] + ([r["admin1"]] if r.get("admin1") and r["admin1"] != r.get("name") else []) + [r.get("country")]
         return r["latitude"], r["longitude"], ", ".join(p for p in parts if p)
 

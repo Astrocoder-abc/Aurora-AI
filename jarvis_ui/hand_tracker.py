@@ -397,6 +397,7 @@ class HandTracker:
             return result, None
 
         frame = cv2.flip(frame, 1)
+        self.raw_frame = frame.copy()      # un-annotated frame for vision
         rgb = self._enhance(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
