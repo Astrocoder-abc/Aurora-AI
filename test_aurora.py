@@ -35,11 +35,18 @@ RESULTS = []
 
 
 class Skip(Exception):
-    pass
+    def __init__(self, msg="", status="SKIP"):
+        super().__init__(msg)
+        self.status = status
 
 
-def skip(msg):
-    raise Skip(msg)
+def skip(msg, status="SKIP"):
+    raise Skip(msg, status)
+
+
+def requires(kind, msg):
+    """kind: API, PERMISSION or HARDWARE"""
+    raise Skip(msg, f"REQUIRES {kind}")
 
 
 def check(group, name, fn):
@@ -47,7 +54,7 @@ def check(group, name, fn):
         detail = fn()
         RESULTS.append((group, name, "PASS", detail if isinstance(detail, str) else ""))
     except Skip as e:
-        RESULTS.append((group, name, "SKIP", str(e)))
+        RESULTS.append((group, name, e.status, str(e)))
     except AssertionError as e:
         RESULTS.append((group, name, "FAIL", f"assertion: {e}" if str(e) else "assertion failed"))
     except Exception as e:
@@ -552,6 +559,7 @@ def t_circuit():
 def t_labs_voice():
     sl = mod("sandbox_labs")
     H = mock.MagicMock()
+    H.labs = None      # a MagicMock auto-creates .labs, so install() would reuse a fake instead of the real Labs
     said = []
     assert sl.handle_command(H, "circuit sandbox", said.append) and "Circuit" in said[0]
     assert sl.handle_command(H, "add a 220 ohm resistor", said.append)
@@ -683,6 +691,7 @@ def t_install():
     v, H, said = make_voice()
     v.recognizer = None
     v.speech = va.SpeechEngine(lambda m: None)
+    v._speak = said.append   # the mock speech engine that fills `said` was just replaced
     plus = ap.install(v, H)
     assert v.plus is plus and v.speech.use_edge == plus.offline.online
     assert v._handle_local_command("offline mode status") and any("currently" in s for s in said)
@@ -814,7 +823,7 @@ def get_client():
     va = mod("voice_assistant")
     key = va.load_api_key()
     if not key or va.Groq is None:
-        skip("no api_key.txt / groq package")
+        requires("API", "no api_key.txt / groq package")
     return va.Groq(api_key=key)
 
 
@@ -863,13 +872,460 @@ live("Edge neural TTS", t_tts)
 live("Open-Meteo weather", t_weather)
 
 
+# ============================================================================ productivity features
+import zipfile
+from datetime import datetime, timedelta
+
+
+# Legacy module names (before everything was merged) resolve to aurora_utilities instead of "module not found".
+_LEGACY_UTILITY_MODULES = {"quick_notes", "file_utilities", "calendar_email", "notification_center", "translation",
+                           "study_mode", "skill_builder", "productivity_commands"}
+_mod_original = mod
+
+
+def mod(name):
+    if name in _LEGACY_UTILITY_MODULES:
+        name = "aurora_utilities"
+    return _mod_original(name)
+
+
+
+class FakeClient:
+    """Stands in for Groq: brain._complete(client, ...) is patched to call .reply()."""
+    def __init__(self, text="ok"):
+        self.text, self.calls = text, []
+
+    def reply(self, system, user):
+        self.calls.append((system, user))
+        return self.text
+
+
+def with_complete(client):
+    return mock.patch.object(mod("brain"), "_complete", lambda c, s, u, *a, **k: c.reply(s, u))
+
+
+def util():
+    return mod("aurora_utilities")
+
+
+def newdir(prefix):
+    return tempfile.mkdtemp(prefix=prefix, dir=tmpdir)
+
+
+# ---- Quick notes
+def t_qn():
+    sc, qn = sc_mod(), util()
+    with mock.patch.object(sc, "NOTES_FILE", os.path.join(newdir("qn"), "notes.txt")):
+        qn.add_quick_note("buy milk and eggs")
+        qn.add_quick_note("call the dentist")
+        eq([n[2] for n in qn.list_notes()], ["buy milk and eggs", "call the dentist"])
+        eq(qn.search_notes("what did i note about dentist")[0][2], "call the dentist")
+        eq(qn.get_quick_note(1)[2], "buy milk and eggs")
+        assert qn.delete_note(1) and not qn.delete_note(9)
+        eq(len(qn.list_notes()), 1)
+        eq(qn.delete_all_notes(), 1)
+        eq(qn.list_notes(), [])
+
+
+check("Quick notes", "add, list, search, read, delete", t_qn)
+
+
+# ---- File utilities
+def t_files():
+    fu = util()
+    home = os.path.join(newdir("home"), "AppData", "Local", "Temp", "h")       # Windows temp dirs live under AppData
+    for d in ("Downloads", "Documents"):
+        os.makedirs(os.path.join(home, d))
+    dl = os.path.join(home, "Downloads")
+    for n in ("report.pdf", "pic.png", "song.mp3", "setup.exe", "notes.txt", "weird.zzz"):
+        open(os.path.join(dl, n), "w").write("x")
+    with mock.patch.object(fu, "HOME", home):
+        eq(fu.find_file("report", fu.folder_path("downloads")), [os.path.join(dl, "report.pdf")])
+        new = fu.rename_file(os.path.join(dl, "report.pdf"), "summary")
+        eq(os.path.basename(new), "summary.pdf")                        # extension kept
+        open(os.path.join(dl, "again.pdf"), "w").write("y")
+        eq(os.path.basename(fu.rename_file(os.path.join(dl, "again.pdf"), "summary.pdf")), "summary (1).pdf")  # no overwrite
+        moved = fu.move_file(os.path.join(dl, "summary.pdf"), os.path.join(home, "Documents"))
+        assert os.path.exists(moved) and not os.path.exists(os.path.join(dl, "summary.pdf"))
+        z = fu.compress_path(os.path.join(dl, "notes.txt"))
+        out = fu.extract_zip(z)
+        assert os.path.exists(os.path.join(out, "notes.txt"))
+        plan = fu.plan_organize(dl)
+        cats = {os.path.basename(s): c for s, c in plan}
+        assert cats["pic.png"] == "Images" and cats["song.mp3"] == "Audio" and cats["weird.zzz"] == "Other"
+        assert fu.organize_folder(dl, plan) == len(plan)
+        assert os.path.exists(os.path.join(dl, "Images", "pic.png"))
+        for bad in (lambda: fu.rename_file(os.path.join(dl, "Images", "pic.png"), "../x.png"),
+                    lambda: fu.move_file(os.path.join(dl, "Images", "pic.png"), tempfile.gettempdir()),
+                    lambda: fu.rename_file(os.path.abspath(__file__), "x.py")):
+            try:
+                bad()
+            except fu.FileError:
+                continue
+            raise AssertionError("unsafe file operation was allowed")
+        evil = os.path.join(dl, "evil.zip")
+        with zipfile.ZipFile(evil, "w") as zf:
+            zf.writestr("../../escaped.txt", "x")
+        try:
+            fu.extract_zip(evil)
+            raise AssertionError("zip-slip not blocked")
+        except fu.FileError:
+            pass
+        assert not os.path.exists(os.path.join(home, "..", "escaped.txt"))
+
+
+check("File utilities", "rename/move/compress/extract/organize + safety limits", t_files)
+
+# ---- Calendar
+ICS = ("BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nSUMMARY:Standup\r\nDTSTART:{d}T090000\r\nDTEND:{d}T091500\r\n"
+       "RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;COUNT=100\r\nEND:VEVENT\r\n"
+       "BEGIN:VEVENT\r\nSUMMARY:Dentist\\, Dr. Lee\r\nDTSTART:{t}T150000\r\nDTEND:{t}T160000\r\nEND:VEVENT\r\n"
+       "BEGIN:VEVENT\r\nSUMMARY:Birthday\r\nDTSTART;VALUE=DATE:{t}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n")
+
+
+def cal_env():
+    cal = util()
+    d = newdir("cal")
+    today = datetime.now().date()
+    ics = os.path.join(d, "c.ics")
+    open(ics, "w").write(ICS.format(d=(today - timedelta(days=14)).strftime("%Y%m%d"), t=(today + timedelta(days=1)).strftime("%Y%m%d")))
+    json.dump({"ics": [ics]}, open(os.path.join(d, "calendar_config.json"), "w"))
+    return cal, d
+
+
+def t_calendar():
+    cal, d = cal_env()
+    with mock.patch.object(cal, "BASE", d):
+        tomorrow = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        evs, errs = cal.events_between(tomorrow, tomorrow + timedelta(days=1))
+        titles = {e["title"] for e in evs}
+        assert not errs and "Dentist, Dr. Lee" in titles and "Birthday" in titles, titles
+        if tomorrow.weekday() < 5:
+            assert "Standup" in titles, "weekly recurrence missing"
+        title, start = cal.parse_event_phrase("dentist tomorrow at 3:30 pm", datetime(2026, 10, 1, 8, 0))
+        eq((title, start), ("dentist", datetime(2026, 10, 2, 15, 30)))
+        eq(cal.parse_event_phrase("lunch with sam", datetime(2026, 10, 1))[1], None)
+        cal.add_local_event("Study group", datetime.now() + timedelta(hours=2))
+        ev, _ = cal.next_event()
+        assert ev and ev["title"] == "Study group" or ev, "next_event failed"
+        evs, _ = cal.events_between(datetime.now(), datetime.now() + timedelta(days=1))
+        assert "Study group" in {e["title"] for e in evs}
+
+
+check("Calendar", "ICS parsing, recurrence, time phrases, local events, next event", t_calendar)
+check("Calendar", "live calendar source (ICS URL / file you configured)",
+      lambda: (_ for _ in ()).throw(Skip("no calendar_config.json in project root", "REQUIRES PERMISSION"))
+      if not os.path.exists(os.path.join(ROOT, "calendar_config.json")) else
+      (lambda c: (c.events_between(datetime.now(), datetime.now() + timedelta(days=7)) and None))(util()))
+
+
+# ---- Email
+RAW = (b"From: =?utf-8?q?Ann_Lee?= <ann@example.com>\r\nSubject: Project update\r\nDate: Mon, 1 Oct 2026 09:00:00 +0000\r\n"
+       b"Content-Type: text/plain; charset=utf-8\r\n\r\nThe demo moved to Friday.\r\nPlease confirm.\r\n")
+
+
+def mail_env():
+    cal = util()
+    d = newdir("mail")
+    json.dump({"imap_host": "imap.test", "smtp_host": "smtp.test", "username": "me@test.com", "contacts": {"ann": "ann@example.com"}},
+              open(os.path.join(d, "email_config.json"), "w"))
+    return cal, d
+
+
+def t_email_logic():
+    cal, d = mail_env()
+    with mock.patch.object(cal, "BASE", d), mock.patch.dict(os.environ, {"AURORA_EMAIL_PASSWORD": "pw"}):
+        assert cal.email_configured()
+        eq(cal.resolve_recipient("ann"), "ann@example.com")
+        eq(cal.resolve_recipient("bob at example dot com"), "bob@example.com")
+        eq(cal.resolve_recipient("nobody"), None)
+        box = mock.MagicMock()
+        box.search.return_value = (None, [b"1"])
+        box.fetch.return_value = (None, [(b"1", RAW)])
+        with mock.patch.object(cal.imaplib, "IMAP4_SSL", return_value=box):
+            msgs = cal.fetch_unread(3)
+        eq((msgs[0]["from"], msgs[0]["subject"]), ("Ann Lee", "Project update"))
+        assert "Friday" in msgs[0]["body"]
+        box.select.assert_called_with("INBOX", readonly=True)
+        assert "PEEK" in box.fetch.call_args[0][1], "must not mark mail as read"
+        draft = cal.save_draft("ann@example.com", "Hi", "Body")
+        eq(cal.latest_draft()["to"], "ann@example.com")
+        try:
+            cal.send_draft(draft)
+            raise AssertionError("send without confirmation was allowed")
+        except PermissionError:
+            pass
+        smtp = mock.MagicMock()
+        with mock.patch.object(cal.smtplib, "SMTP", return_value=smtp):
+            assert cal.send_draft(draft, confirmed=True)
+        smtp.send_message.assert_called_once()
+        assert cal.discard_draft() and cal.latest_draft() is None
+    with mock.patch.object(cal, "BASE", newdir("nomail")):
+        try:
+            cal.fetch_unread()
+            raise AssertionError("expected MailError")
+        except cal.MailError:
+            pass
+
+
+check("Email", "IMAP read (mocked), drafts, send needs confirmed=True, recipients", t_email_logic)
+check("Email", "real mailbox read", lambda: requires("API", "needs email_config.json + AURORA_EMAIL_PASSWORD")
+      if not util().email_configured() else (util().fetch_unread(1) and None))
+
+
+# ---- Skill builder
+def t_skills():
+    skm = util()
+    with mock.patch.object(skm, "BASE", newdir("sk")):
+        eq(skm.parse_steps("open chrome then what's on my calendar today; set a timer for 5 minutes"),
+           ["open chrome", "what's on my calendar today", "set a timer for 5 minutes"])
+        skm.teach_skill("Morning", ["a", "b"])
+        eq(skm.skill_names(), ["morning"])
+        eq(skm.add_step("the morning skill", "c"), 3)
+        skm.edit_step("morning", 2, "b2")
+        skm.remove_step("morning", 1)
+        eq(skm.get_skill("morning")["steps"], ["b2", "c"])
+        eq(skm.run_skill("morning", lambda s: s.upper()), [("b2", "B2"), ("c", "C")])
+        skm.rename_skill("morning", "evening")
+        for bad in (lambda: skm.teach_skill("loop", ["run skill loop"]), lambda: skm.teach_skill("x", []), lambda: skm.edit_step("evening", 9, "z")):
+            try:
+                bad()
+                raise AssertionError("expected SkillError")
+            except skm.SkillError:
+                pass
+        skm.delete_skill("evening")
+        eq(skm.skill_names(), [])
+
+
+check("Skill builder", "teach, list, edit, rename, delete, run, recursion guard", t_skills)
+
+
+# ---- Notification center
+DUMP = """  NotificationRecord(0x1: pkg=com.whatsapp user=UserHandle{0} id=1 importance=3 key=0|com.whatsapp|1)
+      extras={
+        android.title=String (Mom)
+        android.text=CharSequence (Dinner at 7?)
+  NotificationRecord(0x2: pkg=com.android.systemui user=UserHandle{0} id=2 importance=2 key=x)
+      extras={
+        android.title=String (USB debugging connected)
+  NotificationRecord(0x3: pkg=com.google.android.gm user=UserHandle{0} id=3 importance=3 key=y)
+      extras={
+        android.title=Bob
+        android.text=Invoice attached
+"""
+
+
+def t_notifs():
+    nc = util()
+    p = nc.parse_phone_dump(DUMP)
+    eq([(x["package"], x["title"], x["text"]) for x in p],
+       [("com.whatsapp", "Mom", "Dinner at 7?"), ("com.google.android.gm", "Bob", "Invoice attached")])
+    c = nc.NotificationCenter()
+    assert c.push("phone", "a") and not c.push("phone", "a")                 # de-duplicated
+    c.push("calendar", "Meeting soon")
+    eq(c.ranked()[0]["source"], "calendar")                                  # calendar outranks phone
+    sc, cal = sc_mod(), util()
+    with mock.patch.object(sc, "is_device_connected", return_value=(True, "")), \
+            mock.patch.object(sc, "_shell", return_value=(True, DUMP)), \
+            mock.patch.object(cal, "email_configured", return_value=False), mock.patch.object(cal, "BASE", newdir("nc")):
+        c2 = nc.NotificationCenter()
+        eq(c2.collect(), [])
+        assert any("Mom" in n["title"] for n in c2.items)
+        eq(c2.clear(), 2)
+
+
+check("Notification center", "ADB dump parsing, dedupe, ranking, collect (mocked phone)", t_notifs)
+
+
+def t_notifs_hw():
+    ok, out = sc_mod().is_device_connected()
+    if not ok:
+        requires("HARDWARE", "no authorised Android phone over ADB")
+    util().NotificationCenter().collect()
+
+
+check("Notification center", "real phone notifications", t_notifs_hw)
+
+
+# ---- Study mode
+def t_study():
+    sm = util()
+    with mock.patch.object(sm, "BASE", newdir("st")):
+        sm.add_card("Bio", "Powerhouse of the cell?", "mitochondria")
+        sm.add_cards("bio", [{"q": "Plants make food by?", "a": "photosynthesis"}])
+        eq(sm.list_decks(), {"bio": 2})
+        eq(sm.find_deck("biology"), "bio")
+        assert sm.grade_answer("the mitochondria", "mitochondria") and sm.grade_answer("photosyntesis", "photosynthesis")
+        assert not sm.grade_answer("nucleus", "mitochondria")
+        name, cards = sm.get_cards("bio")
+        s = sm.StudySession(name, cards, "quiz", shuffle=False)
+        assert s.check("mitochondria") and not (s.next() and s.check("wrong"))
+        eq(s.score_text(), "1 of 2 correct")
+        assert s.next() is None
+        said = []
+        voice = SimpleNamespace(speak_now=said.append, active_timers=[])
+        t = sm.StudyTimer(voice, seconds_per_minute=0.02)
+        assert t.start(1, pomodoro=True, rest=1, cycles=2) and not t.start(1)
+        time.sleep(0.6)
+        assert not t.running and sm.minutes_today() == 2 and any("complete" in x for x in said), said
+        t.start(5)
+        assert t.stop()
+        time.sleep(0.2)
+        assert not t.running and voice.active_timers == []
+        with with_complete(None):
+            cards = sm.generate_cards(FakeClient('Sure! [{"q":"2+2?","a":"4"},{"q":"","a":"x"}]'), "math", 5)
+        eq(cards, [{"q": "2+2?", "a": "4"}])
+        assert sm.delete_deck("bio") and sm.list_decks() == {}
+
+
+check("Study mode", "decks, grading, quiz session, pomodoro timer, AI card parsing (mocked)", t_study)
+
+
+# ---- Translation
+def t_translation():
+    tr = util()
+    eq(tr.parse_translation_request("translate good morning to spanish"), ("good morning", "spanish"))
+    eq(tr.parse_translation_request("Translate to French: where is the library"), ("where is the library", "french"))
+    eq(tr.parse_translation_request("how do you say thank you in japanese"), ("thank you", "japanese"))
+    eq(tr.parse_translation_request("what is the weather"), None)
+    eq(tr.voice_for_language("spanish"), "es-ES-AlvaroNeural")
+    with with_complete(None):
+        eq(tr.translate_text(FakeClient('"Buenos días"'), "good morning", "spanish"), "Buenos días")
+
+
+check("Translation", "request parsing, voice mapping, translate (mocked model)", t_translation)
+
+
+def t_translation_live():
+    tr = util()
+    out = tr.translate_text(get_client(), "good morning", "spanish")
+    assert "buen" in out.lower(), out
+
+
+live("Translation (real Groq)", t_translation_live)
+live("Study flashcards (real Groq)", lambda: eq(len(util().generate_cards(get_client(), "the water cycle", 3)) >= 2, True))
+
+
+# ---- Voice routing end to end (confirmation rules are the important part)
+def pv():
+    v, H, said = make_voice()
+    return v, said, util()
+
+
+def say(pc, v, phrase):
+    return pc.handle_command(v, phrase)
+
+
+def t_route_confirm_files():
+    fu = util()
+    home = os.path.join(newdir("rhome"), "AppData", "Local", "Temp", "h")
+    dl = os.path.join(home, "Downloads")
+    os.makedirs(dl)
+    os.makedirs(os.path.join(home, "Documents"))
+    open(os.path.join(dl, "report.pdf"), "w").write("x")
+    v, said, pc = pv()
+    with mock.patch.object(fu, "HOME", home):
+        assert say(pc, v, "rename report.pdf in downloads to summary.pdf")
+        assert os.path.exists(os.path.join(dl, "report.pdf")), "renamed BEFORE confirmation"
+        assert "yes" in said[-1].lower(), f"no confirmation prompt: {said[-1:]}"
+        assert say(pc, v, "yes") and os.path.exists(os.path.join(dl, "summary.pdf")), f"rename after yes failed: {said[-1:]}"
+        assert say(pc, v, "move summary.pdf in downloads to documents") and os.path.exists(os.path.join(dl, "summary.pdf"))
+        assert say(pc, v, "no") and os.path.exists(os.path.join(dl, "summary.pdf")), "moved despite 'no'"
+        assert say(pc, v, "move summary.pdf in downloads to documents")
+        pc.handle_command(v, "list my skills")                     # an unrelated command must cancel the pending move
+        assert not (say(pc, v, "yes")), "stale confirmation executed"
+        assert os.path.exists(os.path.join(dl, "summary.pdf"))
+        assert say(pc, v, "organize my downloads") and os.path.exists(os.path.join(dl, "summary.pdf")), said[-1:]
+        assert say(pc, v, "yes") and os.path.exists(os.path.join(dl, "Documents", "summary.pdf")), f"organize failed: {said[-1:]}"
+        assert not say(pc, v, "move the panel to the left"), "must not steal non-file phrases"
+        open(os.path.join(home, "Documents", "todo.txt"), "w").write("x")
+        assert say(pc, v, "zip todo.txt in documents") and os.path.exists(os.path.join(home, "Documents", "todo.txt.zip"))
+
+
+def t_route_email_send():
+    cal, d = mail_env()
+    v, said, pc = pv()
+    sent = mock.MagicMock()
+    with mock.patch.object(cal, "BASE", d), mock.patch.dict(os.environ, {"AURORA_EMAIL_PASSWORD": "pw"}), \
+            mock.patch.object(cal.smtplib, "SMTP", return_value=sent), with_complete(None):
+        v.client = FakeClient("Subject: Demo\n\nSee you Friday.")
+        assert say(pc, v, "draft an email to ann about the demo on friday")
+        assert cal.latest_draft()["to"] == "ann@example.com"
+        sent.send_message.assert_not_called()
+        assert say(pc, v, "send the email") and "about to send" in said[-1]
+        sent.send_message.assert_not_called()
+        assert say(pc, v, "no")
+        sent.send_message.assert_not_called()
+        say(pc, v, "send the email")
+        say(pc, v, "yes")
+        sent.send_message.assert_called_once()
+
+
+def t_route_notes_skills_calendar():
+    sc, skm = sc_mod(), util()
+    v, said, pc = pv()
+    cal, d = cal_env()
+    with mock.patch.object(sc, "NOTES_FILE", os.path.join(newdir("rn"), "notes.txt")), mock.patch.object(skm, "BASE", newdir("rs")), \
+            mock.patch.object(cal, "BASE", d):
+        assert say(pc, v, "remember this: pick up the parcel") and "saved" in said[-1].lower()
+        assert not say(pc, v, "remember my face as sam"), "face enrollment must still reach its own handler"
+        assert say(pc, v, "search notes for parcel") and "parcel" in said[-1]
+        assert say(pc, v, "delete all notes") and "permanently" in said[-1]
+        assert say(pc, v, "no") and len(util().list_notes()) == 1
+        assert say(pc, v, "delete note 1") and util().list_notes() == []
+        assert say(pc, v, "teach a skill called warmup: what time is it then list my skills")
+        assert skm.get_skill("warmup") and len(skm.get_skill("warmup")["steps"]) == 2
+        assert say(pc, v, "list my skills") and "warmup" in said[-1]
+        assert say(pc, v, "run skill warmup") and "Finished warmup" in said[-1]
+        assert say(pc, v, "delete skill warmup") and skm.get_skill("warmup")
+        assert say(pc, v, "yes") and not skm.get_skill("warmup")
+        assert say(pc, v, "what do i have tomorrow") and ("Dentist" in said[-1] or "Birthday" in said[-1]), said[-1]
+        assert say(pc, v, "add lunch with sam tomorrow at noon to my calendar") and "yes" in said[-1].lower()
+        assert not os.path.exists(os.path.join(d, "calendar_local.json")), "calendar changed before confirmation"
+        assert say(pc, v, "yes") and os.path.exists(os.path.join(d, "calendar_local.json"))
+
+
+def t_route_study_translate():
+    sm = util()
+    v, said, pc = pv()
+    with mock.patch.object(sm, "BASE", newdir("rst")), with_complete(None):
+        v.client = FakeClient('[{"q":"Capital of France?","a":"Paris"},{"q":"Capital of Italy?","a":"Rome"}]')
+        assert say(pc, v, "make 2 flashcards about capitals") and sm.list_decks() == {"capitals": 2}
+        assert say(pc, v, "quiz me on capitals") and v._productivity.session.mode == "quiz"
+        for _ in range(2):
+            card = v._productivity.session.card
+            assert say(pc, v, f"the answer is {card['a']}")
+        assert "2 of 2" in said[-1] and v._productivity.session is None
+        v.client = FakeClient("Buenos días")
+        assert say(pc, v, "translate good morning to spanish") and v.hologram.show_info_card.called
+        assert "Buenos días" in v.last_reply, f"last_reply={v.last_reply!r}"
+        v.client = None
+        assert say(pc, v, "translate hello to french") and "Groq" in said[-1]
+
+
+for _name, _fn in (("confirm-before-change for files", t_route_confirm_files), ("email never sends without yes", t_route_email_send),
+                   ("notes, skills, calendar confirmation", t_route_notes_skills_calendar), ("study quiz + translation", t_route_study_translate)):
+    check("Productivity voice routing", _name, _fn)
+
+
+def t_hook():
+    v, H, said = make_voice()
+    assert v._handle_local_command("list my skills"), "productivity router not hooked"
+    assert v._handle_local_command("translate hello to french"), "productivity router not hooked into voice_assistant"
+    assert v._handle_local_command("take a note: buy milk"), "existing notes command broke"
+
+
+check("Productivity voice routing", "hooked into VoiceAssistant._handle_local_command (existing commands intact)", t_hook)
+
+
 # ============================================================================ report
 def report():
     shutil.rmtree(tmpdir, ignore_errors=True)
     groups = {}
     for g, n, s, d in RESULTS:
         groups.setdefault(g, []).append((n, s, d))
-    icon = {"PASS": "[ OK ]", "FAIL": "[FAIL]", "SKIP": "[skip]"}
+    icon = {"PASS": "[ OK ]", "FAIL": "[FAIL]", "SKIP": "[skip]", "REQUIRES API": "[ API ]",
+            "REQUIRES PERMISSION": "[PERM]", "REQUIRES HARDWARE": "[ HW ]"}
     print("\n" + "=" * 78 + "\n AURORA SELF-TEST\n" + "=" * 78)
     for g, rows in groups.items():
         p = sum(1 for r in rows if r[1] == "PASS")
@@ -878,9 +1334,10 @@ def report():
         print(f"\n{g}  -  {state}  ({p}/{len(rows)} passed)")
         for n, s, d in rows:
             print(f"  {icon[s]} {n}" + (f"  -> {d}" if d else ""))
-    counts = {k: sum(1 for r in RESULTS if r[2] == k) for k in ("PASS", "FAIL", "SKIP")}
+    counts = {k: sum(1 for r in RESULTS if r[2] == k) for k in icon}
     print("\n" + "=" * 78)
-    print(f" {counts['PASS']} passed, {counts['FAIL']} failed, {counts['SKIP']} skipped of {len(RESULTS)}")
+    print(f" {counts['PASS']} passed, {counts['FAIL']} failed, {counts['SKIP']} skipped, {counts['REQUIRES API']} require API, "
+          f"{counts['REQUIRES PERMISSION']} require permission, {counts['REQUIRES HARDWARE']} require hardware, of {len(RESULTS)}")
     broken = [g for g, rows in groups.items() if any(r[1] == "FAIL" for r in rows)]
     print(" WORKING: " + ", ".join(g for g in groups if g not in broken))
     if broken:
