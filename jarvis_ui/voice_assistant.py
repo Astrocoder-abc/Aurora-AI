@@ -50,7 +50,7 @@ def _optional(name):
         return None
 
 
-sandbox_labs, addons = (_optional(n) for n in ("sandbox_labs", "addons"))
+sandbox_labs, addons, productivity_commands = (_optional(n) for n in ("sandbox_labs", "addons", "productivity_commands"))
 
 WAKE_WORD_CORE, WAKE_FUZZY = "aurora", 0.72
 VISION_RE = re.compile(r"\bwhat (?:can |do )?you see\b|\bwhat am i (?:holding|looking at|wearing)\b|\blook at (?:this|me)\b"
@@ -163,8 +163,8 @@ def _rm(path):
             pass
 
 
-async def _edge_save(text, path):
-    await edge_tts.Communicate(text, voice=EDGE_VOICE).save(path)
+async def _edge_save(text, path, voice=None):
+    await edge_tts.Communicate(text, voice=voice or EDGE_VOICE).save(path)
 
 
 class SpeechEngine:
@@ -183,13 +183,13 @@ class SpeechEngine:
     def busy(self):
         return self._pending > 0
 
-    def say(self, text):
+    def say(self, text, voice=None):
         text = clean_for_speech(text)
         if not text:
             return
         with self._cv:
             self._pending += 1
-        self._text_q.put((self._gen, text))
+        self._text_q.put((self._gen, text, voice))
 
     def _done(self):
         with self._cv:
@@ -221,7 +221,7 @@ class SpeechEngine:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         while True:
-            gen, text = self._text_q.get()
+            gen, text, voice = self._text_q.get()
             try:
                 if gen != self._gen:
                     self._done()
@@ -232,7 +232,7 @@ class SpeechEngine:
                         fd, p = tempfile.mkstemp(suffix=".mp3")
                         os.close(fd)
                         try:
-                            loop.run_until_complete(asyncio.wait_for(_edge_save(text, p), 25))
+                            loop.run_until_complete(asyncio.wait_for(_edge_save(text, p, voice), 25))
                             path = p
                             break
                         except Exception as e:
@@ -654,6 +654,12 @@ class VoiceAssistant:
     # ---- local (no-API) commands --------------------------------------------------------------------
     def _handle_local_command(self, text):
         t = text.lower()
+        try:   # skills, calendar, email, notes, files, study, translation (optional module)
+            from jarvis_ui import aurora_utilities as _utilities
+        except Exception:
+            _utilities = None
+        if _utilities is not None and _utilities.handle_command(self, text):
+            return True
         H, speak, log = self.hologram, self._speak, self._log
         has = lambda *ks: any(k in t for k in ks)
         showing = bool(re.search(r"\b(show|display|draw|load|model|pull up|bring up)\b", t))
@@ -666,6 +672,8 @@ class VoiceAssistant:
             speak(self.last_reply or "I haven't said anything yet.")
             return True
 
+        if productivity_commands and productivity_commands.handle_command(self, text):   # skills, calendar, email, notes, files, study, translation
+            return True
         if self.plus is not None and self.plus.route(text):        # cowork, hub, offline mode, file search
             return True
         if sandbox_labs and sandbox_labs.handle_command(H, t, speak):
