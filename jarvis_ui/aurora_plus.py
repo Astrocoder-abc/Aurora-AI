@@ -65,7 +65,7 @@ SECRETS = re.compile("|".join([
     r"gsk_[A-Za-z0-9]{20,}", r"sk-[A-Za-z0-9_\-]{20,}", r"AKIA[0-9A-Z]{16}", r"ghp_[A-Za-z0-9]{30,}",
     r"-----BEGIN [A-Z ]*PRIVATE KEY", r"\b\d{3}-\d{2}-\d{4}\b", r"\b(?:\d[ -]?){15,16}\b",
     r"\b(?:api[_-]?key|secret|passw(?:or)?d|token)\b\s*[:=]\s*['\"]?[A-Za-z0-9_\-]{16,}",
-    r"api_key\.txt|phone_pin|my_number|contacts\.json|hub_token|\.env\b|id_rsa|\.ssh\b|"
+    r"api_key\.txt|phone_pin|my_number|contacts\.json|hub_token|gmail_token|google_client|\.env\b|id_rsa|\.ssh\b|"
     r"credentials\.(?:json|txt)|cookies\.sqlite|login data",
 ]), re.I)
 
@@ -370,7 +370,7 @@ class Cowork:
 
 INDEX_FILE = os.path.join(BASE, "semantic_index.json")
 SKIP_DIRS = {".git", "node_modules", "venv", ".venv", "__pycache__", "site-packages", "$RECYCLE.BIN"}
-SKIP_FILES = re.compile(r"api_key|phone_pin|my_number|contacts|hub_token|\.env|password|secret|credential|"
+SKIP_FILES = re.compile(r"api_key|phone_pin|my_number|contacts|hub_token|gmail_token|google_client|\.env|password|secret|credential|"
                         r"id_rsa|cookies|login", re.I)
 sc.VAULT_TEXT_EXTS |= {".js", ".ino", ".cpp", ".c", ".html", ".ini", ".yaml", ".yml"}
 
