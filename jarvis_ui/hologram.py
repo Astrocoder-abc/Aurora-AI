@@ -698,6 +698,9 @@ class Hologram:
         self.hud_lines = []
         self.event_log = deque(maxlen=6)
         self._event_log_lock = threading.Lock()
+        self.overlays = []          # callables(theme_color) drawn above the dashboard
+        self.event_listeners = []   # callables(text) notified on every log_event
+        self.quiet_alerts = False   # True while presenting: monitor alerts stay silent
         self._last_time = time.time()
         self._fps = 0.0
         self.should_quit = False
@@ -843,6 +846,11 @@ class Hologram:
     def log_event(self, text):
         with self._event_log_lock:
             self.event_log.appendleft(f"{time.strftime('%H:%M:%S')}  {text}")
+        for fn in self.event_listeners:
+            try:
+                fn(text)
+            except Exception:
+                pass
 
     # ---- docking (make room for a side widget) -----------------------------
 
@@ -3285,6 +3293,8 @@ class Hologram:
         if self.mode == "telemetry":
             self._draw_telemetry_panel(theme_color)
         self._draw_bottom_bar(theme_color)
+        for fn in self.overlays:
+            fn(theme_color)
         self._draw_scanlines()
         self._draw_corner_brackets()
         self._draw_vignette()

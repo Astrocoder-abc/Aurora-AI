@@ -50,7 +50,8 @@ def _optional(name):
         return None
 
 
-sandbox_labs, addons, productivity_commands = (_optional(n) for n in ("sandbox_labs", "addons", "productivity_commands"))
+sandbox_labs, addons, productivity_commands, dashboard_modes, system_monitor = (
+    _optional(n) for n in ("sandbox_labs", "addons", "productivity_commands", "dashboard_modes", "system_monitor"))
 
 WAKE_WORD_CORE, WAKE_FUZZY = "aurora", 0.72
 VISION_RE = re.compile(r"\bwhat (?:can |do )?you see\b|\bwhat am i (?:holding|looking at|wearing)\b|\blook at (?:this|me)\b"
@@ -679,6 +680,10 @@ class VoiceAssistant:
         if sandbox_labs and sandbox_labs.handle_command(H, t, speak):
             return True
         if addons and addons.handle_command(self, t):              # draw mode, panels, sandbox, heart, plots
+            return True
+        if dashboard_modes and dashboard_modes.handle_command(self, text):   # timeline, presentation mode
+            return True
+        if system_monitor and system_monitor.handle_command(self, text):     # emergency monitor, alert explanations
             return True
 
         # notes

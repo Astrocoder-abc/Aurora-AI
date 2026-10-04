@@ -15,7 +15,7 @@ import cv2
 from jarvis_ui.hologram import Hologram
 from jarvis_ui.voice_assistant import VoiceAssistant, NullVoice
 from jarvis_ui.face_id import FaceID
-from jarvis_ui import system_control, addons
+from jarvis_ui import system_control, addons, dashboard_modes, system_monitor
 
 GESTURE_TO_STATE = {"open_palm": "listening", "fist": "speaking"}
 SNAPSHOT_DIR = "snapshots"
@@ -58,6 +58,8 @@ def main():
     drawer = addons.GestureDrawer(hologram, speak=voice.speak_now, on_log=hologram.log_event)
     hologram.drawer, voice.drawer = drawer, drawer
     addons.install(hologram, drawer)
+    dashboard_modes.install(hologram, voice)
+    system_monitor.start(hologram, voice)
 
     last_debug_frame, prev_time, frame_i = None, time.time(), 0
     volume_prev_pitch = None
@@ -78,7 +80,8 @@ def main():
 
             if debug_frame is not None:
                 last_debug_frame = debug_frame
-                voice.latest_frame = debug_frame
+                raw = getattr(tracker, "raw_frame", None)
+                voice.latest_frame = raw if raw is not None else debug_frame
                 frame_i += 1
                 gray = cv2.cvtColor(debug_frame, cv2.COLOR_BGR2GRAY)
                 if frame_i % DETECT_EVERY == 0 or face_id.enrolling:

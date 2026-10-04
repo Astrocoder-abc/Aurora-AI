@@ -96,7 +96,7 @@ for d in REQUIRED + WINDOWS_ONLY + OPTIONAL:
 
 # ============================================================================ modules import
 for m in ["hologram", "hand_tracker", "face_id", "system_control", "telemetry", "brain", "voice_assistant",
-          "addons", "aurora_plus", "sandbox_labs"]:
+          "addons", "aurora_plus", "sandbox_labs", "dashboard_modes", "system_monitor"]:
     check("Modules import", f"jarvis_ui.{m}", (lambda m=m: importlib.import_module(f"jarvis_ui.{m}") and None))
 check("Modules import", "main.py", lambda: importlib.import_module("main") and None)
 
@@ -1316,6 +1316,159 @@ def t_hook():
 
 
 check("Productivity voice routing", "hooked into VoiceAssistant._handle_local_command (existing commands intact)", t_hook)
+
+
+# ============================================================================ dashboard modes + system monitor
+def modes_env():
+    dm = mod("dashboard_modes")
+    v, _, said = make_voice()
+    H = mock.MagicMock(name="HologramForModes")
+    H.overlays, H.event_listeners, H.quiet_alerts = [], [], False
+    H.modes = H.labs = None            # MagicMock auto-creates attributes; install() must see None to build real ones
+    H.mode, H.info_card, H.translate_x = "empty", None, 0.0
+    v.hologram = H
+    v.speak_now = said.append
+    return dm, H, v, said
+
+
+def t_slide_parse():
+    dm = mod("dashboard_modes")
+    s = dm.parse_slides("# A\n- x\n- y\nNotes: hi\nDemo: show me the solar system\n---\n# B")
+    eq(len(s), 2)
+    eq((s[0]["title"], s[0]["bullets"], s[0]["notes"], s[0]["demo"]), ("A", ["x", "y"], "hi", "show me the solar system"))
+
+
+def t_presentation_flow():
+    dm, H, v, said = modes_env()
+    with mock.patch.object(dm, "load_deck", lambda name=None: (dm.SAMPLE_DECK, "test deck")):
+        assert dm.handle_command(v, "presentation mode")
+        m = H.modes
+        assert m.active == "presentation" and H.quiet_alerts is True
+        assert dm.handle_command(v, "next slide") and m.presentation.i == 1
+        H.load_atom.assert_called_with("carbon")                      # slide 2's Demo: line ran
+        assert dm.handle_command(v, "previous slide") and m.presentation.i == 0
+        assert dm.handle_command(v, "last slide") and m.presentation.i == 3
+        assert dm.handle_command(v, "next slide") and "last slide" in said[-1]
+        assert dm.handle_command(v, "show speaker notes") and m.presentation.show_notes
+        assert dm.handle_command(v, "set a timer for 10 minutes") and m.presentation.timer_end
+        assert dm.handle_command(v, "blank screen") and m.presentation.blank
+        assert dm.handle_command(v, "end presentation") and m.active is None and H.quiet_alerts is False
+        assert not dm.handle_command(v, "next slide"), "must not react outside presentation mode"
+
+
+def t_timeline():
+    dm, H, v, said = modes_env()
+    d = tempfile.mkdtemp(dir=tmpdir)
+    with mock.patch.object(dm, "EVENTS_FILE", os.path.join(d, "ev.jsonl")), \
+            mock.patch.object(dm, "_git_commits", lambda limit=40: [(time.time() - 50, "git", "fix bug")]), \
+            mock.patch.object(dm, "_recent_files", lambda limit=40: [(time.time() - 20, "file", "main.py")]):
+        dm.install(H, v)
+        for fn in H.event_listeners:
+            fn("CODE: wrote demo")
+            fn("FACE: recognized sam")                                 # not a recorded category
+        assert dm.handle_command(v, "show my project timeline")
+        eq(sorted(k for _, k, _ in H.modes.timeline.items), ["aurora", "file", "git"])
+        assert H.modes.active == "timeline"
+        assert dm.handle_command(v, "close timeline") and H.modes.active is None
+        assert not dm.handle_command(v, "make a timeline of world war two"), "topic timelines must reach the AI"
+
+
+def monitor(quiet=False):
+    sm = mod("system_monitor")
+    if sm.psutil is None:
+        skip("psutil not installed")
+    H = mock.MagicMock()
+    H.quiet_alerts, H.mode = quiet, "empty"
+    voice = mock.MagicMock()
+    return sm, sm.SystemMonitor(H, voice), H, voice
+
+
+def t_monitor_alert():
+    sm, mon, H, voice = monitor()
+    mon._alert("x", "Disk dropped", "why", 60)
+    mon._alert("x", "again", "why", 60)                                # inside the cooldown
+    eq(len(mon.alerts), 1)
+    voice.speak_now.assert_called_once()
+    H.quiet_alerts = True
+    mon._alert("y", "Net down", "why", 60)
+    eq((len(mon.alerts), voice.speak_now.call_count), (2, 1))          # silent while presenting
+
+
+def t_monitor_disk():
+    sm, mon, H, voice = monitor()
+    usage = lambda free: SimpleNamespace(free=free, total=200 * sm.GB, percent=50)
+    with mock.patch.object(sm.psutil, "disk_usage", side_effect=[usage(100 * sm.GB), usage(90 * sm.GB)]), \
+            mock.patch.object(mon, "_snapshot_io", lambda now: None):
+        mon._check_disk(1000.0)
+        mon._check_disk(1005.0)
+    assert [a["kind"] for a in mon.alerts] == ["disk_drop"], mon.alerts
+
+
+def t_monitor_cpu():
+    sm, mon, H, voice = monitor()
+    with mock.patch.object(sm.psutil, "cpu_percent", return_value=97.0), \
+            mock.patch.object(mon, "_top_cpu", lambda: ("MsMpEng.exe", 60.0)):
+        for i in range(6):
+            mon._check_cpu(float(i))
+    assert mon.alerts and mon.alerts[-1]["kind"] == "cpu" and "Defender" in mon.alerts[-1]["explanation"]
+
+
+def t_monitor_network():
+    sm, mon, H, voice = monitor()
+    states = iter([True, False, False, True])
+    with mock.patch.object(sm.SystemMonitor, "_online", staticmethod(lambda: next(states))), \
+            mock.patch.object(sm.SystemMonitor, "_net_explain", staticmethod(lambda: "adapter down")):
+        for t in (100.0, 110.0, 120.0, 130.0):
+            mon._check_network(t)
+    assert [a["kind"] for a in mon.alerts] == ["network"]
+    assert any("back" in c.args[0] for c in H.log_event.call_args_list), "recovery notice missing"
+
+
+def t_monitor_crash():
+    if os.name != "nt":
+        skip("crash detection reads the Windows event log")
+    sm, mon, H, voice = monitor()
+    fake = lambda text: SimpleNamespace(stdout=text, returncode=0)
+    ev = lambda date: (f"Event[0]\n  Date: {date}\n  Description:\nFaulting application name: notepad.exe, version: 1\n"
+                       "Faulting module name: ntdll.dll, version 2\nException code: 0xc0000005\n")
+    with mock.patch.object(sm.subprocess, "run", side_effect=[fake(ev("2026-10-01T10:00:00Z")), fake(ev("2026-10-01T10:00:00Z")),
+                                                              fake(ev("2026-10-02T11:00:00Z"))]):
+        for t in (1, 2, 3):
+            mon._check_crashes(t)                                      # baseline, unchanged, new crash
+    assert [a["kind"] for a in mon.alerts] == ["crash"]
+    assert "notepad.exe" in mon.alerts[0]["summary"] and "access violation" in mon.alerts[0]["explanation"]
+
+
+def t_monitor_voice():
+    sm = mod("system_monitor")
+    v, H, said = make_voice()
+    assert not sm.handle_command(v, "what happened"), "'what happened' must reach the AI when there are no alerts"
+    assert sm.handle_command(v, "any alerts") and "No alerts" in said[-1]
+    assert sm.handle_command(v, "emergency monitor status") and said
+
+
+def t_modes_hooked():
+    dm = mod("dashboard_modes")
+    hsrc = open(os.path.join(ROOT, "jarvis_ui", "hologram.py"), encoding="utf-8").read()
+    for needle in ("self.overlays = []", "self.event_listeners = []", "fn(theme_color)", "fn(text)"):
+        assert needle in hsrc, f"hologram.py is missing a hook ({needle}): run apply_dashboard_modes_patch.py"
+    v, H, said = make_voice()
+    H.modes = H.labs = None
+    with mock.patch.object(dm, "collect", lambda since=None, limit=300: []):
+        assert v._handle_local_command("show my project timeline"), "dashboard_modes is not hooked into voice_assistant"
+    assert v._handle_local_command("emergency monitor status"), "system_monitor is not hooked into voice_assistant"
+
+
+check("Dashboard modes", "slide file parsing", t_slide_parse)
+check("Dashboard modes", "presentation voice flow (slides, notes, timer, blank, demo, exit)", t_presentation_flow)
+check("Dashboard modes", "project timeline (event recording, sources, close)", t_timeline)
+check("Dashboard modes", "hooks present in hologram.py and voice_assistant.py", t_modes_hooked)
+check("System monitor", "alert cooldown + silent while presenting", t_monitor_alert)
+check("System monitor", "sudden disk-space loss", t_monitor_disk)
+check("System monitor", "unusual CPU usage + explanation", t_monitor_cpu)
+check("System monitor", "network disconnect + recovery", t_monitor_network)
+check("System monitor", "application crash from event log", t_monitor_crash)
+check("System monitor", "voice commands", t_monitor_voice)
 
 
 # ============================================================================ report
