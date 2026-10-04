@@ -1472,6 +1472,51 @@ check("System monitor", "voice commands", t_monitor_voice)
 
 
 # ============================================================================ report
+# ---- Screen understanding + file assistant (added by apply_screen_and_file_features.py)
+def t_file_assistant():
+    fu = util()
+    home = os.path.join(newdir("fa"), "h")
+    for d in ("Documents/School", "Downloads"):
+        os.makedirs(os.path.join(home, d))
+    dl = os.path.join(home, "Downloads")
+    open(os.path.join(dl, "physics_notes.txt"), "w").write("newton physics")
+    open(os.path.join(dl, "cooking.txt"), "w").write("pasta")
+    v, said, pc = pv()
+    with mock.patch.object(fu, "HOME", home):
+        assert say(pc, v, "find documents about physics")
+        eq([os.path.basename(p) for p in v._productivity.found], ["physics_notes.txt"])
+        assert say(pc, v, "rename these files properly") and "yes" in said[-1].lower()
+        assert os.path.exists(os.path.join(dl, "physics_notes.txt")), "renamed BEFORE confirmation"
+        assert say(pc, v, "yes") and os.path.exists(os.path.join(dl, "Physics Notes.txt")), said[-1:]
+        assert say(pc, v, "move these into my school folder") and "yes" in said[-1].lower()
+        assert say(pc, v, "no") and os.path.exists(os.path.join(dl, "Physics Notes.txt")), "moved despite 'no'"
+        assert say(pc, v, "move these into my school folder") and say(pc, v, "yes")
+        assert os.path.exists(os.path.join(home, "Documents", "School", "Physics Notes.txt")), said[-1:]
+        assert say(pc, v, "undo the move") and say(pc, v, "yes")
+        assert os.path.exists(os.path.join(dl, "Physics Notes.txt")), "undo failed"
+        assert not say(pc, v, "find files about budget"), "bare file search must reach the semantic search"
+        assert not say(pc, v, "show me a picture of a cat"), "must not search files for picture requests"
+
+
+def t_screen_understanding():
+    sc, br = sc_mod(), mod("brain")
+    v, H, said = make_voice()
+    v.client = object()
+    with mock.patch.object(sc, "capture_screen", return_value=object()), \
+            mock.patch.object(br, "describe_screen", return_value="Missing colon on line 3.") as d:
+        assert v._handle_local_command("why isn't this code working")
+    assert any("colon" in s for s in said), said
+    assert "why isn't" in d.call_args[0][2]
+    v2, _, said2 = make_voice()
+    assert v2._handle_local_command("what's on my screen") and any("Groq" in s for s in said2)
+    assert not make_voice()[0]._handle_local_command("why is the sky blue"), "general questions must reach the AI"
+    assert "describe_screen" in {t["function"]["name"] for t in br.TOOLS}
+
+
+check("File assistant", "find, rename, move, undo (confirm first, 'no' cancels)", t_file_assistant)
+check("Screen understanding", "routes to vision, needs API, ignores unrelated questions", t_screen_understanding)
+
+
 def report():
     shutil.rmtree(tmpdir, ignore_errors=True)
     groups = {}
