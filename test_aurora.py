@@ -1845,6 +1845,445 @@ check("Gmail OAuth", "real Gmail read", lambda: requires("PERMISSION", "say 'Aur
       if not gm().has("read") else (gm().fetch_unread(1) and None))
 
 
+# ---- Feature modules: visual calculator, adaptive interface, project workspace, operation simulator
+import contextlib
+
+
+def _fdir():
+    return tempfile.mkdtemp(dir=tmpdir)
+
+
+def fake_holo():
+    """Hologram stand-in: real ints/lists where the code does arithmetic or iteration, mocks elsewhere."""
+    H = mock.MagicMock(name="Hologram")
+    H.width, H.height, H.translate_x = 1280, 720, 0.0
+    H.mode, H.info_card, H.quiet_alerts = "empty", None, False
+    H.overlays, H.event_listeners, H.event_log = [], [], []
+    H.modes = H.labs = H.adaptive_interface = H.workspace = None
+    H._wrap_text.side_effect = lambda f, t, w: [t]
+    H._truncate.side_effect = lambda t, n: t
+    H._pill_width.side_effect = lambda t: 8 * len(t) + 28
+    H._materialize_progress.return_value = 1.0
+    return H
+
+
+def stub_voice(H=None, **kw):
+    said = []
+    attrs = dict(hologram=H or fake_holo(), _speak=said.append, _log=lambda m: None, client=None, plus=None,
+                 latest_frame="frame")
+    attrs.update(kw)
+    v = SimpleNamespace(**attrs)
+    return v, said
+
+
+THEME = (0.3, 0.6, 1.0)
+
+# ============================================================================ visual calculator
+G = "Visual calculator"
+
+
+def vc():
+    return mod("visual_calculator")
+
+
+def t_vc_normalize():
+    v = vc()
+    for raw, want in [("2 × 3", "2*3"), ("3x + 2", "3*x+2"), ("4 x 5", "4*5"), ("12,500 + 1", "12500+1"),
+                      ("x^2", "x**2"), ("2 + 2 =", "2+2"), ("2(3+4)", "2*(3+4)")]:
+        eq(v.normalize(raw), want)
+
+
+def t_vc_solve():
+    v = vc()
+    for problem, want in [("12 + 30", "The answer is 42."), ("10 / 4", "The answer is 2.5."),
+                          ("2x + 4 = 10", "x equals 3."), ("x^2 - 5x + 6 = 0", "x equals 2 or x equals 3."),
+                          ("x^2 + 1 = 0", "There is no real solution."), ("x + 1 = x + 2", "There is no real solution."),
+                          ("x + 1 = x + 1", "Every number works."), ("2 + 2 = 4", "That's correct."), ("1 / 0", "That divides by zero.")]:
+        eq(v.solve_text(problem), want)
+    assert v.solve_text("2 + 2 = 5").startswith("That's wrong"), "wrong equation not flagged"
+    assert v.solve_text("x^3 = 8") is None, "cubic should go to the AI"
+    assert v.solve_text("hello") is None
+    assert v.solve_text("9**9**9") is None, "huge exponent must be refused"
+
+
+def t_vc_spoken():
+    v = vc()
+    eq(v.spoken("2+3"), "2 plus 3")
+    eq(v.fmt(3.0), "3")
+    eq(v.fmt(2.5), "2.5")
+
+
+def vc_run(phrase, ocr=None, vision=None, vision_error=False, complete=None, client=None, frame="img"):
+    v = vc()
+    voice, said = stub_voice(client=None)
+    voice.client, voice.latest_frame = client, frame
+    br = mod("brain")
+    with contextlib.ExitStack() as st:
+        st.enter_context(mock.patch.object(v, "ocr_math", return_value=ocr))
+        st.enter_context(mock.patch.object(v.sc, "capture_screen", return_value="screen"))
+        if vision_error:
+            st.enter_context(mock.patch.object(br, "describe_scene", side_effect=RuntimeError("down")))
+        else:
+            st.enter_context(mock.patch.object(br, "describe_scene", return_value=vision))
+        st.enter_context(mock.patch.object(br, "_complete", return_value=complete))
+        handled = v.handle_command(voice, phrase)
+    return handled, said, voice
+
+
+def t_vc_offline_ocr():
+    handled, said, voice = vc_run("solve this problem", ocr="2+3")
+    assert handled
+    eq(said[-1], "I read 2 plus 3. The answer is 5.")
+    assert voice.hologram.show_info_card.called
+    handled, said, _ = vc_run("solve the equation on my screen", ocr="2x+4=10")
+    assert handled and "x equals 3" in said[-1], said
+    handled, said, _ = vc_run("read this equation", ocr=None)
+    assert handled and "couldn't read" in said[-1] and "pytesseract" in said[-1], said
+    handled, said, _ = vc_run("solve this problem", frame=None)
+    assert handled and "can't get an image" in said[-1]
+    assert not vc_run("what time is it")[0], "unrelated phrase must not be handled"
+
+
+def t_vc_online():
+    handled, said, _ = vc_run("solve this problem", vision="x^2-4=0", client=object())
+    assert handled and "x equals -2 or x equals 2" in said[-1], said
+    handled, said, _ = vc_run("solve this problem", vision="x^3=8", complete="x equals 2.", client=object())
+    assert handled and "x equals 2." in said[-1], "hard problem should go to the AI"
+    handled, said, _ = vc_run("solve this problem", vision="NONE", client=object())
+    assert handled and "couldn't read" in said[-1] and "pytesseract" not in said[-1], said
+    handled, said, _ = vc_run("solve this problem", vision_error=True, ocr="7*6", client=object())
+    assert handled and "The answer is 42." in said[-1], "must fall back to local OCR when the AI fails"
+
+
+check(G, "normalize spoken/printed math", t_vc_normalize)
+check(G, "local solver: arithmetic, linear, quadratic, edge cases, safety", t_vc_solve)
+check(G, "spoken formatting", t_vc_spoken)
+check(G, "voice flow offline (OCR), screen source, no frame, unrelated phrase", t_vc_offline_ocr)
+check(G, "voice flow online (vision model, AI fallback, NONE, error -> OCR)", t_vc_online)
+
+# ============================================================================ adaptive interface
+G = "Adaptive interface"
+
+
+def ai_env():
+    ai = mod("adaptive_interface")
+    H = fake_holo()
+    gs = mock.MagicMock()
+    gs.connected = False
+    gs.latest = {"fps": 60, "cpu": 20.0, "ram": 40.0, "temp_c": 55.0, "session": "1m 2s", "foreground": "game.exe",
+                 "recording": "no"}
+    voice, said = stub_voice(H, game_session=gs, active_timers=[{"label": "study session", "ends_at": time.time() + 90}])
+    return ai, H, gs, voice, said
+
+
+def t_ai_switch():
+    ai, H, gs, voice, said = ai_env()
+    for phrase, mode, hidden in [("switch to coding mode", "coding", ("log",)),
+                                 ("Switch Into The Programming Mode", "coding", ("log",)),
+                                 ("switch to studying mode", "studying", ("system", "log", "readout")),
+                                 ("switch over to the gaming mode", "gaming", ("system", "log", "readout")),
+                                 ("switch to normal mode", "standard", ())]:
+        assert ai.handle_command(voice, phrase), phrase
+        eq(H.adaptive_interface.mode, mode)
+        eq(H.hidden_panels, hidden)
+        eq(said[-1], ai.REPLIES[mode])
+    gs.start.assert_called_once()
+    gs.stop.assert_called_once()                       # leaving gaming mode stops the reader it started
+    eq(len(H.overlays), 1)                             # install() is idempotent
+    assert not ai.handle_command(voice, "switch to chemistry mode")
+    assert not ai.handle_command(voice, "switch to coding")
+
+
+def t_ai_gather():
+    ai, H, gs, voice, said = ai_env()
+    ui = ai.install(H, voice)
+    ui.mode, ui._busy = "coding", True
+    run = lambda *a, **k: SimpleNamespace(stdout="main\n")
+    with mock.patch.object(ai.subprocess, "run", run), \
+            mock.patch.object(ai.dashboard_modes, "_recent_files", lambda n: [(time.time(), "file", "main.py")]):
+        ui._gather()
+    eq(ui._info["branch"], "main")
+    eq(ui._info["files"][0][2], "main.py")
+    assert ui._busy is False
+    ui.mode, ui._busy = "studying", True
+    au, sc = mod("aurora_utilities"), mod("system_control")
+    with mock.patch.object(ai.subprocess, "run", run), mock.patch.object(au, "minutes_today", return_value=12), \
+            mock.patch.object(au, "list_decks", return_value={"bio": 3}), mock.patch.object(sc, "read_notes", return_value=["n1"]):
+        ui._gather()
+    eq((ui._info["minutes"], ui._info["decks"], ui._info["notes"]), (12, {"bio": 3}, ["n1"]))
+
+
+def t_ai_draw():
+    ai, H, gs, voice, said = ai_env()
+    ui = ai.install(H, voice)
+    ui._refresh = lambda: None
+    ui._info = {"branch": "main", "dirty": 2, "files": [(time.time(), "file", "a.py")], "minutes": 5,
+                "decks": {"bio": 3}, "notes": ["n1"]}
+    for mode in ("coding", "studying", "gaming"):
+        ui.mode = mode
+        ui.draw(THEME)
+    assert H._draw_panel.called, "nothing was drawn"
+    H._draw_panel.reset_mock()
+    ui.mode = "standard"
+    ui.draw(THEME)
+    assert not H._draw_panel.called, "standard mode must not draw"
+    ui.mode, H.modes = "coding", SimpleNamespace(active="presentation")
+    ui._refresh = lambda: (_ for _ in ()).throw(AssertionError("drew during presentation"))
+    ui.draw(THEME)
+
+
+check(G, "voice: switching modes, hidden panels, game reader start/stop, rejects bad phrases", t_ai_switch)
+check(G, "background data gathering (git, files, study stats)", t_ai_gather)
+check(G, "each mode draws; standard and presentation draw nothing", t_ai_draw)
+
+# ============================================================================ project workspace
+G = "Project workspace"
+
+
+@contextlib.contextmanager
+def ws_env():
+    pw, tel = mod("project_workspace"), mod("telemetry")
+    root = _fdir()
+    with mock.patch.object(pw, "WORKSPACES_DIR", root), mock.patch.object(tel, "EXPERIMENTS_DIR", tel.EXPERIMENTS_DIR):
+        voice, said = stub_voice()
+        try:
+            yield SimpleNamespace(pw=pw, tel=tel, root=root, voice=voice, said=said,
+                                  say=lambda p: pw.handle_command(voice, p))
+        finally:
+            mgr = getattr(voice.hologram, "workspace", None)
+            if mgr is not None:
+                mgr.close()                              # restores telemetry.EXPERIMENTS_DIR
+
+
+def t_ws_data():
+    pw = mod("project_workspace")
+    eq(pw.slug("Mars Project!"), "mars_project")
+    assert "temperature" in pw.words("what was the temperature in my last experiment")
+    assert "what" not in pw.words("what was the temperature")
+    d = _fdir()
+    ws = pw.Workspace(os.path.join(d, "mars"), "Mars")
+    for sub in ("files", "data", "experiments"):
+        assert os.path.isdir(os.path.join(d, "mars", sub)), sub
+    ws.add("tasks", text="order sensors", done=False)
+    assert ws.complete_task(1) and not ws.complete_task(5)
+    ws.add("notes", text="battery drains fast")
+    assert pw.Workspace(os.path.join(d, "mars")).meta["notes"][0]["text"] == "battery drains fast", "not persisted"
+    eq(ws.tab_lines("tasks"), ["1. [x] order sensors"])
+    csv, txt = os.path.join(d, "run1.csv"), os.path.join(d, "thermal.txt")
+    open(csv, "w").write("a,b\n1,2\n")
+    open(txt, "w").write("thermal insulation results look good")
+    assert os.path.dirname(ws.add_file(csv)) == ws.data_dir and os.path.dirname(ws.add_file(txt)) == ws.files_dir
+    assert os.path.basename(ws.add_file(csv)) == "run1 (1).csv", "duplicate import overwrote the file"
+    hits = ws.search("battery")
+    assert hits and "battery" in hits[0][1], hits
+    assert any("thermal" in t.lower() for _, t in ws.search("thermal insulation"))
+    eq(ws.search("zzzz"), [])
+    assert "couldn't find" in ws.ask("zzzz")
+
+
+def t_ws_experiment_answer():
+    pw = mod("project_workspace")
+    ws = pw.Workspace(os.path.join(_fdir(), "p"), "P")
+    log = os.path.join(ws.exp_dir, "exp1")
+    os.makedirs(log)
+    with open(os.path.join(log, "log.jsonl"), "w") as f:
+        for temp in (20.0, 24.5):
+            f.write(json.dumps({"type": "sensor", "data": {"temperature": temp}}) + "\n")
+    ans = ws.ask("what was the temperature in my last experiment")
+    assert "exp1" in ans and "24.5" in ans and "20" in ans and "2 readings" in ans, ans
+
+
+def t_ws_voice():
+    with ws_env() as e:
+        say, said, pw = e.say, e.said, e.pw
+        assert not say("tell me a joke") and not say("add note: x"), "must ignore non-workspace phrases when none is open"
+        assert say("create a workspace for my Mars project") and "Mars project workspace ready" in said[-1]
+        assert os.path.isdir(os.path.join(e.root, "mars", "files"))
+        eq(e.tel.EXPERIMENTS_DIR, os.path.join(e.root, "mars", "experiments"))
+        assert say("add note: battery drains fast") and said[-1] == "Note added."
+        assert say("add task: order sensors") and said[-1] == "Task added."
+        assert say("complete task 1") and said[-1] == "Task completed."
+        assert say("complete task 9") and "don't have" in said[-1]
+        assert say("add link: nasa dot gov") and e.voice.hologram.workspace.ws.meta["links"][0]["url"] == "https://nasa.gov"
+        n = len(said)
+        assert say("show tasks") and len(said) == n, "tab switch should be silent"
+        eq(e.voice.hologram.workspace.tab, "tasks")
+        assert say("search project for battery") and "battery" in said[-1], said[-1]
+        # experiments recorded now land inside the project and are answerable
+        rec = e.tel.ExperimentRecorder()
+        assert rec.start("trial1")[0]
+        rec.log_sensor({"temperature": 21.5})
+        assert say("what was the temperature in my last experiment") and "21.5" in said[-1], said[-1]
+        assert say("list my workspaces") and "mars" in said[-1]
+        assert say("open my Venus workspace") and "don't have a workspace" in said[-1]
+        assert say("open my Mars workspace") and "Opened" in said[-1]
+        e.voice.hologram.workspace.draw(THEME)
+        assert e.voice.hologram._draw_panel.called, "overlay did not draw"
+        assert say("close workspace") and said[-1] == "Workspace closed."
+        assert e.tel.EXPERIMENTS_DIR != os.path.join(e.root, "mars", "experiments"), "experiments dir not restored"
+        assert not say("close workspace") or "No workspace" in said[-1]
+
+
+check(G, "workspace data: folders, persistence, tasks, file import, search", t_ws_data)
+check(G, "'last experiment' sensor answer", t_ws_experiment_answer)
+check(G, "voice flow end to end (create, edit, ask, open, close, overlay draw)", t_ws_voice)
+
+# ============================================================================ operation simulator
+G = "Operation simulator"
+
+
+@contextlib.contextmanager
+def sim_env(files=()):
+    au, sc, sm = mod("aurora_utilities"), mod("system_control"), mod("operation_simulator")
+    home = os.path.join(_fdir(), "h")
+    dl = os.path.join(home, "Downloads")
+    os.makedirs(dl)
+    os.makedirs(os.path.join(home, "Documents", "School"))
+    for f in files:
+        open(os.path.join(dl, f), "w").write("x")
+    with mock.patch.object(au, "HOME", home), mock.patch.object(au, "BASE", _fdir()), \
+            mock.patch.object(sc, "NOTES_FILE", os.path.join(_fdir(), "notes.txt")):
+        said, ran = [], []
+        voice = SimpleNamespace(_speak=said.append, _handle_local_command=lambda op: ran.append(op) or True,
+                                hologram=mock.MagicMock(), client=None, plus=None, _productivity=SimpleNamespace(found=[]))
+
+        def run(phrase):
+            handled = sm.handle_command(voice, phrase)
+            return handled, (said[-1] if said else "")
+        yield SimpleNamespace(au=au, sc=sc, sm=sm, home=home, dl=dl, voice=voice, said=said, ran=ran, run=run)
+
+
+def expect(e, phrase, *frags):
+    handled, msg = e.run(phrase)
+    assert handled, f"'{phrase}' not handled"
+    for f in frags:
+        assert f.lower() in msg.lower(), f"{phrase!r} -> {msg!r} lacks {f!r}"
+    return msg
+
+
+def t_sim_organize_and_go():
+    files = ["report.pdf", "pic.png", "song.mp3"]
+    with sim_env(files) as e:
+        msg = expect(e, "simulate organizing my downloads", "3 loose files", "go ahead")
+        eq(sorted(os.listdir(e.dl)), sorted(files))                 # nothing moved
+        assert e.voice.hologram.show_info_card.called
+        assert e.run("go ahead")[0]
+        eq(e.ran, ["organize my downloads"])
+        assert not e.run("go ahead")[0], "go ahead must only work once"
+    with sim_env() as e:
+        expect(e, "preview organizing my downloads", "nothing to organize")
+    with sim_env(["a.pdf"]) as e:
+        e.run("simulate organizing my downloads")
+        e.voice._simulator.last = (e.voice._simulator.last[0], time.time() - 1000)
+        expect(e, "go ahead", "expired")
+        eq(e.ran, [])
+
+
+def t_sim_files():
+    with sim_env(["report.pdf", "summary.pdf"]) as e:
+        expect(e, "what would happen if I rename report.pdf in downloads to notes.pdf", "renamed to notes.pdf", "Nothing is overwritten")
+        expect(e, "simulate renaming report.pdf in downloads to summary.pdf", "summary (1).pdf", "taken")
+        expect(e, "simulate renaming report.pdf in downloads to a/b", "isn't a valid file name")
+        expect(e, "simulate moving report.pdf in downloads to documents", "would move to Documents")
+        assert not e.run("simulate renaming nothing.pdf in downloads to x.pdf")[0], "unknown file should fall through"
+        eq(sorted(os.listdir(e.dl)), ["report.pdf", "summary.pdf"])   # still untouched
+        open(os.path.join(e.home, "Documents", "todo.txt"), "w").write("x")
+        expect(e, "simulate zipping todo.txt in documents", "todo.txt.zip would be created")
+        assert not os.path.exists(os.path.join(e.home, "Documents", "todo.txt.zip"))
+    with sim_env() as e:
+        with zipfile.ZipFile(os.path.join(e.dl, "archive.zip"), "w") as z:
+            z.writestr("a.txt", "1")
+            z.writestr("b.txt", "2")
+        with zipfile.ZipFile(os.path.join(e.dl, "evil.zip"), "w") as z:
+            z.writestr("../evil.txt", "x")
+        expect(e, "simulate extracting archive.zip in downloads", "folder called archive", "2 entries")
+        expect(e, "simulate extracting evil.zip in downloads", "unsafe paths")
+        assert not os.path.exists(os.path.join(e.dl, "archive"))
+
+
+def t_sim_batches():
+    with sim_env(["physics_notes.txt", "b.txt"]) as e:
+        expect(e, "simulate moving these into my school folder", "tell me which files first")
+        expect(e, "simulate renaming these files properly", "tell me which files first")
+        e.voice._productivity.found = [os.path.join(e.dl, "physics_notes.txt"), os.path.join(e.dl, "b.txt")]
+        expect(e, "simulate moving these into my school folder", "2 files would move into School")
+        expect(e, "simulate moving these into my chemistry folder", "no chemistry folder", "new one in Documents")
+        expect(e, "simulate renaming these files properly", "physics_notes.txt to Physics Notes.txt")
+        assert os.path.exists(os.path.join(e.dl, "physics_notes.txt")), "files changed during simulation"
+
+
+def t_sim_data():
+    with sim_env() as e:
+        expect(e, "simulate deleting all notes", "no notes")
+        e.au.add_quick_note("first note")
+        e.au.add_quick_note("second note")
+        expect(e, "simulate deleting all notes", "All 2 notes", "no undo")
+        expect(e, "simulate deleting note 1", "Note 1 would be deleted", "first note")
+        eq(len(e.au.list_notes()), 2)                                   # nothing was deleted
+        e.au.teach_skill("warmup", ["a", "b"])
+        expect(e, "simulate deleting skill warmup", "warmup", "2 steps")
+        expect(e, "simulate deleting skill nope", "don't have a skill")
+        assert e.au.get_skill("warmup")
+        e.au.add_card("bio", "q", "a")
+        expect(e, "simulate deleting deck bio", "bio", "1 flashcards")
+        expect(e, "simulate deleting deck nope", "don't have that deck")
+        assert e.au.list_decks() == {"bio": 1}
+
+
+def t_sim_system():
+    with sim_env() as e:
+        with mock.patch.object(e.sc, "get_volume_percent", return_value=50):
+            expect(e, "simulate volume to 90", "from 50 to 90", "loud")
+            expect(e, "simulate volume up", "to 60")
+            expect(e, "simulate muting", "to 0")
+        with mock.patch.object(e.sc, "get_volume_percent", return_value=None):
+            expect(e, "simulate volume up", "isn't available")
+        expect(e, "simulate locking my computer", "lock")
+        for result, frag in (((False, ""), "can't see your phone"), ((True, "abc\tdevice"), "USB connection keeps working"),
+                             ((True, "192.168.1.5:5555\tdevice"), "lose the connection")):
+            with mock.patch.object(e.sc, "is_device_connected", return_value=result):
+                expect(e, "simulate turning off wifi on my phone", frag)
+        with mock.patch.object(e.au, "latest_draft", return_value=None):
+            expect(e, "simulate sending the email", "no draft")
+        with mock.patch.object(e.au, "latest_draft", return_value={"to": "a@b.c", "subject": "Hi", "body": "see you friday"}), \
+                mock.patch.object(e.au, "email_configured", return_value=False):
+            expect(e, "simulate sending the email", "a@b.c", "isn't set up")
+
+
+def t_sim_edit_code():
+    with sim_env() as e:
+        path = os.path.join(e.home, "sorter.py")
+        open(path, "w").write("a\n")
+        br = mod("brain")
+        with mock.patch.object(e.sc, "resolve_project_path", return_value=path):
+            expect(e, "simulate editing sorter to add a reverse option", "AI online")
+            e.voice.client = object()
+            with mock.patch.object(br, "edit_code", return_value="a\nb\n"):
+                expect(e, "simulate editing sorter to add a reverse option", "1 line added", ".bak")
+            eq(open(path).read(), "a\n")                                 # file untouched
+        with mock.patch.object(e.sc, "resolve_project_path", return_value=None), \
+                mock.patch.object(e.sc, "find_arduino_sketch", return_value=None):
+            assert not e.run("simulate editing ghost to do x")[0]
+
+
+def t_sim_passthrough():
+    with sim_env(["a.pdf"]) as e:
+        assert not e.run("organize my downloads")[0], "real commands must not be intercepted"
+        assert not e.run("simulate world peace")[0], "unknown simulations must fall through"
+        e.run("simulate organizing my downloads")
+        assert not e.run("what time is it")[0]
+        assert e.voice._simulator.last is None, "unrelated command should clear the pending simulation"
+
+
+check(G, "organize preview, 'go ahead' runs once, expiry, nothing touched", t_sim_organize_and_go)
+check(G, "rename / move / zip / extract previews (clashes, invalid, unsafe zip)", t_sim_files)
+check(G, "batch move / rename of found files", t_sim_batches)
+check(G, "notes, skills, decks previews", t_sim_data)
+check(G, "volume, lock, phone wifi, email previews", t_sim_system)
+check(G, "code-edit preview (needs AI, file untouched)", t_sim_edit_code)
+check(G, "unrelated and real commands fall through", t_sim_passthrough)
+
+
 def report():
     shutil.rmtree(tmpdir, ignore_errors=True)
     groups = {}
