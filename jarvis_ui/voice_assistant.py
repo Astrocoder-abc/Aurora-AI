@@ -57,6 +57,13 @@ WAKE_WORD_CORE, WAKE_FUZZY = "aurora", 0.72
 VISION_RE = re.compile(r"\bwhat (?:can |do )?you see\b|\bwhat am i (?:holding|looking at|wearing)\b|\blook at (?:this|me)\b"
                        r"|\bwhat(?:'s| is) in front of me\b|\bdescribe (?:the |my )?(?:camera|scene|room|view)\b"
                        r"|\b(?:use|check|open) (?:the |my )?(?:webcam|camera view)\b")
+SCREEN_RE = re.compile(
+    r"\b(?:look at|read|check|see|describe|explain|analy[sz]e|scan)\s+(?:my |the |this )?(?:current )?screen\b"
+    r"|\bwhat(?:'s| is| am i looking at)\s+(?:on\s+)?(?:my |the )?screen\b"
+    r"|\bwhy\b.*\b(?:this|my|the)\s+(?:\w+\s+)?(?:code|program|script|app|build|test|error)\b"
+    r"|\bwhat(?:'s| is) (?:wrong|the (?:error|problem|bug|issue))\b.*\b(?:this|here|code|screen)\b"
+    r"|\b(?:debug|fix|explain) (?:this|my) (?:code|error|bug|script|program)\b"
+    r"|\bwhat does this error (?:mean|say)\b")
 API_KEY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "api_key.txt")
 EDGE_VOICE = "en-GB-RyanNeural"
 STOP_WORDS = ("stop", "stop it", "be quiet", "silence", "shut up", "enough")
@@ -525,6 +532,9 @@ class VoiceAssistant:
         if name == "describe_camera":
             self._turn_display = True
             return self._run_local("what do you see")
+        if name == "describe_screen":
+            self._turn_display = True
+            return self._run_local("look at my screen. " + g("question"))
         kind, n, val, tgt = g("kind"), g("name"), g("value"), g("target")
         phrase = None
         if name == "show_display":
@@ -752,6 +762,25 @@ class VoiceAssistant:
         if "experiment report" in t or ("generate" in t and "report" in t and "experiment" in t):
             path, err = self.experiment.generate_report()
             speak(f"Report generated in the {os.path.basename(os.path.dirname(path))} folder." if path else err)
+            return True
+
+        # screen understanding ("why isn't this code working?", "what's on my screen")
+        if SCREEN_RE.search(t):
+            if not self.client:
+                speak("I need the Groq API connected to understand your screen.")
+                return True
+            speak("Let me look at your screen.")
+            frame = sc.capture_screen()
+            if frame is None:
+                speak("I couldn't capture the screen.")
+                return True
+            try:
+                answer = brain.describe_screen(self.client, frame, text)
+                H.show_info_card("Screen: " + text[:80], answer)
+                speak(answer)
+            except Exception as e:
+                log(f"VISION: screen understanding failed ({e})")
+                speak("Sorry, I hit an error looking at your screen.")
             return True
 
         # vision

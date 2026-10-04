@@ -156,6 +156,40 @@ def take_screenshot():
         return False
 
 
+def capture_screen(max_width=1600, hide_aurora=True):
+    """Screenshot as a BGR array (None on failure). Aurora's own fullscreen window is minimised first so the
+    user's real screen is captured, then restored."""
+    hwnd = None
+    if hide_aurora and os.name == "nt":
+        try:
+            import pygame
+            hwnd = pygame.display.get_wm_info().get("window")
+        except Exception:
+            hwnd = None
+    img = None
+    try:
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 6)        # SW_MINIMIZE
+            time.sleep(0.7)
+        from PIL import ImageGrab
+        img = ImageGrab.grab()
+    except Exception:
+        img = None
+    finally:
+        if hwnd:
+            try:
+                ctypes.windll.user32.ShowWindow(hwnd, 9)    # SW_RESTORE
+            except Exception:
+                pass
+    if img is None:
+        return None
+    import cv2
+    import numpy as np
+    if img.width > max_width:
+        img = img.resize((max_width, round(img.height * max_width / img.width)))
+    return cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2BGR)
+
+
 def lock_workstation():
     try:
         ctypes.windll.user32.LockWorkStation()
