@@ -96,7 +96,7 @@ for d in REQUIRED + WINDOWS_ONLY + OPTIONAL:
 
 # ============================================================================ modules import
 for m in ["hologram", "hand_tracker", "face_id", "system_control", "telemetry", "brain", "voice_assistant",
-          "addons", "aurora_plus", "sandbox_labs", "dashboard_modes", "system_monitor"]:
+          "addons", "aurora_plus", "sandbox_labs", "dashboard_modes", "system_monitor", "gmail_client"]:
     check("Modules import", f"jarvis_ui.{m}", (lambda m=m: importlib.import_module(f"jarvis_ui.{m}") and None))
 check("Modules import", "main.py", lambda: importlib.import_module("main") and None)
 
@@ -1020,34 +1020,35 @@ check("Calendar", "live calendar source (ICS URL / file you configured)",
 
 
 # ---- Email
-RAW = (b"From: =?utf-8?q?Ann_Lee?= <ann@example.com>\r\nSubject: Project update\r\nDate: Mon, 1 Oct 2026 09:00:00 +0000\r\n"
-       b"Content-Type: text/plain; charset=utf-8\r\n\r\nThe demo moved to Friday.\r\nPlease confirm.\r\n")
-
-
 def mail_env():
     cal = util()
     d = newdir("mail")
-    json.dump({"imap_host": "imap.test", "smtp_host": "smtp.test", "username": "me@test.com", "contacts": {"ann": "ann@example.com"}},
-              open(os.path.join(d, "email_config.json"), "w"))
+    with open(os.path.join(d, "email_config.json"), "w") as f:
+        json.dump({"contacts": {"ann": "ann@example.com"}}, f)
     return cal, d
+
+
+def no_gmail(d):
+    """Gmail not connected: points gmail_client at a missing token file (your real token is never touched)."""
+    return mock.patch.object(mod("gmail_client"), "TOKEN_FILE", os.path.join(d, "no_token.json"))
+
+
+def mail_token(d, scopes=("read", "send")):
+    g = mod("gmail_client")
+    path = os.path.join(d, "gmail_token.json")
+    with open(path, "w") as f:
+        json.dump({"access_token": "at", "expires_at": time.time() + 3600, "refresh_token": "r",
+                   "scopes": [g.SCOPES[s] for s in scopes]}, f)
+    return mock.patch.object(g, "TOKEN_FILE", path)
 
 
 def t_email_logic():
     cal, d = mail_env()
-    with mock.patch.object(cal, "BASE", d), mock.patch.dict(os.environ, {"AURORA_EMAIL_PASSWORD": "pw"}):
-        assert cal.email_configured()
+    with mock.patch.object(cal, "BASE", d), no_gmail(d):
+        assert not cal.email_configured()
         eq(cal.resolve_recipient("ann"), "ann@example.com")
         eq(cal.resolve_recipient("bob at example dot com"), "bob@example.com")
         eq(cal.resolve_recipient("nobody"), None)
-        box = mock.MagicMock()
-        box.search.return_value = (None, [b"1"])
-        box.fetch.return_value = (None, [(b"1", RAW)])
-        with mock.patch.object(cal.imaplib, "IMAP4_SSL", return_value=box):
-            msgs = cal.fetch_unread(3)
-        eq((msgs[0]["from"], msgs[0]["subject"]), ("Ann Lee", "Project update"))
-        assert "Friday" in msgs[0]["body"]
-        box.select.assert_called_with("INBOX", readonly=True)
-        assert "PEEK" in box.fetch.call_args[0][1], "must not mark mail as read"
         draft = cal.save_draft("ann@example.com", "Hi", "Body")
         eq(cal.latest_draft()["to"], "ann@example.com")
         try:
@@ -1055,22 +1056,23 @@ def t_email_logic():
             raise AssertionError("send without confirmation was allowed")
         except PermissionError:
             pass
-        smtp = mock.MagicMock()
-        with mock.patch.object(cal.smtplib, "SMTP", return_value=smtp):
-            assert cal.send_draft(draft, confirmed=True)
-        smtp.send_message.assert_called_once()
+        for call in (lambda: cal.fetch_unread(), lambda: cal.send_draft(draft, confirmed=True)):
+            try:
+                call()
+                raise AssertionError("mail worked without a Gmail connection")
+            except cal.MailError:
+                pass
         assert cal.discard_draft() and cal.latest_draft() is None
-    with mock.patch.object(cal, "BASE", newdir("nomail")):
-        try:
-            cal.fetch_unread()
-            raise AssertionError("expected MailError")
-        except cal.MailError:
-            pass
 
 
-check("Email", "IMAP read (mocked), drafts, send needs confirmed=True, recipients", t_email_logic)
-check("Email", "real mailbox read", lambda: requires("API", "needs email_config.json + AURORA_EMAIL_PASSWORD")
-      if not util().email_configured() else (util().fetch_unread(1) and None))
+def t_no_password_mail():
+    src = open(util().__file__, encoding="utf-8").read()
+    for word in ("imaplib", "smtplib", "AURORA_EMAIL_PASSWORD", "email_password"):
+        assert word not in src, f"password-based mail code still present: {word}"
+
+
+check("Email", "recipients, drafts, send needs confirmed=True, clear error when Gmail isn't connected", t_email_logic)
+check("Email", "no password-based (IMAP/SMTP) code remains", t_no_password_mail)
 
 
 # ---- Skill builder
@@ -1244,21 +1246,22 @@ def t_route_confirm_files():
 
 def t_route_email_send():
     cal, d = mail_env()
+    g = mod("gmail_client")
     v, said, pc = pv()
-    sent = mock.MagicMock()
-    with mock.patch.object(cal, "BASE", d), mock.patch.dict(os.environ, {"AURORA_EMAIL_PASSWORD": "pw"}), \
-            mock.patch.object(cal.smtplib, "SMTP", return_value=sent), with_complete(None):
+    sent = []
+    with mock.patch.object(cal, "BASE", d), mail_token(d), \
+            mock.patch.object(g, "_api", lambda p, body=None: sent.append(p) or {}), with_complete(None):
         v.client = FakeClient("Subject: Demo\n\nSee you Friday.")
         assert say(pc, v, "draft an email to ann about the demo on friday")
         assert cal.latest_draft()["to"] == "ann@example.com"
-        sent.send_message.assert_not_called()
+        assert not sent
         assert say(pc, v, "send the email") and "about to send" in said[-1]
-        sent.send_message.assert_not_called()
+        assert not sent, "sent before confirmation"
         assert say(pc, v, "no")
-        sent.send_message.assert_not_called()
+        assert not sent, "sent despite 'no'"
         say(pc, v, "send the email")
         say(pc, v, "yes")
-        sent.send_message.assert_called_once()
+        eq(sent, ["messages/send"])
 
 
 def t_route_notes_skills_calendar():
@@ -1515,6 +1518,331 @@ def t_screen_understanding():
 
 check("File assistant", "find, rename, move, undo (confirm first, 'no' cancels)", t_file_assistant)
 check("Screen understanding", "routes to vision, needs API, ignores unrelated questions", t_screen_understanding)
+
+
+# ---- Gmail OAuth (added by install_gmail_oauth.py)
+import base64
+import urllib.parse
+
+
+def gm():
+    return mod("gmail_client")
+
+
+def gm_token(d, scopes=("read",), expires=3600, refresh="r"):
+    """Patches gmail_client.TOKEN_FILE to a temp file holding a token with the given permissions."""
+    g = gm()
+    path = os.path.join(d, "gmail_token.json")
+    with open(path, "w") as f:
+        json.dump({"access_token": "at", "expires_at": time.time() + expires, "refresh_token": refresh,
+                   "scopes": [g.SCOPES[s] for s in scopes]}, f)
+    return mock.patch.object(g, "TOKEN_FILE", path)
+
+
+def t_gmail_permissions():
+    g, d = gm(), newdir("gm")
+    with mock.patch.object(g, "TOKEN_FILE", os.path.join(d, "none.json")):
+        assert not g.connected() and not g.has("read") and not g.has("send")
+    with gm_token(d, ("read",)):
+        assert g.connected() and g.has("read") and not g.has("send")
+        try:
+            g.send({"to": "a@b.c", "body": "x"}, True)
+            raise AssertionError("send allowed without the send permission")
+        except g.GmailError:
+            pass
+    with gm_token(d, ("send",)):
+        try:
+            g.fetch_unread()
+            raise AssertionError("read allowed without the read permission")
+        except g.GmailError:
+            pass
+    with gm_token(d, ("read", "send")):
+        try:
+            g.send({"to": "a@b.c", "body": "x"})
+            raise AssertionError("send without confirmation was allowed")
+        except PermissionError:
+            pass
+
+
+def t_gmail_fetch():
+    g, d = gm(), newdir("gm")
+    data = base64.urlsafe_b64encode(b"The demo moved to Friday.\nPlease confirm.").decode().rstrip("=")
+    msg = {"payload": {"headers": [{"name": "From", "value": "Ann Lee <ann@example.com>"},
+                                   {"name": "Subject", "value": "Project update"}, {"name": "Date", "value": "Mon"}],
+                       "mimeType": "multipart/alternative",
+                       "parts": [{"mimeType": "text/html", "body": {"data": "PGI+"}},
+                                 {"mimeType": "text/plain", "body": {"data": data}}]}}
+    calls = []
+
+    def fake(path, body=None):
+        calls.append((path, body))
+        return {"messages": [{"id": "1"}]} if path.startswith("messages?") else msg
+
+    with gm_token(d), mock.patch.object(g, "_api", fake):
+        out = g.fetch_unread(3)
+    eq((out[0]["from"], out[0]["address"], out[0]["subject"]), ("Ann Lee", "ann@example.com", "Project update"))
+    assert "Friday" in out[0]["body"], out[0]["body"]
+    assert "is%3Aunread" in calls[0][0] and all(c[1] is None for c in calls), "reading must be read-only"
+
+
+def t_gmail_send():
+    g, d = gm(), newdir("gm")
+    sent = []
+    with gm_token(d, ("send",)), mock.patch.object(g, "_api", lambda p, body=None: sent.append((p, body)) or {}):
+        assert g.send({"to": "ann@example.com", "subject": "Hi", "body": "See you Friday."}, True)
+    eq(sent[0][0], "messages/send")
+    raw = base64.urlsafe_b64decode(sent[0][1]["raw"]).decode()
+    assert "To: ann@example.com" in raw and "See you Friday." in raw, raw
+
+
+def t_gmail_refresh():
+    g, d = gm(), newdir("gm")
+    fake_req = lambda url, data=None, headers=None, as_json=False: {"access_token": "new", "expires_in": 3600}
+    with gm_token(d, expires=-100):
+        with mock.patch.object(g, "_client", lambda: ("cid", "sec")), mock.patch.object(g, "_request", fake_req):
+            eq(g._access_token(), "new")
+        with open(g.TOKEN_FILE) as f:
+            eq(json.load(f)["access_token"], "new")
+    with gm_token(d, expires=-100, refresh=None):
+        try:
+            g._access_token()
+            raise AssertionError("expired token without refresh token must ask to reconnect")
+        except g.GmailError:
+            pass
+
+
+def t_gmail_signin():
+    g, d = gm(), newdir("gm")
+    seen = {}
+
+    def run(state_ok):
+        def fake_open(url):
+            q = {k: v[0] for k, v in urllib.parse.parse_qs(urllib.parse.urlparse(url).query).items()}
+            seen.clear()
+            seen.update(q)
+            st = q["state"] if state_ok else "forged"
+
+            def callback():
+                time.sleep(0.2)
+                urllib.request.urlopen(f"{q['redirect_uri']}/?code=abc&state={st}", timeout=5).read()
+            threading.Thread(target=callback, daemon=True).start()
+            return True
+
+        exchange = lambda url, data=None, headers=None, as_json=False: {
+            "access_token": "at", "refresh_token": "rt", "expires_in": 3600, "scope": g.SCOPES["read"]}
+        with mock.patch.object(g, "TOKEN_FILE", os.path.join(d, f"t{state_ok}.json")), \
+                mock.patch.object(g, "_client", lambda: ("cid", "sec")), \
+                mock.patch.object(g.webbrowser, "open", fake_open), mock.patch.object(g, "_request", exchange):
+            g.authorize(["read"], timeout=10)
+            return g._load_token()
+
+    tok = run(True)
+    eq((tok["refresh_token"], tok["scopes"]), ("rt", [g.SCOPES["read"]]))
+    assert seen["code_challenge_method"] == "S256" and g.SCOPES["read"] in seen["scope"]
+    assert seen["redirect_uri"].startswith("http://127.0.0.1:"), seen["redirect_uri"]
+    try:
+        run(False)
+        raise AssertionError("forged state must be rejected")
+    except g.GmailError:
+        pass
+
+
+def t_gmail_disconnect():
+    g, d = gm(), newdir("gm")
+    with gm_token(d), mock.patch.object(g, "_request", lambda *a, **k: {}):
+        assert g.disconnect() and not os.path.exists(g.TOKEN_FILE)
+        assert not g.disconnect()
+
+
+def t_gmail_routing():
+    g, cal, d = gm(), util(), newdir("gm")
+    v, said, pc = pv()
+    calls = []
+    with mock.patch.object(g, "connect_async", lambda perms, done: calls.append(perms) or done(None)):
+        assert say(pc, v, "connect gmail") and calls[-1] == ["read"]
+        assert "connected" in said[-1].lower(), said[-1:]
+        assert say(pc, v, "connect gmail with sending") and calls[-1] == ["read", "send"]
+    with mock.patch.object(g, "disconnect", lambda: True):
+        assert say(pc, v, "disconnect gmail") and "disconnected" in said[-1].lower()
+    sent = []
+    with gm_token(d, ("read", "send")), mock.patch.object(cal, "BASE", newdir("gmm")), \
+            mock.patch.object(g, "_api", lambda p, body=None: sent.append(p) or {}):
+        cal.save_draft("ann@example.com", "Hi", "Body")
+        assert say(pc, v, "send the email") and "about to send" in said[-1], said[-1:]
+        assert not sent, "sent before confirmation"
+        assert say(pc, v, "no") and not sent, "sent despite 'no'"
+        say(pc, v, "send the email")
+        say(pc, v, "yes")
+        eq(sent, ["messages/send"])
+        assert cal.latest_draft() is None
+
+
+check("Gmail OAuth", "permissions: read/send are separate, send needs confirmed=True", t_gmail_permissions)
+check("Gmail OAuth", "read unread mail (mocked API, read-only)", t_gmail_fetch)
+check("Gmail OAuth", "send builds a valid message (mocked API)", t_gmail_send)
+check("Gmail OAuth", "token refresh and reconnect prompt", t_gmail_refresh)
+check("Gmail OAuth", "sign-in flow: PKCE, state check, token saved (no password)", t_gmail_signin)
+check("Gmail OAuth", "disconnect revokes and deletes token", t_gmail_disconnect)
+check("Gmail OAuth", "voice: connect/disconnect, send needs 'yes'", t_gmail_routing)
+check("Gmail OAuth", "real Gmail read", lambda: requires("PERMISSION", "say 'Aurora, connect gmail' first")
+      if not gm().has("read") else (gm().fetch_unread(1) and None))
+
+
+# ---- Gmail OAuth (added by install_gmail_oauth.py)
+import base64
+import urllib.parse
+
+
+def gm():
+    return mod("gmail_client")
+
+
+def gm_token(d, scopes=("read",), expires=3600, refresh="r"):
+    """Patches gmail_client.TOKEN_FILE to a temp file holding a token with the given permissions."""
+    g = gm()
+    path = os.path.join(d, "gmail_token.json")
+    with open(path, "w") as f:
+        json.dump({"access_token": "at", "expires_at": time.time() + expires, "refresh_token": refresh,
+                   "scopes": [g.SCOPES[s] for s in scopes]}, f)
+    return mock.patch.object(g, "TOKEN_FILE", path)
+
+
+def t_gmail_permissions():
+    g, d = gm(), newdir("gm")
+    with mock.patch.object(g, "TOKEN_FILE", os.path.join(d, "none.json")):
+        assert not g.connected() and not g.has("read") and not g.has("send")
+    with gm_token(d, ("read",)):
+        assert g.connected() and g.has("read") and not g.has("send")
+        try:
+            g.send({"to": "a@b.c", "body": "x"}, True)
+            raise AssertionError("send allowed without the send permission")
+        except g.GmailError:
+            pass
+    with gm_token(d, ("send",)):
+        try:
+            g.fetch_unread()
+            raise AssertionError("read allowed without the read permission")
+        except g.GmailError:
+            pass
+    with gm_token(d, ("read", "send")):
+        try:
+            g.send({"to": "a@b.c", "body": "x"})
+            raise AssertionError("send without confirmation was allowed")
+        except PermissionError:
+            pass
+
+
+def t_gmail_fetch():
+    g, d = gm(), newdir("gm")
+    data = base64.urlsafe_b64encode(b"The demo moved to Friday.\nPlease confirm.").decode().rstrip("=")
+    msg = {"payload": {"headers": [{"name": "From", "value": "Ann Lee <ann@example.com>"},
+                                   {"name": "Subject", "value": "Project update"}, {"name": "Date", "value": "Mon"}],
+                       "mimeType": "multipart/alternative",
+                       "parts": [{"mimeType": "text/html", "body": {"data": "PGI+"}},
+                                 {"mimeType": "text/plain", "body": {"data": data}}]}}
+    calls = []
+
+    def fake(path, body=None):
+        calls.append((path, body))
+        return {"messages": [{"id": "1"}]} if path.startswith("messages?") else msg
+
+    with gm_token(d), mock.patch.object(g, "_api", fake):
+        out = g.fetch_unread(3)
+    eq((out[0]["from"], out[0]["address"], out[0]["subject"]), ("Ann Lee", "ann@example.com", "Project update"))
+    assert "Friday" in out[0]["body"], out[0]["body"]
+    assert "is%3Aunread" in calls[0][0] and all(c[1] is None for c in calls), "reading must be read-only"
+
+
+def t_gmail_send():
+    g, d = gm(), newdir("gm")
+    sent = []
+    with gm_token(d, ("send",)), mock.patch.object(g, "_api", lambda p, body=None: sent.append((p, body)) or {}):
+        assert g.send({"to": "ann@example.com", "subject": "Hi", "body": "See you Friday."}, True)
+    eq(sent[0][0], "messages/send")
+    raw = base64.urlsafe_b64decode(sent[0][1]["raw"]).decode()
+    assert "To: ann@example.com" in raw and "See you Friday." in raw, raw
+
+
+def t_gmail_refresh():
+    g, d = gm(), newdir("gm")
+    fake_req = lambda url, data=None, headers=None, as_json=False: {"access_token": "new", "expires_in": 3600}
+    with gm_token(d, expires=-100):
+        with mock.patch.object(g, "_client", lambda: ("cid", "sec")), mock.patch.object(g, "_request", fake_req):
+            eq(g._access_token(), "new")
+        with open(g.TOKEN_FILE) as f:
+            eq(json.load(f)["access_token"], "new")
+    with gm_token(d, expires=-100, refresh=None):
+        try:
+            g._access_token()
+            raise AssertionError("expired token without refresh token must ask to reconnect")
+        except g.GmailError:
+            pass
+
+
+def t_gmail_signin():
+    g, d = gm(), newdir("gm")
+    seen = {}
+
+    def run(state_ok):
+        def fake_open(url):
+            q = {k: v[0] for k, v in urllib.parse.parse_qs(urllib.parse.urlparse(url).query).items()}
+            seen.clear()
+            seen.update(q)
+            st = q["state"] if state_ok else "forged"
+
+            def callback():
+                time.sleep(0.2)
+                urllib.request.urlopen(f"{q['redirect_uri']}/?code=abc&state={st}", timeout=5).read()
+            threading.Thread(target=callback, daemon=True).start()
+            return True
+
+        exchange = lambda url, data=None, headers=None, as_json=False: {
+            "access_token": "at", "refresh_token": "rt", "expires_in": 3600, "scope": g.SCOPES["read"]}
+        with mock.patch.object(g, "TOKEN_FILE", os.path.join(d, f"t{state_ok}.json")), \
+                mock.patch.object(g, "_client", lambda: ("cid", "sec")), \
+                mock.patch.object(g.webbrowser, "open", fake_open), mock.patch.object(g, "_request", exchange):
+            g.authorize(["read"], timeout=10)
+            return g._load_token()
+
+    tok = run(True)
+    eq((tok["refresh_token"], tok["scopes"]), ("rt", [g.SCOPES["read"]]))
+    assert seen["code_challenge_method"] == "S256" and g.SCOPES["read"] in seen["scope"]
+    assert seen["redirect_uri"].startswith("http://127.0.0.1:"), seen["redirect_uri"]
+    try:
+        run(False)
+        raise AssertionError("forged state must be rejected")
+    except g.GmailError:
+        pass
+
+
+def t_gmail_disconnect():
+    g, d = gm(), newdir("gm")
+    with gm_token(d), mock.patch.object(g, "_request", lambda *a, **k: {}):
+        assert g.disconnect() and not os.path.exists(g.TOKEN_FILE)
+        assert not g.disconnect()
+
+
+def t_gmail_routing():
+    g, cal, d = gm(), util(), newdir("gm")
+    v, said, pc = pv()
+    calls = []
+    with mock.patch.object(g, "connect_async", lambda perms, done: calls.append(perms) or done(None)):
+        assert say(pc, v, "connect gmail") and calls[-1] == ["read"]
+        assert "connected" in said[-1].lower(), said[-1:]
+        assert say(pc, v, "connect gmail with sending") and calls[-1] == ["read", "send"]
+    with mock.patch.object(g, "disconnect", lambda: True):
+        assert say(pc, v, "disconnect gmail") and "disconnected" in said[-1].lower()
+
+
+check("Gmail OAuth", "permissions: read/send are separate, send needs confirmed=True", t_gmail_permissions)
+check("Gmail OAuth", "read unread mail (mocked API, read-only)", t_gmail_fetch)
+check("Gmail OAuth", "send builds a valid message (mocked API)", t_gmail_send)
+check("Gmail OAuth", "token refresh and reconnect prompt", t_gmail_refresh)
+check("Gmail OAuth", "sign-in flow: PKCE, state check, token saved (no password)", t_gmail_signin)
+check("Gmail OAuth", "disconnect revokes and deletes token", t_gmail_disconnect)
+check("Gmail OAuth", "voice: connect/disconnect", t_gmail_routing)
+check("Gmail OAuth", "real Gmail read", lambda: requires("PERMISSION", "say 'Aurora, connect gmail' first")
+      if not gm().has("read") else (gm().fetch_unread(1) and None))
 
 
 def report():
