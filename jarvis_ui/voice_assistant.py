@@ -50,8 +50,8 @@ def _optional(name):
         return None
 
 
-sandbox_labs, addons, productivity_commands, dashboard_modes, system_monitor = (
-    _optional(n) for n in ("sandbox_labs", "addons", "productivity_commands", "dashboard_modes", "system_monitor"))
+sandbox_labs, addons, productivity_commands, dashboard_modes, system_monitor, document_generator = (
+    _optional(n) for n in ("sandbox_labs", "addons", "productivity_commands", "dashboard_modes", "system_monitor", "document_generator"))
 
 WAKE_WORD_CORE, WAKE_FUZZY = "aurora", 0.72
 VISION_RE = re.compile(r"\bwhat (?:can |do )?you see\b|\bwhat am i (?:holding|looking at|wearing)\b|\blook at (?:this|me)\b"
@@ -373,6 +373,7 @@ class VoiceAssistant:
             for i, n in enumerate(names):
                 log(f"  [{i}] {n}")
             idx = self._read_number("mic_index.txt", int)
+            self._mic_index = idx
             self.microphone = sr.Microphone(device_index=idx) if idx is not None else sr.Microphone()
             log(f"VOICE: using mic_index.txt override -> [{idx}]" if idx is not None else
                 "VOICE: using system default input (create mic_index.txt if nothing is heard)")
@@ -393,6 +394,10 @@ class VoiceAssistant:
             return cast(v) if v else None
         except Exception:
             return None
+
+    def _open_mic(self):
+        """Fresh Microphone per use: one shared instance breaks when two threads enter/exit it."""
+        return sr.Microphone(device_index=self._mic_index)
 
     def start(self):
         if not self.microphone:                   # an API key is NOT required: local commands work offline
@@ -436,7 +441,7 @@ class VoiceAssistant:
                 continue
             text = ""
             try:
-                with self.microphone as src:
+                with self._open_mic() as src:
                     audio = self.recognizer.listen(src, timeout=1.2, phrase_time_limit=2.5)
                 text = self.recognizer.recognize_google(audio).lower().strip(" .,!?")
             except Exception:
@@ -552,23 +557,28 @@ class VoiceAssistant:
             self._turn_display = True
             d = int(a.get("delta", 1))
             phrase = f"{'add' if d > 0 else 'remove'} {abs(d)} {g('particle', 'proton')}"
+        elif name == "create_document":
+            self._turn_display = True
+            phrase = f"create a {kind} about {g('topic')}"
         elif name == "take_note":
             phrase = f"take a note: {g('text')}"
         elif name == "write_code":
             lang = g("language", "python")
             phrase = f"write {lang if lang in ('python', 'javascript', 'cpp', 'c', 'html', 'arduino') else 'python'} code called {g('name')} that {g('description')}"
+        elif name == "debug_code":
+            phrase = f"debug {n}"
         elif name == "pc_control":
             act = g("action")
             phrase = {"volume_up": "volume up", "volume_down": "volume down", "mute": "mute volume", "set_volume": f"volume to {val}",
                       "play_pause": "play music", "next_track": "next song", "previous_track": "previous song",
                       "screenshot": "take a screenshot", "lock": "lock my computer", "status": "system status",
-                      "open_app": f"open {val}", "open_website": f"open {val}"}.get(act)
+                      "open_app": f"open {val}", "open_website": f"open {val}", "close_app": f"close {val}"}.get(act)
         elif name == "phone_control":
             act = g("action")
             phrase = {"call": "call me" if tgt.lower() == "me" else f"call {tgt}", "whatsapp_call": f"call {tgt} on whatsapp",
                       "whatsapp_video_call": f"video call {tgt} on whatsapp", "open_app": f"open {tgt} on my phone",
                       "web_search": f"google {tgt} on my phone", "wifi_on": "turn on wifi on my phone",
-                      "wifi_off": "turn off wifi on my phone", "unlock": "unlock my phone"}.get(act)
+                      "wifi_off": "turn off wifi on my phone", "unlock": "unlock my phone", "close_app": f"close {tgt} on my phone"}.get(act)
         return self._run_local(phrase) if phrase else "Unsupported request."
 
     # ---- phone commands ---------------------------------------------------------------------
@@ -608,6 +618,14 @@ class VoiceAssistant:
                 on = next(x for x in m.groups() if x) == "on"
                 ok = sc.wifi_set(on)
                 speak(f"Phone wifi turned {'on' if on else 'off'}." if ok else "I couldn't change the phone's wifi.")
+            return True
+        m = re.search(r"(?:close|quit|kill|stop) (.+?) (?:on|in) (?:my |the )?(?:phone|mobile)", t)
+        if m:
+            name = m.group(1).strip()
+            if self._phone_ready():
+                ok = sc.close_phone_app(name)
+                log(f"PHONE: close {name} {'ok' if ok else 'failed'}")
+                speak(f"Closed {name} on your phone." if ok else f"I couldn't close {name} on your phone.")
             return True
         m = re.search(r"(?:open|launch|start) (.+?) (?:on|in) (?:my |the )?(?:phone|mobile)", t)
         if m:
@@ -688,6 +706,8 @@ class VoiceAssistant:
         if self.plus is not None and self.plus.route(text):        # cowork, hub, offline mode, file search
             return True
         if sandbox_labs and sandbox_labs.handle_command(H, t, speak):
+            return True
+        if document_generator and document_generator.handle_command(self, text):   # presentations, documents, spreadsheets
             return True
         if addons and addons.handle_command(self, t):              # draw mode, panels, sandbox, heart, plots
             return True
@@ -986,6 +1006,13 @@ class VoiceAssistant:
 
         # phone (before PC apps, or "open chrome on my phone" would open it on the PC)
         if self._handle_phone_command(t):
+            return True
+
+        app = sc.APP_RE.search(t)
+        if app and re.search(r"\b(close|quit|kill)\b", t):
+            ok = sc.close_app(app.group(1))
+            log(f"APP: {'closed' if ok else 'failed to close'} {app.group(1)}")
+            speak(f"Closed {app.group(1)}" if ok else f"I couldn't close {app.group(1)}. It may not be running.")
             return True
 
         # PC apps
@@ -1302,28 +1329,28 @@ class VoiceAssistant:
             self._log(f"VOICE: energy_threshold.txt override -> {override:.0f}")
         else:
             try:
-                with self._mic_lock, self.microphone as src:
+                with self._mic_lock, self._open_mic() as src:
                     self._log("VOICE: calibrating for ambient noise (2 sec)...")
                     r.adjust_for_ambient_noise(src, duration=2)
                 r.energy_threshold = max(50, min(600, r.energy_threshold))
                 self._log(f"VOICE: calibrated (energy_threshold={r.energy_threshold:.0f})")
             except Exception as e:
-                self._log(f"VOICE: could not calibrate microphone ({e})")
-                return
+                self._log(f"VOICE: could not calibrate microphone ({e}), using default threshold")
+                r.energy_threshold = 300
 
         loops, last_cal = 0, time.time()
         while self._running:
             loops += 1
             if not override and time.time() - last_cal > 120 and not self.speech.busy:
                 try:
-                    with self._mic_lock, self.microphone as src:
+                    with self._mic_lock, self._open_mic() as src:
                         r.adjust_for_ambient_noise(src, duration=1)
                     r.energy_threshold = max(50, min(600, r.energy_threshold))
                 except Exception:
                     pass
                 last_cal = time.time()
             try:
-                with self._mic_lock, self.microphone as src:
+                with self._mic_lock, self._open_mic() as src:
                     audio = r.listen(src, timeout=5, phrase_time_limit=8)
                 text = r.recognize_google(audio)
                 self._log(f"VOICE: picked up audio -> '{text}'")
