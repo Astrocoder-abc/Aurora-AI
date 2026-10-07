@@ -76,12 +76,16 @@ LOCAL_SITES = {"google": "https://google.com", "youtube": "https://youtube.com",
 
 
 def find_wake_word(text):
-    """(True, text_after_wake_word) using fuzzy matching ('arora' etc.)."""
+    """(True, text_after_wake_word) using fuzzy matching ('arora', 'a roar' etc.)."""
     words = text.split()
+    ok = lambda s: s == WAKE_WORD_CORE or difflib.SequenceMatcher(None, s, WAKE_WORD_CORE).ratio() >= WAKE_FUZZY
     for i, w in enumerate(words):
         c = w.strip(",.!?").lower()
-        if c == WAKE_WORD_CORE or difflib.SequenceMatcher(None, c, WAKE_WORD_CORE).ratio() >= WAKE_FUZZY:
-            after, before = " ".join(words[i + 1:]), " ".join(words[:i])
+        n = 1
+        if not ok(c) and i + 1 < len(words):
+            c, n = c + words[i + 1].strip(",.!?").lower(), 2      # split words: "a roar", "or aura"
+        if ok(c):
+            after, before = " ".join(words[i + n:]), " ".join(words[:i])
             return True, (after or before)
     return False, None
 
@@ -301,6 +305,45 @@ class SpeechEngine:
             self._offline.runAndWait()
 
 
+VOSK_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "vosk_model")
+
+
+class OfflineRecognizer:
+    """Offline speech-to-text: Vosk if the model folder exists, else PocketSphinx."""
+
+    def __init__(self, log, recognizer):
+        self.log, self.rec, self._model, self._tried = log, recognizer, None, False
+
+    def _load(self):
+        if not self._tried:
+            self._tried = True
+            try:
+                import vosk
+                vosk.SetLogLevel(-1)
+                if not os.path.isdir(VOSK_DIR):
+                    raise FileNotFoundError("vosk_model/ folder missing")
+                self._model = vosk.Model(VOSK_DIR)
+                self.log("VOICE: offline recognition using Vosk")
+            except Exception as e:
+                self.log(f"VOICE: Vosk unavailable ({e}), falling back to PocketSphinx")
+        return self._model
+
+    def recognize(self, audio):
+        model = self._load()
+        if model:
+            import vosk
+            kr = vosk.KaldiRecognizer(model, 16000)
+            kr.AcceptWaveform(audio.get_raw_data(convert_rate=16000, convert_width=2))
+            text = json.loads(kr.FinalResult()).get("text", "").strip()
+            if text:
+                return text
+            raise sr.UnknownValueError()
+        try:
+            return self.rec.recognize_sphinx(audio)
+        except sr.RequestError:
+            raise sr.UnknownValueError()
+
+
 class NullVoice:
     """Stand-in when the voice assistant can't be constructed, so main.py keeps running."""
     state, enabled, client, microphone, plus = "idle", False, None, None, None
@@ -410,6 +453,23 @@ class VoiceAssistant:
     def stop(self):
         self._running = False
         self.speech.stop()
+
+    def enable_offline_recognition(self, is_online):
+        """Google STT when online, local Vosk/PocketSphinx otherwise."""
+        rec = self.recognizer
+        if rec is None:
+            return
+        google, offline = rec.recognize_google, OfflineRecognizer(self._log, rec)
+        rec.operation_timeout = 6                 # fail fast when the connection is dead
+
+        def hybrid(audio, *a, **k):
+            if is_online():
+                try:
+                    return google(audio, *a, **k)
+                except sr.RequestError:
+                    pass
+            return offline.recognize(audio)
+        rec.recognize_google = hybrid
 
     # ---- speech ---------------------------------------------------------------
     def speak_now(self, text):

@@ -8,31 +8,24 @@ very next utterance is "yes". Inside a skill, actions that need confirmation are
 Config files (next to api_key.txt; none are required, nothing is hard-coded):
   calendar_config.json  {"ics": ["C:/path/cal.ics", "https://.../basic.ics"]}      read-only calendar sources
   calendar_local.json   events Aurora added after you confirmed (created on demand)
-  email_config.json     {"imap_host", "smtp_host", "username", "imap_port", "smtp_port", "contacts": {"bob": "bob@x.com"}}
-  password:             env AURORA_EMAIL_PASSWORD, or one line in email_password.txt (use an app password)
+  email_config.json     {"contacts": {"bob": "bob@x.com"}}  address book only; sign in with "connect gmail"
   skills.json, study_data.json, email_drafts.json, notes.txt   created on demand
 Calendar limits: TZID times are read as local time; repeats support DAILY/WEEKLY(BYDAY)/MONTHLY/YEARLY.
 """
 import difflib
-import email
-import email.utils
-import imaplib
 import json
 import os
 import random
 import re
 import shutil
-import smtplib
-import ssl
 import threading
 import time
 import urllib.request
 import zipfile
 from datetime import datetime, timedelta
-from email.header import decode_header, make_header
-from email.message import EmailMessage
 
 from jarvis_ui import system_control as sc
+from jarvis_ui import gmail_client as gmail
 
 BASE = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
@@ -616,61 +609,20 @@ class MailError(Exception):
 
 
 def email_config():
-    cfg = _json("email_config.json", {})
-    pw = os.environ.get("AURORA_EMAIL_PASSWORD", "")
-    if not pw:
-        try:
-            pw = open(_p("email_password.txt"), encoding="utf-8").read().strip()
-        except OSError:
-            pw = ""
-    cfg["password"] = pw
-    return cfg
+    """Address book only: email_config.json {"contacts": {"bob": "bob@x.com"}}. No passwords are stored or read."""
+    return _json("email_config.json", {})
 
 
 def email_configured():
-    c = email_config()
-    return bool(c.get("username") and c.get("password") and c.get("imap_host"))
-
-
-def _h(value):
-    try:
-        return str(make_header(decode_header(value or "")))
-    except Exception:
-        return value or ""
-
-
-def _body(msg):
-    parts = msg.walk() if msg.is_multipart() else [msg]
-    for part in parts:
-        if part.get_content_type() == "text/plain" and not part.get_filename():
-            payload = part.get_payload(decode=True) or b""
-            return re.sub(r"\s+", " ", payload.decode(part.get_content_charset() or "utf-8", "ignore")).strip()[:4000]
-    return ""
+    return gmail.connected()
 
 
 def fetch_unread(limit=5):
-    """Newest unread messages (BODY.PEEK, so nothing is marked read). -> [{from, address, subject, date, body}]"""
-    c = email_config()
-    if not email_configured():
-        raise MailError("Email isn't set up. Create email_config.json and set AURORA_EMAIL_PASSWORD.")
+    """Newest unread messages via Gmail OAuth (read-only). -> [{from, address, subject, date, body}]"""
     try:
-        box = imaplib.IMAP4_SSL(c["imap_host"], int(c.get("imap_port", 993)), timeout=15)
-        box.login(c["username"], c["password"])
-        box.select("INBOX", readonly=True)
-        _, data = box.search(None, "UNSEEN")
-        out = []
-        for num in data[0].split()[-limit:][::-1]:
-            _, parts = box.fetch(num, "(BODY.PEEK[])")
-            msg = email.message_from_bytes(parts[0][1])
-            name, addr = email.utils.parseaddr(msg.get("From", ""))
-            out.append({"from": _h(name) or addr, "address": addr, "subject": _h(msg.get("Subject")),
-                        "date": msg.get("Date", ""), "body": _body(msg)})
-        box.logout()
-        return out
-    except MailError:
-        raise
-    except Exception as e:
-        raise MailError(f"I couldn't read your mail ({type(e).__name__}).")
+        return gmail.fetch_unread(limit)
+    except gmail.GmailError as e:
+        raise MailError(str(e))
 
 
 def resolve_recipient(spoken):
@@ -702,28 +654,13 @@ def discard_draft():
 
 
 def send_draft(draft, confirmed=False):
-    """Sends via SMTP. Refuses unless the user explicitly confirmed this exact draft."""
+    """Sends via the Gmail API. Refuses unless the user explicitly confirmed this exact draft."""
     if confirmed is not True:
         raise PermissionError("Sending email requires explicit confirmation.")
-    c = email_config()
-    if not (draft and draft.get("to") and draft.get("body") and c.get("username") and c.get("password") and c.get("smtp_host")):
-        raise MailError("The draft or SMTP settings are incomplete.")
-    msg = EmailMessage()
-    msg["From"], msg["To"], msg["Subject"] = c["username"], draft["to"], draft.get("subject") or "(no subject)"
-    msg.set_content(draft["body"])
-    port = int(c.get("smtp_port", 587))
     try:
-        if port == 465:
-            s = smtplib.SMTP_SSL(c["smtp_host"], port, timeout=20, context=ssl.create_default_context())
-        else:
-            s = smtplib.SMTP(c["smtp_host"], port, timeout=20)
-            s.starttls(context=ssl.create_default_context())
-        s.login(c["username"], c["password"])
-        s.send_message(msg)
-        s.quit()
-    except Exception as e:
-        raise MailError(f"Sending failed ({type(e).__name__}).")
-    return True
+        return gmail.send(draft, True)
+    except gmail.GmailError as e:
+        raise MailError(str(e))
 
 
 # ---- AI text helpers (Groq via brain._complete). Email content is treated as data, never as instructions.
@@ -1459,7 +1396,7 @@ class Router:
     # ---- email ------------------------------------------------------------------
     def _need_mail(self):
         if not email_configured():
-            self.say("Email isn't set up. Create email_config.json and set the AURORA_EMAIL_PASSWORD variable.")
+            self.say("Gmail isn't connected. Say connect Gmail.")
             return True
         return False
 
@@ -1470,6 +1407,15 @@ class Router:
         return self.emails[n - 1] if 1 <= n <= len(self.emails) else None
 
     def email(self, o, t):
+        if re.fullmatch(r"disconnect (?:my )?gmail", t):
+            self.say("Gmail disconnected." if gmail.disconnect() else "Gmail isn't connected.")
+            return True
+        m = re.fullmatch(r"(?:connect|link|sign in to) (?:my )?gmail( with sending| and sending)?", t)
+        if m:
+            self.say("Opening Google sign-in in your browser. Approve access there.")
+            gmail.connect_async(["read"] + (["send"] if m.group(1) else []),
+                                lambda err: self.v.speak_now(err or "Gmail connected."))
+            return True
         if re.search(r"\b(?:read|check|show|get)(?: me)?(?: my)?(?: new| unread)? (?:e-?mails?|mail|inbox)\b|\bdo i have (?:any )?(?:new )?(?:e-?mails?|mail)\b|\bany new (?:e-?mails?|mail)\b", t):
             if self._need_mail():
                 return True

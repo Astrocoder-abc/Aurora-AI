@@ -856,22 +856,8 @@ def install(voice, hologram=None):
     # neural TTS only when online; otherwise the local voice
     voice.speech.use_edge = plus.offline.online
 
-    # speech-to-text: Google when online, PocketSphinx when offline (if installed)
-    rec = getattr(voice, "recognizer", None)
-    if rec is not None:
-        google = rec.recognize_google
-
-        def hybrid(audio, *a, **k):
-            if plus.offline.online():
-                try:
-                    return google(audio, *a, **k)
-                except sr.RequestError:
-                    pass
-            try:
-                return rec.recognize_sphinx(audio)
-            except sr.RequestError:
-                raise sr.UnknownValueError()      # sphinx not installed: treat as "nothing heard"
-        rec.recognize_google = hybrid
+    # speech-to-text: Google when online, Vosk / PocketSphinx when offline
+    voice.enable_offline_recognition(plus.offline.online)
 
     voice._on_log("PLUS: Cowork, Network Hub, Offline Mode, File Search ready")
     return plus

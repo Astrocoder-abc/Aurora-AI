@@ -22,6 +22,7 @@ import time
 
 import cv2
 import numpy as np
+from jarvis_ui import system_control as sc
 from OpenGL.GL import (glBegin, glEnd, glVertex2f, glVertex3f, glPushMatrix, glPopMatrix, glScalef,
                        glColor4f, glLineWidth, GL_LINE_LOOP, GL_LINE_STRIP, GL_LINES)
 
@@ -610,7 +611,7 @@ def sandbox_run(name, timeout=RUN_TIMEOUT_SECONDS):
         env["SYSTEMROOT"] = os.environ.get("SYSTEMROOT", "")
     try:
         r = subprocess.run(runner + [path], cwd=SANDBOX_ROOT, env=env, capture_output=True, text=True,
-                           timeout=timeout, shell=False)
+                           timeout=timeout, shell=False, stdin=subprocess.DEVNULL)
         return r.returncode == 0, (r.stdout or "")[:MAX_OUTPUT_CHARS], (r.stderr or "")[:MAX_OUTPUT_CHARS]
     except subprocess.TimeoutExpired:
         return False, "", f"Timed out after {timeout}s (possible infinite loop)"
@@ -651,6 +652,93 @@ def _sandbox_command(voice, speak, t):
         speak(f"Sandbox has {len(files)} file(s): {', '.join(files[:8])}" if files else "Sandbox is empty.")
         return True
     return False
+
+
+# ---- write / debug loop: model writes -> sandbox runs -> model fixes from the traceback
+MAX_FIX_ROUNDS = 3
+_LANG_OF_EXT = {".py": "python", ".js": "javascript"}
+_NOT_NAMES = {"this", "that", "it", "these", "those", "them", "my", "the", "code", "error", "bug", "script", "file", "program"}
+_DEBUG_RE = re.compile(r"(?:debug|fix)\s+(?:my\s+|the\s+)?(?:(?:code|script|file|program)\s+)?(?:called\s+)?([\w\-]+)"
+                       r"(?:\s+(?:code|script|file|program))?$")
+_WRITE_DEBUG_RE = re.compile(r"(?:write|make|build) (?:and (?:test|debug|run) )?(?:(python|javascript|js) )?code "
+                             r"(?:called (.+?) )?that (.+?)(?: and (?:test|debug|fix|run)(?: it| any errors| the errors)?)?$")
+
+
+def _unsafe(text):
+    """Reason string if the text holds secrets or destructive intent (reuses Cowork's guard), else ''."""
+    try:
+        from jarvis_ui.aurora_plus import Guard
+        ok, why = Guard.text_ok(text)
+        return "" if ok else why
+    except Exception:
+        return ""
+
+
+def debug_loop(client, code, goal="", name="debug_run", lang="python", rounds=MAX_FIX_ROUNDS):
+    """Run code in the sandbox; on failure ask the model for a fix using the error. -> (code, ok, out, err, fixes)"""
+    from jarvis_ui import brain
+    for fixes in range(rounds + 1):
+        bad = _unsafe(code)
+        if bad:
+            return code, False, "", f"blocked because {bad}", fixes
+        _, ok, out, err = sandbox_write_and_run(name, code, lang)
+        if ok or fixes == rounds:
+            return code, ok, out, err, fixes
+        code = brain.fix_code(client, code, err, goal, lang)
+
+
+def _debug_command(voice, speak, t):
+    """'write and debug code that ...' / 'debug sorter'. False when the phrase isn't for us."""
+    m = _WRITE_DEBUG_RE.match(t)
+    if m and re.search(r"\band (?:test|debug|run|fix)\b", t):
+        lang = {"js": "javascript"}.get(m.group(1), m.group(1) or "python")
+        name, desc = (m.group(2) or "sandbox_task").strip(), m.group(3).strip()
+        if not voice.client:
+            speak("I need the Groq API connected to write and debug code.")
+            return True
+        speak(f"Writing {name} and testing it in the sandbox.")
+        try:
+            from jarvis_ui import brain
+            code, ok, out, err, fixes = debug_loop(voice.client, brain.generate_code(voice.client, desc, lang), desc, name, lang)
+            voice._log(f"SANDBOX: write+debug '{name}' ok={ok} fixes={fixes}")
+            if ok:
+                path = sc.get_or_make_path(name, lang)
+                sc.write_file_content(path, code)
+                voice._open_code(path, f"Done. {name} runs cleanly after {fixes} fix{'' if fixes == 1 else 'es'}. Opened it")
+            else:
+                speak(f"I couldn't get it working after {fixes} fixes. Last error: {err.strip()[-150:]}")
+        except Exception as e:
+            speak(f"Sandbox error: {e}")
+        return True
+    m = _DEBUG_RE.match(t)
+    if not m or m.group(1) in _NOT_NAMES:
+        return False
+    path = sc.resolve_project_path(m.group(1))
+    if not path:
+        return False                       # unknown file: let "debug this code" reach screen understanding
+    lang = _LANG_OF_EXT.get(os.path.splitext(path)[1].lower())
+    if not lang:
+        speak("I can only run .py and .js files in the sandbox.")
+    elif not voice.client:
+        speak("I need the Groq API connected to debug code.")
+    else:
+        speak(f"Debugging {m.group(1)} in the sandbox.")
+        try:
+            with open(path, encoding="utf-8", errors="ignore") as f:
+                current = f.read()
+            code, ok, out, err, fixes = debug_loop(voice.client, current, "", os.path.basename(path), lang)
+            voice._log(f"SANDBOX: debug '{m.group(1)}' ok={ok} fixes={fixes}")
+            if ok and not fixes:
+                speak("It already runs without errors." + (f" Output: {out.strip()[:120]}" if out.strip() else ""))
+            elif ok:
+                diff = sc.summarize_diff(current, code)
+                sc.write_file_content(path, code)          # keeps a .bak of the original
+                voice._open_code(path, f"Fixed after {fixes} attempt{'' if fixes == 1 else 's'}: {diff}. Backup saved. Opened it")
+            else:
+                speak(f"Still failing after {fixes} fixes, so I left the file alone. Error: {err.strip()[-150:]}")
+        except Exception as e:
+            speak(f"Debug error: {e}")
+    return True
 
 
 # ============================================================================

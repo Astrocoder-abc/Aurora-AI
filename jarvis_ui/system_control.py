@@ -134,6 +134,23 @@ def launch_app(name):
     return False
 
 
+CLOSE_EXES = {"calculator": "CalculatorApp.exe", "calc": "CalculatorApp.exe"}
+NEVER_CLOSE = {"explorer", "file explorer", "cmd", "command prompt", "powershell", "task manager", "control panel"}
+
+
+def close_app(name):
+    """Gracefully closes a PC app (no /F, so unsaved-work prompts still appear)."""
+    key = name.strip().lower()
+    if key in NEVER_CLOSE:
+        return False
+    exe = CLOSE_EXES.get(key) or APP_COMMANDS.get(key, key if key.endswith(".exe") else key + ".exe")
+    try:
+        return subprocess.run(["taskkill", "/IM", exe], capture_output=True, timeout=10,
+                              creationflags=0x08000000).returncode == 0
+    except Exception:
+        return False
+
+
 def get_system_status():
     if not PSUTIL_AVAILABLE:
         return None
@@ -366,12 +383,22 @@ def _packages():
     return [l[8:].strip() for l in out.splitlines() if l.startswith("package:")]
 
 
-def open_app(name):
+def _resolve_pkg(name):
     key = name.lower().strip()
     pkg = APP_PKGS.get(key)
     if not pkg:
         cands = [p for p in _packages() if key.replace(" ", "") in p.lower()]
         pkg = min(cands, key=len) if cands else None
+    return pkg
+
+
+def close_phone_app(name):
+    pkg = _resolve_pkg(name)
+    return bool(pkg) and _shell(f"am force-stop {pkg}")[0]
+
+
+def open_app(name):
+    pkg = _resolve_pkg(name)
     if not pkg:
         return False
     ok, out = _shell(f"monkey -p {pkg} -c android.intent.category.LAUNCHER 1")
