@@ -16,3 +16,7 @@ Pillow>=10.0.0
 pyserial>=3.5
 pypdf>=4.0.0
 pytesseract
+python-pptx
+python-docx
+openpyxl
+vosk>=0.3.45

@@ -2284,6 +2284,123 @@ check(G, "code-edit preview (needs AI, file untouched)", t_sim_edit_code)
 check(G, "unrelated and real commands fall through", t_sim_passthrough)
 
 
+# ---- Document generator (added by apply_document_generator_patch.py)
+G = "Document generator"
+
+
+def dgm():
+    return mod("document_generator")
+
+
+def t_dg_parse():
+    d = dgm()
+    for word, kind in [("presentation", "pptx"), ("slide deck", "pptx"), ("powerpoint", "pptx"), ("report", "docx"),
+                       ("word doc", "docx"), ("spreadsheet", "xlsx"), ("excel sheet", "xlsx")]:
+        eq(d._kind(word), kind)
+    eq(d._REQ.search("make a 5 slide presentation about black holes").groups(), ("5", "presentation", "black holes"))
+    assert not d._REQ.search("start presentation called robotics"), "must not steal presentation mode"
+    assert not d._REQ.search("generate my experiment report"), "must not steal the experiment report"
+
+
+def t_dg_offline_build():
+    d = dgm()
+    with mock.patch.object(d, "OUT_DIR", _fdir()):
+        for kind in ("pptx", "docx", "xlsx"):
+            path, n, ai, err = d.create(kind, "Black Holes!", None, 3)
+            if err and err.startswith("Missing"):
+                skip(err)
+            assert not err and not ai, err
+            assert path.endswith(d.EXT[kind]) and os.path.getsize(path) > 1000, path
+    br = mod("brain")
+    with mock.patch.object(br, "_complete", return_value="not json"), mock.patch.object(d, "OUT_DIR", _fdir()):
+        path, n, ai, err = d.create("docx", "x", object())
+    if err and err.startswith("Missing"):
+        skip(err)
+    assert not err and not ai, "bad AI output must fall back to the skeleton"
+
+
+def t_dg_ai_content():
+    d, br = dgm(), mod("brain")
+    pptx = '{"title":"T","slides":[{"title":"A","bullets":["x","y"],"notes":"n"},{"title":"B","bullets":[],"notes":""}]}'
+    xlsx = '{"title":"Budget","headers":["Item","Cost"],"rows":[["Rent",800],["Food",300],["Total","=SUM(B2:B3)"]]}'
+    docx = '{"title":"Doc","sections":[{"heading":"Intro","paragraphs":["Hello world."],"bullets":["pt"]}]}'
+    with mock.patch.object(d, "OUT_DIR", _fdir()):
+        with mock.patch.object(br, "_complete", return_value="```json\n" + pptx + "\n```"):
+            path, n, ai, err = d.create("pptx", "t", object(), 2)
+        if err and err.startswith("Missing"):
+            skip(err)
+        assert ai and n == 3, (n, ai, err)
+        from pptx import Presentation
+        prs = Presentation(path)
+        eq(len(prs.slides), 3)
+        eq(prs.slides[1].shapes.title.text, "A")
+        eq(prs.slides[1].notes_slide.notes_text_frame.text, "n")
+        with mock.patch.object(br, "_complete", return_value=xlsx):
+            path, n, ai, err = d.create("xlsx", "budget", object())
+        from openpyxl import load_workbook
+        ws = load_workbook(path).active
+        eq((ws["A1"].value, ws["B2"].value, ws["B4"].value), ("Item", 800, "=SUM(B2:B3)"))
+        assert ws["A1"].font.bold, "header not bold"
+        with mock.patch.object(br, "_complete", return_value=docx):
+            path, n, ai, err = d.create("docx", "doc", object())
+        from docx import Document
+        text = " ".join(p.text for p in Document(path).paragraphs)
+        assert "Intro" in text and "Hello world." in text and "pt" in text, text
+
+
+def t_dg_voice():
+    d = dgm()
+    voice, said = stub_voice()
+    with mock.patch.object(d, "OUT_DIR", _fdir()):
+        assert d.handle_command(voice, "create a 2 row spreadsheet for expenses")
+    if "Missing" in said[-1]:
+        skip(said[-1])
+    assert "spreadsheet is ready with 2 rows" in said[-1] and "offline" in said[-1], said
+    assert voice.hologram.show_info_card.called
+    assert not d.handle_command(voice, "start presentation called robotics")
+    assert not d.handle_command(voice, "what time is it")
+
+
+def t_dg_hooked():
+    src = open(os.path.join(ROOT, "jarvis_ui", "voice_assistant.py"), encoding="utf-8").read()
+    assert "document_generator.handle_command" in src, "run apply_document_generator_patch.py"
+    assert "create_document" in {t["function"]["name"] for t in mod("brain").TOOLS}, "AI tool missing"
+    v, H, said = make_voice()
+    with mock.patch.object(dgm(), "OUT_DIR", _fdir()):
+        assert v._handle_local_command("make a presentation about mars"), "not hooked into _handle_local_command"
+        assert "presentation" in v._exec_tool("create_document", {"kind": "presentation", "topic": "mars"}).lower()
+
+
+check(G, "request parsing (and no clash with presentation mode)", t_dg_parse)
+check(G, "builds pptx/docx/xlsx offline; bad AI output falls back", t_dg_offline_build)
+check(G, "AI content -> real slides, notes, formulas, headings (mocked model)", t_dg_ai_content)
+check(G, "voice flow: reply, info card, unrelated phrases fall through", t_dg_voice)
+check(G, "hooked into voice_assistant and the AI tools", t_dg_hooked)
+
+
+def t_dg_live():
+    d = dgm()
+    with mock.patch.object(d, "OUT_DIR", _fdir()):
+        path, n, ai, err = d.create("pptx", "the water cycle", get_client(), 3)
+    if err and err.startswith("Missing"):
+        skip(err)
+    assert ai and n >= 3, (n, ai, err)
+
+
+live("Document generator (real Groq)", t_dg_live)
+
+
+def t_debug_loop():
+    ad, br = mod("addons"), mod("brain")
+    with mock.patch.object(ad, "SANDBOX_ROOT", os.path.join(tmpdir, "dbg")), \
+            mock.patch.object(br, "fix_code", lambda c, code, err, goal="", lang="python": "print(42)\n"):
+        code, ok, out, err, fixes = ad.debug_loop(object(), "print(1/0)\n", "demo", "dbg_demo")
+    assert ok and fixes == 1 and out.strip() == "42", (ok, fixes, err)
+
+
+check("Code sandbox", "debug loop fixes a failing script (mocked model)", t_debug_loop)
+
+
 def report():
     shutil.rmtree(tmpdir, ignore_errors=True)
     groups = {}
