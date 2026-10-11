@@ -700,6 +700,7 @@ class Hologram:
         self._event_log_lock = threading.Lock()
         self.overlays = []          # callables(theme_color) drawn above the dashboard
         self.event_listeners = []   # callables(text) notified on every log_event
+        self.hidden_panels = ()     # adaptive interface hides "system" / "log" / "readout"
         self.quiet_alerts = False   # True while presenting: monitor alerts stay silent
         self._last_time = time.time()
         self._fps = 0.0
@@ -745,11 +746,15 @@ class Hologram:
         except Exception:
             pass  # MSAA unsupported on this GPU/driver — fine, just less smooth
 
-        pygame.display.set_mode((self.width, self.height), flags)
+        try:
+            pygame.display.set_mode((self.width, self.height), flags, vsync=1)
+        except Exception:
+            pygame.display.set_mode((self.width, self.height), flags)
         pygame.display.set_caption("AURORA")
         self._init_gl_state()
 
     def _init_gl_state(self):
+        self._text_cache, self._gl_lists, self._compiling = {}, {}, False
         glClearColor(0.01, 0.02, 0.045, 1.0)
         glEnable(GL_DEPTH_TEST)
         glEnable(GL_LINE_SMOOTH)
@@ -781,6 +786,8 @@ class Hologram:
     def toggle_fullscreen(self):
         self.fullscreen = not self.fullscreen
         self._set_display_mode(self.fullscreen)
+        self.background_texture = None          # GL textures die with the old context
+        self._load_background_image()
 
     def process_events(self):
         """Pump pygame's event queue — MUST be called every frame, or
@@ -1330,12 +1337,35 @@ class Hologram:
 
     # ---- 3D drawing helpers --------------------------------------------------
 
+    def _cached_list(self, key, build):
+        """Compile build() into a GL display list once; return its id."""
+        lid = self._gl_lists.get(key)
+        if lid is None:
+            lid = glGenLists(1)
+            glNewList(lid, GL_COMPILE)
+            self._compiling = True
+            try:
+                build()
+            finally:
+                self._compiling = False
+                glEndList()
+            self._gl_lists[key] = lid
+        return lid
+
     def _draw_ring(self, radius, segments=64):
-        glBegin(GL_LINE_LOOP)
-        for i in range(segments):
-            theta = 2.0 * math.pi * i / segments
-            glVertex3f(radius * math.cos(theta), radius * math.sin(theta), 0.0)
-        glEnd()
+        def build():
+            glBegin(GL_LINE_LOOP)
+            for i in range(segments):
+                theta = 2.0 * math.pi * i / segments
+                glVertex3f(math.cos(theta), math.sin(theta), 0.0)
+            glEnd()
+        if self._compiling:                      # nested inside another display list: draw directly
+            glPushMatrix(); glScalef(radius, radius, 1.0); build(); glPopMatrix()
+            return
+        glPushMatrix()
+        glScalef(radius, radius, 1.0)
+        glCallList(self._cached_list(("ring", segments), build))
+        glPopMatrix()
 
     def _draw_ring_xz(self, radius, segments=64):
         """Horizontal ring (lies flat in the XZ plane)."""
@@ -1534,6 +1564,9 @@ class Hologram:
         glEnd()
 
     def _draw_shape(self, name):
+        glCallList(self._cached_list(("shape", name), lambda: self._draw_shape_immediate(name)))
+
+    def _draw_shape_immediate(self, name):
         if name == "sphere":
             self._draw_wireframe_sphere(1.5)
         elif name == "cube":
@@ -2012,8 +2045,7 @@ class Hologram:
         """Rounded pill-shaped tag for a node label."""
         if not self.font_small:
             return
-        surf = self.font_small.render(text, True, text_color)
-        tw, th = surf.get_size()
+        tw, th = self.font_small.size(text)
         pad_x, pad_y = 10, 5
         w, h = tw + pad_x * 2 + 8, th + pad_y * 2
         r = h / 2
@@ -2482,20 +2514,51 @@ class Hologram:
         cursor = "_" if int(self.elapsed * 2) % 2 == 0 else " "
         self._blit_text(self.font_small, f"[ {label} ]{cursor}", x, y, color=color)
 
+    _TEXT_CACHE_MAX = 700
+
     def _blit_text(self, font, text, x, y, color=(60, 220, 255)):
-        if not font:
+        if not font or not text:
             return 0
         try:
-            surf = font.render(text, True, color)
-            w, h = surf.get_size()
-            data = pygame.image.tostring(surf, "RGBA", True)
-            glRasterPos2f(x, y + h)
-            glDrawPixels(w, h, GL_RGBA, GL_UNSIGNED_BYTE, data)
+            cache = self._text_cache
+            key = (id(font), text, tuple(color))
+            entry = cache.pop(key, None)                      # re-inserted below = most recently used
+            if entry is None:
+                surf = font.render(text, True, color)
+                w, h = surf.get_size()
+                data = pygame.image.tostring(surf, "RGBA", False)
+                tex = glGenTextures(1)
+                glBindTexture(GL_TEXTURE_2D, tex)
+                glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, data)
+                entry = (tex, w, h)
+                while len(cache) >= self._TEXT_CACHE_MAX:
+                    glDeleteTextures([cache.pop(next(iter(cache)))[0]])
+            cache[key] = entry
+            tex, w, h = entry
+            x, y = round(x), round(y)
+            glEnable(GL_TEXTURE_2D)
+            glBindTexture(GL_TEXTURE_2D, tex)
+            glColor4f(1.0, 1.0, 1.0, 1.0)
+            glBegin(GL_QUADS)
+            glTexCoord2f(0, 0); glVertex2f(x, y)
+            glTexCoord2f(1, 0); glVertex2f(x + w, y)
+            glTexCoord2f(1, 1); glVertex2f(x + w, y + h)
+            glTexCoord2f(0, 1); glVertex2f(x, y + h)
+            glEnd()
+            glDisable(GL_TEXTURE_2D)
             return h
         except Exception:
             return 0
 
     def _draw_background_grid(self):
+        glCallList(self._cached_list(("grid", self.width, self.height), self._draw_background_grid_immediate))
+
+    def _draw_background_grid_immediate(self):
         cx, cy = self.width / 2, self.height / 2
         max_dist = math.hypot(cx, cy)
         step = 80
@@ -2574,6 +2637,13 @@ class Hologram:
             self._blit_text(self.font_small, self._truncate(self.shell_summary, 40), 44, 55, color=(140, 190, 220))
 
     def _get_system_stats(self):
+        now = time.time()
+        cached = self.__dict__.get("_stats_cache")
+        if cached is None or now - cached[0] >= 0.5:
+            cached = self._stats_cache = (now, self._read_system_stats())
+        return cached[1]
+
+    def _read_system_stats(self):
         """Real system stats via psutil."""
         if not PSUTIL_AVAILABLE:
             return [("CPU", None), ("MEM", None), ("BATT", None)]
@@ -2860,6 +2930,9 @@ class Hologram:
         glEnd()
 
     def _draw_vignette(self):
+        glCallList(self._cached_list(("vignette", self.width, self.height), self._draw_vignette_immediate))
+
+    def _draw_vignette_immediate(self):
         """Darkens the screen edges/corners."""
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
         w, h = self.width, self.height
@@ -3286,9 +3359,12 @@ class Hologram:
         if self.mode == "constellation":
             self._draw_constellation_labels()
         self._draw_top_bar(theme_color)
-        self._draw_system_panel(theme_color)
-        self._draw_event_log()
-        self._draw_info_panel(theme_color)
+        if "system" not in self.hidden_panels:
+            self._draw_system_panel(theme_color)
+        if "log" not in self.hidden_panels:
+            self._draw_event_log()
+        if "readout" not in self.hidden_panels:
+            self._draw_info_panel(theme_color)
         self._draw_weather_panel(theme_color)
         if self.mode == "telemetry":
             self._draw_telemetry_panel(theme_color)

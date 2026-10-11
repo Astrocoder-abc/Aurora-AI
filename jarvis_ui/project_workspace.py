@@ -303,7 +303,7 @@ class WorkspaceManager:
             self.tab = "data" if os.path.dirname(dest) == ws.data_dir else "files"
             self._show()
             return f"Added {os.path.basename(dest)} to the project."
-        if _QUERY.search(o):
+        if _QUERY.search(o) and not re.search(r"\b(?:timeline|presentation)\b", o, re.I):
             question = re.sub(r"^search (?:the )?project (?:for )?", "", o, flags=re.I)
             plus = getattr(voice, "plus", None)
             client = voice.client if plus is None or plus.offline.online() else None

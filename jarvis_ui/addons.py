@@ -751,6 +751,8 @@ def handle_command(voice, text):
     H, speak = voice.hologram, voice._speak
 
     drawer = getattr(voice, "drawer", None)
+    if _debug_command(voice, speak, t):
+        return True
     if drawer is not None and _draw_command(drawer, speak, t):
         return True
 

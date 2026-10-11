@@ -246,7 +246,7 @@ class GameSessionReader:
 
     def _loop(self):
         while self._running:
-            mins, secs = divmod(int(time.time() - self.session_start), 60)
+            mins, secs = divmod(int(time.time() - (self.session_start or time.time())), 60)
             self.latest = {
                 "session": f"{mins}m {secs}s",
                 "fps": round(self.external_fps) if self.external_fps else "N/A",
@@ -281,8 +281,8 @@ class ExperimentRecorder:
     def start(self, name=None):
         if self.active:
             return False, f"Experiment '{self.name}' is already running."
-        self.name = (re.sub(r"[^a-zA-Z0-9_\- ]", "", name).strip().replace(" ", "_")
-                     if name else time.strftime("experiment_%Y%m%d_%H%M%S"))
+        self.name = (re.sub(r"[^a-zA-Z0-9_\- ]", "", name or "").strip().replace(" ", "_")
+                     or time.strftime("experiment_%Y%m%d_%H%M%S"))
         self.dir = os.path.join(EXPERIMENTS_DIR, self.name)
         os.makedirs(os.path.join(self.dir, "screenshots"), exist_ok=True)
         self.log_path = os.path.join(self.dir, "log.jsonl")

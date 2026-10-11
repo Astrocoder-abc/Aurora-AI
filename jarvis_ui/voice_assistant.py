@@ -50,8 +50,10 @@ def _optional(name):
         return None
 
 
-sandbox_labs, addons, productivity_commands, dashboard_modes, system_monitor, document_generator = (
-    _optional(n) for n in ("sandbox_labs", "addons", "productivity_commands", "dashboard_modes", "system_monitor", "document_generator"))
+(sandbox_labs, addons, dashboard_modes, system_monitor, document_generator, adaptive_interface,
+ visual_calculator, operation_simulator, project_workspace) = (
+    _optional(n) for n in ("sandbox_labs", "addons", "dashboard_modes", "system_monitor", "document_generator",
+                           "adaptive_interface", "visual_calculator", "operation_simulator", "project_workspace"))
 
 WAKE_WORD_CORE, WAKE_FUZZY = "aurora", 0.72
 VISION_RE = re.compile(r"\bwhat (?:can |do )?you see\b|\bwhat am i (?:holding|looking at|wearing)\b|\blook at (?:this|me)\b"
@@ -187,6 +189,7 @@ class SpeechEngine:
         self.use_edge = lambda: True          # aurora_plus swaps in an online check
         self._text_q, self._audio_q = queue.Queue(), queue.Queue(maxsize=4)
         self._gen, self._pending, self._cv = 0, 0, threading.Condition()
+        self.last_end = 0.0               # when speech last finished
         self._offline = None
         threading.Thread(target=self._synth_loop, daemon=True).start()
         threading.Thread(target=self._play_loop, daemon=True).start()
@@ -206,6 +209,7 @@ class SpeechEngine:
     def _done(self):
         with self._cv:
             self._pending = max(0, self._pending - 1)
+            self.last_end = time.time()
             self._cv.notify_all()
 
     def wait(self, timeout=300):
@@ -396,7 +400,7 @@ class VoiceAssistant:
         self.game_session = telemetry.GameSessionReader(on_log=log)
         self.experiment = telemetry.ExperimentRecorder(on_log=log)
         self.active_reader = self.telemetry
-        self._cancel, self._mic_lock = threading.Event(), threading.Lock()
+        self._cancel = threading.Event()
         self._capture, self._capture_tid, self._turn_display = None, None, False
 
         self.speech = SpeechEngine(log)
@@ -447,8 +451,8 @@ class VoiceAssistant:
         if not self.microphone:                   # an API key is NOT required: local commands work offline
             return
         self.enabled = self._running = True
-        threading.Thread(target=self._run_loop, daemon=True).start()
-        threading.Thread(target=self._watch_loop, daemon=True).start()
+        self._start_listening()
+        pass
         self._log("VOICE: listening for wake word 'Aurora'" + ("" if self.client else " (no AI key - local commands only)"))
 
     def stop(self):
@@ -494,25 +498,6 @@ class VoiceAssistant:
     def _interrupt(self):
         self._cancel.set()
         self.speech.stop()
-
-    def _watch_loop(self):
-        """While Aurora speaks, listen for a bare 'stop'. Serialised with the main loop via _mic_lock."""
-        while self._running:
-            if not self.speech.busy or not self._mic_lock.acquire(timeout=0.2):
-                time.sleep(0.1)
-                continue
-            text = ""
-            try:
-                with self._open_mic() as src:
-                    audio = self.recognizer.listen(src, timeout=1.2, phrase_time_limit=2.5)
-                text = self.recognizer.recognize_google(audio).lower().strip(" .,!?")
-            except Exception:
-                pass
-            finally:
-                self._mic_lock.release()
-            if text and STOP_RE.fullmatch(text):
-                self._log("VOICE: stop heard, interrupting speech")
-                self._interrupt()
 
     # ---- timers -------------------------------------------------------------------
     def _start_timer(self, seconds, label):
@@ -763,7 +748,9 @@ class VoiceAssistant:
             speak(self.last_reply or "I haven't said anything yet.")
             return True
 
-        if productivity_commands and productivity_commands.handle_command(self, text):   # skills, calendar, email, notes, files, study, translation
+        if any(f and f.handle_command(self, text) for f in
+               (operation_simulator, project_workspace, adaptive_interface, visual_calculator)):
+            #   # skills, calendar, email, notes, files, study, translation
             return True
         if self.plus is not None and self.plus.route(text):        # cowork, hub, offline mode, file search
             return True
@@ -828,7 +815,7 @@ class VoiceAssistant:
             ok, info = self.experiment.start(m.group(1))
             speak(f"Experiment '{info}' started. Say 'log observation' to record notes." if ok else info)
             return True
-        if "stop experiment" in t or ("end" in t and "experiment" in t):
+        if "stop experiment" in t or re.search(r"\bend\b.*\bexperiment\b", t):
             ok, info = self.experiment.stop()
             speak(f"Experiment '{info}' stopped." if ok else info)
             return True
@@ -1380,44 +1367,90 @@ class VoiceAssistant:
                 "humidity": cur.get("relative_humidity_2m"), "wind_kph": cur.get("wind_speed_10m"),
                 "updated_at": time.strftime("%H:%M")}
 
-    # ---- main listen loop ---------------------------------------------------------------------------
-    def _run_loop(self):
+    # ---- continuous microphone ---------------------------------------------------------------------------
+    # One listener thread keeps a single mic stream open and never stops capturing. Phrases are recognised and handled
+    # on worker threads, so nothing is missed while Aurora thinks, runs a command or speaks.
+    def _start_listening(self):
+        self._audio_q, self._stop_q, self._stt_lock = queue.Queue(maxsize=8), queue.Queue(maxsize=4), threading.Lock()
+        for target in (self._listen_loop, self._command_loop, self._stop_loop):
+            threading.Thread(target=target, daemon=True).start()
+
+    def _calibrate(self, src, override, seconds):
+        r = self.recognizer
+        if override:
+            r.energy_threshold = override
+            return
+        try:
+            r.adjust_for_ambient_noise(src, duration=seconds)
+            r.energy_threshold = max(50, min(600, r.energy_threshold))
+        except Exception as e:
+            self._log(f"VOICE: could not calibrate microphone ({e}), using default threshold")
+            r.energy_threshold = 300
+
+    def _listen_loop(self):
         r = self.recognizer
         r.dynamic_energy_threshold = False       # dynamic mode learns Aurora's own voice as "noise"
         r.pause_threshold, r.non_speaking_duration, r.phrase_threshold = 0.9, 0.4, 0.3
         override = self._read_number("energy_threshold.txt", float)
-        if override:
-            r.energy_threshold = override
-            self._log(f"VOICE: energy_threshold.txt override -> {override:.0f}")
-        else:
-            try:
-                with self._mic_lock, self._open_mic() as src:
-                    self._log("VOICE: calibrating for ambient noise (2 sec)...")
-                    r.adjust_for_ambient_noise(src, duration=2)
-                r.energy_threshold = max(50, min(600, r.energy_threshold))
-                self._log(f"VOICE: calibrated (energy_threshold={r.energy_threshold:.0f})")
-            except Exception as e:
-                self._log(f"VOICE: could not calibrate microphone ({e}), using default threshold")
-                r.energy_threshold = 300
-
-        loops, last_cal = 0, time.time()
         while self._running:
-            loops += 1
-            if not override and time.time() - last_cal > 120 and not self.speech.busy:
-                try:
-                    with self._mic_lock, self._open_mic() as src:
-                        r.adjust_for_ambient_noise(src, duration=1)
-                    r.energy_threshold = max(50, min(600, r.energy_threshold))
-                except Exception:
-                    pass
-                last_cal = time.time()
             try:
-                with self._mic_lock, self._open_mic() as src:
-                    audio = r.listen(src, timeout=5, phrase_time_limit=8)
-                text = r.recognize_google(audio)
-                self._log(f"VOICE: picked up audio -> '{text}'")
-            except sr.WaitTimeoutError:
+                with self._open_mic() as src:
+                    self._log("VOICE: calibrating for ambient noise (2 sec)...")
+                    self._calibrate(src, override, 2)
+                    self._log(f"VOICE: microphone stays on (energy_threshold={r.energy_threshold:.0f})")
+                    last_cal = time.time()
+                    while self._running:
+                        if not override and time.time() - last_cal > 120 and not self.speech.busy and self._state == "idle":
+                            self._calibrate(src, override, 1)
+                            last_cal = time.time()
+                        t0 = time.time()
+                        try:
+                            audio = r.listen(src, timeout=2, phrase_time_limit=8)
+                        except sr.WaitTimeoutError:
+                            continue
+                        # anything captured while Aurora was (or had just been) speaking can only be a "stop"
+                        spoke = self.speech.busy or self.speech.last_end > t0 - 0.4
+                        q = self._stop_q if spoke else self._audio_q
+                        try:
+                            q.put_nowait((time.time(), audio))
+                        except queue.Full:
+                            pass
+            except Exception as e:
+                self._log(f"VOICE ERROR: microphone stream lost ({e}), reopening")
+                time.sleep(1)
+
+    def _transcribe(self, audio):
+        with self._stt_lock:
+            return self.recognizer.recognize_google(audio)
+
+    def _stop_loop(self):
+        while self._running:
+            try:
+                ts, audio = self._stop_q.get(timeout=0.5)
+            except queue.Empty:
                 continue
+            if time.time() - ts > 5:
+                continue
+            try:
+                text = self._transcribe(audio).lower().strip(" .,!?")
+            except Exception:
+                continue
+            if STOP_RE.fullmatch(text):
+                self._log("VOICE: stop heard, interrupting speech")
+                self._interrupt()
+
+    def _command_loop(self):
+        loops = 0
+        while self._running:
+            try:
+                ts, audio = self._audio_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if time.time() - ts > 20:                # stale: captured while a long command was running
+                continue
+            loops += 1
+            try:
+                text = self._transcribe(audio)
             except sr.UnknownValueError:
                 if loops % 5 == 0:
                     self._log("VOICE: heard audio but couldn't transcribe it")
@@ -1426,22 +1459,25 @@ class VoiceAssistant:
                 self._log(f"VOICE ERROR: {e}")
                 time.sleep(1)
                 continue
+            self._log(f"VOICE: picked up audio -> '{text}'")
+            self._handle_utterance(text)
 
-            found, command = find_wake_word(text)
-            if not found:
-                continue
-            command = command.strip(" ,.")
-            if not command:
-                self._speak("Yes?")
-                continue
-            self._state, self.last_heard = "listening", command
-            self._log(f"HEARD: {command}")
-            try:
-                if not self._handle_local_command(command):
-                    self._ask(command)
-            except Exception as e:
-                import traceback
-                self._log(f"VOICE: command crashed ({type(e).__name__}: {e})")
-                traceback.print_exc()
-            finally:
-                self._state = "idle"
+    def _handle_utterance(self, text):
+        found, command = find_wake_word(text)
+        if not found:
+            return
+        command = command.strip(" ,.")
+        if not command:
+            self._speak("Yes?")
+            return
+        self._state, self.last_heard = "listening", command
+        self._log(f"HEARD: {command}")
+        try:
+            if not self._handle_local_command(command):
+                self._ask(command)
+        except Exception as e:
+            import traceback
+            self._log(f"VOICE: command crashed ({type(e).__name__}: {e})")
+            traceback.print_exc()
+        finally:
+            self._state = "idle"
