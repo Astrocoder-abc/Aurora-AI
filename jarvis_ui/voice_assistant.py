@@ -305,36 +305,37 @@ class SpeechEngine:
             self._offline.runAndWait()
 
 
-VOSK_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "vosk_model")
+WHISPER_MODEL = "small"
 
 
 class OfflineRecognizer:
-    """Offline speech-to-text: Vosk if the model folder exists, else PocketSphinx."""
+    """Offline speech-to-text: Whisper small (faster-whisper) if available, else PocketSphinx."""
 
     def __init__(self, log, recognizer):
         self.log, self.rec, self._model, self._tried = log, recognizer, None, False
+        self._lock = threading.Lock()
 
     def _load(self):
-        if not self._tried:
-            self._tried = True
-            try:
-                import vosk
-                vosk.SetLogLevel(-1)
-                if not os.path.isdir(VOSK_DIR):
-                    raise FileNotFoundError("vosk_model/ folder missing")
-                self._model = vosk.Model(VOSK_DIR)
-                self.log("VOICE: offline recognition using Vosk")
-            except Exception as e:
-                self.log(f"VOICE: Vosk unavailable ({e}), falling back to PocketSphinx")
-        return self._model
+        with self._lock:
+            if not self._tried:
+                self._tried = True
+                try:
+                    from faster_whisper import WhisperModel
+                    self._model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+                    self.log(f"VOICE: offline recognition using Whisper {WHISPER_MODEL}")
+                except Exception as e:
+                    self.log(f"VOICE: Whisper unavailable ({e}), falling back to PocketSphinx")
+            return self._model
 
     def recognize(self, audio):
         model = self._load()
         if model:
-            import vosk
-            kr = vosk.KaldiRecognizer(model, 16000)
-            kr.AcceptWaveform(audio.get_raw_data(convert_rate=16000, convert_width=2))
-            text = json.loads(kr.FinalResult()).get("text", "").strip()
+            import numpy as np
+            raw = audio.get_raw_data(convert_rate=16000, convert_width=2)
+            pcm = np.frombuffer(raw, np.int16).astype(np.float32) / 32768.0
+            segments, _ = model.transcribe(pcm, language="en", beam_size=1, vad_filter=True,
+                                           condition_on_previous_text=False, initial_prompt="Aurora.")
+            text = " ".join(s.text.strip() for s in segments).strip()
             if text:
                 return text
             raise sr.UnknownValueError()
@@ -460,6 +461,7 @@ class VoiceAssistant:
         if rec is None:
             return
         google, offline = rec.recognize_google, OfflineRecognizer(self._log, rec)
+        threading.Thread(target=offline._load, daemon=True).start()   # load/download Whisper while online
         rec.operation_timeout = 6                 # fail fast when the connection is dead
 
         def hybrid(audio, *a, **k):

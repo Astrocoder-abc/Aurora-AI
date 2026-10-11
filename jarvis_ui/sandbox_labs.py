@@ -87,6 +87,12 @@ _VEL = (r"(\d+(?:\.\d+)?)\s*(?:m/s|m per s(?:ec(?:ond)?)?|meters? per second|met
 _VERB = r"\b(?:create|make|launch|fire|shoot|throw|kick|simulate|add|build|drop|start)\b"
 
 
+WORLD_W, WORLD_H = 16.0, 10.0   # rigid-body world size in meters
+_REF = r"(\d+|one|two|three|four|five|six|seven|eight|nine|ten)"
+_BODY = r"(?:ball|body|object|mass|weight)"
+_WORLD_KW = re.compile(r"\bkg\b|kilogram|\bbodies\b|\bnewtons?\b|physics (?:world|playground)|\bgravity\b")
+
+
 def _physics_kind(t):
     if not re.search(_VERB, t):
         return None
@@ -182,11 +188,91 @@ class Physics:
                 s["trail"].append((s["L"] * math.sin(s["th"]), s["L"] * math.cos(s["th"])))
                 if len(s["trail"]) > 120:
                     s["trail"].pop(0)
+            elif k == "world":
+                self._step_world(s, dt)
             else:
                 for _ in range(8):
                     ds = dt / 8
                     s["v"] += (-s["k"] * s["x"] - 0.15 * s["v"]) / s["m"] * ds
                     s["x"] += s["v"] * ds
+
+
+    # ---- rigid-body world: circles with mass (kg), gravity, floor/walls, impulse collisions, pushes in newtons ----
+    def world(self):
+        if not (self.sims and self.sims[0]["kind"] == "world"):
+            self.sims = [{"kind": "world", "g": 9.81, "body": "earth", "e": 0.6, "bodies": [], "next": 1,
+                          "sel": None, "hit": "", "hit_t": -9.0, "clock": 0.0}]
+        return self.sims[0]
+
+    @staticmethod
+    def body(w, ref):
+        return next((b for b in w["bodies"] if b["id"] == ref), None)
+
+    def add_body(self, w, m=1.0, x=None, y=None):
+        n = w["next"]
+        w["next"] += 1
+        r = 0.3 * m ** (1 / 3)
+        x = 2 + (n * 3.7) % (WORLD_W - 4) if x is None else x
+        y = WORLD_H - 1.5 if y is None else y
+        b = {"id": n, "m": m, "r": r, "x": min(max(x, r), WORLD_W - r), "y": min(max(y, r), WORLD_H - r),
+             "vx": 0.0, "vy": 0.0, "f": (0.0, 0.0), "ft": 0.0, "col": PALETTE[(n - 1) % len(PALETTE)]}
+        w["bodies"] = (w["bodies"] + [b])[-12:]
+        w["sel"] = n
+        return b
+
+    @staticmethod
+    def push(b, newtons, dx, dy, dur=0.5):
+        if not (dx or dy):
+            dx = 1.0
+        d = math.hypot(dx, dy)
+        b["f"], b["ft"] = (newtons * dx / d, newtons * dy / d), dur
+
+    def _step_world(self, w, dt):
+        n, bs, g, e = 8, w["bodies"], w["g"], w["e"]
+        h = dt / n
+        w["clock"] += dt
+        for _ in range(n):
+            for b in bs:
+                ax = ay = 0.0
+                if b["ft"] > 0:                      # F = m a while a push is active
+                    ax, ay = b["f"][0] / b["m"], b["f"][1] / b["m"]
+                    b["ft"] -= h
+                b["vx"] += ax * h
+                b["vy"] += (ay - g) * h
+                b["x"] += b["vx"] * h
+                b["y"] += b["vy"] * h
+                r = b["r"]
+                if b["y"] < r:
+                    b["y"] = r
+                    b["vy"] = -e * b["vy"] if b["vy"] < -0.5 else 0.0
+                if b["y"] <= r + 1e-6:
+                    b["vx"] *= 1 - 0.6 * h           # floor friction
+                if b["y"] > WORLD_H - r:
+                    b["y"], b["vy"] = WORLD_H - r, -e * abs(b["vy"])
+                if b["x"] < r:
+                    b["x"], b["vx"] = r, e * abs(b["vx"])
+                elif b["x"] > WORLD_W - r:
+                    b["x"], b["vx"] = WORLD_W - r, -e * abs(b["vx"])
+            for i in range(len(bs)):
+                for j in range(i + 1, len(bs)):
+                    a, c = bs[i], bs[j]
+                    dx, dy = c["x"] - a["x"], c["y"] - a["y"]
+                    d, rr = math.hypot(dx, dy), a["r"] + c["r"]
+                    if d >= rr:
+                        continue
+                    if d < 1e-9:
+                        dx, dy, d = 1e-6, 0.0, 1e-6
+                    nx, ny, ia, ic = dx / d, dy / d, 1 / a["m"], 1 / c["m"]
+                    fix = (rr - d) / (ia + ic) * 0.8
+                    a["x"] -= nx * fix * ia; a["y"] -= ny * fix * ia
+                    c["x"] += nx * fix * ic; c["y"] += ny * fix * ic
+                    vn = (c["vx"] - a["vx"]) * nx + (c["vy"] - a["vy"]) * ny
+                    if vn < 0:
+                        imp = -(1 + e) * vn / (ia + ic)          # impulse in newton-seconds
+                        a["vx"] -= imp * nx * ia; a["vy"] -= imp * ny * ia
+                        c["vx"] += imp * nx * ic; c["vy"] += imp * ny * ic
+                        if imp > 0.5:
+                            w["hit"], w["hit_t"] = f"ball {a['id']} hit ball {c['id']}: {imp:.1f} N*s impulse", w["clock"]
 
 
 # ============================================================================
@@ -627,10 +713,63 @@ class Labs:
                     x + 18, y + 50)
             self._t('Also: "drop a ball from 15 meters on the moon"   |   "create a spring with constant 40"',
                     x + 18, y + 70)
+            self._t('Also: "physics world" then "add a 5 kg ball", "push ball 1 into ball 2 with 100 newtons"', x + 18, y + 90)
             return
         ph.step(self.dt)
         kind = ph.sims[0]["kind"]
-        {"proj": self._phys_proj, "pendulum": self._phys_pend, "spring": self._phys_spring}[kind](x, y, w, hh)
+        {"proj": self._phys_proj, "pendulum": self._phys_pend, "spring": self._phys_spring,
+         "world": self._phys_world}[kind](x, y, w, hh)
+
+    def _phys_world(self, x, y, w, hh):
+        ph, s = self.phys, self.phys.sims[0]
+        S = min((w - 60) / WORLD_W, (hh - 130) / WORLD_H)
+        x0, y0 = x + (w - WORLD_W * S) / 2, y + hh - 55
+        if self.inside:
+            px, py = (self.mx - x0) / S, (y0 - self.my) / S
+            sel = ph.body(s, s["sel"])
+            if self.edge_l:
+                hit = next((b for b in reversed(s["bodies"]) if math.hypot(px - b["x"], py - b["y"]) <= b["r"]), None)
+                if hit:
+                    s["sel"] = hit["id"]
+                elif 0 <= px <= WORLD_W and 0 <= py <= WORLD_H:
+                    ph.add_body(s, 1.0, px, py)
+            elif self.edge_r and sel:
+                ph.push(sel, 100.0, px - sel["x"], py - sel["y"])
+        self._t("PHYSICS SANDBOX - RIGID BODIES", x + 18, y + 12, big=True)
+        for k in range(0, int(WORLD_W) + 1, 2):
+            _line([(x0 + k * S, y0), (x0 + k * S, y0 + 5)], (0.5, 0.7, 0.9), 0.6, 1.0)
+            self._t(f"{k}m", x0 + k * S - 8, y0 + 8, (110, 150, 180))
+        _line([(x0, y0 - WORLD_H * S), (x0, y0), (x0 + WORLD_W * S, y0), (x0 + WORLD_W * S, y0 - WORLD_H * S)],
+              (0.6, 0.85, 1.0), 0.9, 2.5)
+        energy = 0.0
+        for b in s["bodies"]:
+            col, cx, cy, rp = b["col"], x0 + b["x"] * S, y0 - b["y"] * S, b["r"] * S
+            energy += 0.5 * b["m"] * (b["vx"] ** 2 + b["vy"] ** 2) + b["m"] * s["g"] * b["y"]
+            self._circle(cx, cy, rp * 1.5, col, 0.15)
+            self._circle(cx, cy, rp, col, 0.9)
+            _line([(cx, cy), (cx + b["vx"] * S * 0.15, cy - b["vy"] * S * 0.15)], (1, 1, 1), 0.5, 1.5)
+            if b["ft"] > 0:                                   # arrow showing the applied force
+                fx, fy = b["f"]
+                mag = math.hypot(fx, fy)
+                ux, uy = fx / mag, -fy / mag
+                ln = min(90.0, 25.0 + mag * 0.3)
+                _line([(cx - ux * (rp + ln), cy - uy * (rp + ln)), (cx - ux * rp, cy - uy * rp)], (1.0, 0.85, 0.3), 1.0, 3.5)
+                self._t(f"{mag:g} N", cx - ux * (rp + ln) - 14, cy - uy * (rp + ln) - 18, (255, 215, 80))
+            if b["id"] == s["sel"]:
+                glLineWidth(2.5)
+                self._circle(cx, cy, rp + 5, (1, 1, 1), 0.95, filled=False)
+            self._t(f"{b['id']}: {b['m']:g}kg", cx - 22, cy - 8, (20, 30, 40))
+        self._t(f"gravity {s['g']:g} m/s2 ({s['body']})   bounce {s['e']:g}   balls {len(s['bodies'])}   energy {energy:.0f} J",
+                x + 18, y + 44)
+        b = ph.body(s, s["sel"])
+        if b:
+            v = math.hypot(b["vx"], b["vy"])
+            self._t(f"ball {b['id']}: {b['m']:g} kg   v {v:.1f} m/s   momentum {b['m'] * v:.1f} kg m/s   "
+                    f"KE {0.5 * b['m'] * v * v:.1f} J   height {b['y'] - b['r']:.1f} m", x + 18, y + 62, (150, 190, 220))
+        if s["clock"] - s["hit_t"] < 3:
+            self._t(s["hit"], x + w - 330, y + 14, (255, 215, 80))
+        self._t('"add a 5 kg ball" | "push ball 1 into ball 2 with 100 newtons" | "make two balls collide" | "zero gravity" | '
+                "click = add/select, right-click = push", x + 18, y + hh - 24, (110, 150, 180))
 
     def _phys_proj(self, x, y, w, hh):
         sims = self.phys.sims
@@ -942,6 +1081,83 @@ _EL_RE = "|".join(EL_WORDS)
 _CKIND = r"(battery|resistor|led|switch|capacitor|bulb|lamp|arduino|ground)"
 
 
+def _world_route(labs, t):
+    """Rigid-body physics voice commands. Returns a reply string, or None if the phrase isn't for the physics world."""
+    ph = labs.phys
+    live = labs.active == "physics" and bool(ph.sims) and ph.sims[0]["kind"] == "world"
+    if re.search(r"projectile|pendulum|\bspring\b", t) or not (live or _WORLD_KW.search(t)):
+        return None
+    refs = [_int(r) for r in re.findall(rf"{_BODY}s?\s+(?:number\s+)?{_REF}\b", t)]
+    force = _num(r"(\d+(?:\.\d+)?)\s*(?:newtons?|n\b)", t)
+    mass = _num(r"(\d+(?:\.\d+)?)\s*(?:kg|kilograms?|kilos?)", t)
+    named = next((k for k in GRAVITY if re.search(rf"\b{k}\b", t)), None)
+    gval = _num(r"gravity\s*(?:to|of|at|=)?\s*(\d+(?:\.\d+)?)", t)
+    zero = re.search(r"\b(?:zero|no|without|disable|remove)\s+gravity|turn off gravity|gravity off|weightless|zero[- ]g\b", t)
+    newg = 0.0 if zero else gval if gval is not None else GRAVITY.get(named)
+    if newg is not None and not re.search(r"\b(?:set|change|switch|turn|make|put|use|drop|add|create)\b|zero|weightless", t):
+        newg = None
+    bounce = _num(r"(?:bounciness|bounce|restitution|elasticity)\s*(?:to|of|at)?\s*(\d*\.\d+|\d+)", t)
+    if bounce is None and re.search(r"\b(?:bouncy|rubber)\b", t):
+        bounce = 0.9
+    opening = re.search(r"physics (?:world|playground)|rigid bod|gravity (?:world|sandbox)", t)
+    collide = re.search(r"\b(?:collide|crash|smash)\b|head[- ]on|each other", t)
+    is_add = (re.search(r"\b(?:add|create|make|drop|spawn|release)\b", t) and re.search(rf"\b{_BODY}s?\b|\bsphere\b", t)
+              and not re.search(r"presentation|document|spreadsheet|report|slide|essay", t))
+    is_push = re.search(r"\b(?:push|hit|kick|shove|pull|slam|hammer|apply|throw|launch|shoot|move|accelerate)\b", t) and \
+        (force or refs or (live and re.search(r"\b(?:push|kick|shove|slam)\b", t)))
+    if not (opening or collide or is_add or is_push or newg is not None or bounce is not None):
+        return None
+    if not live:
+        labs.open("physics")
+    w = ph.world()
+    bs, out = w["bodies"], []
+    if newg is not None:
+        w["g"] = newg
+        w["body"] = "zero gravity" if zero else (named if gval is None and named else "custom")
+        out.append(f"Gravity is {newg:g} meters per second squared.")
+    if bounce is not None:
+        w["e"] = max(0.0, min(1.0, bounce))
+        out.append(f"Bounciness {w['e']:g}.")
+    if collide:
+        while len(bs) < 2:
+            ph.add_body(w, mass or 1.0, 3.0 + 10.0 * len(bs), 0.0)
+            bs = w["bodies"]
+        a, c = (ph.body(w, refs[0]), ph.body(w, refs[1])) if len(refs) > 1 else (bs[-2], bs[-1])
+        if not (a and c):
+            return "I can't find those balls."
+        F = force or 100.0
+        ph.push(a, F, c["x"] - a["x"], c["y"] - a["y"], 0.6)
+        ph.push(c, F, a["x"] - c["x"], a["y"] - c["y"], 0.6)
+        out.append(f"Balls {a['id']} and {c['id']} are pushed into each other with {F:g} newtons each.")
+    elif is_add and not (force or refs):
+        mm = re.search(r"\b(\d+|two|three|four|five|six)\b(?!\s*(?:kg|kilo))\s+(?:\w+\s+){0,2}?(?:balls|spheres|objects|bodies|masses|weights)\b", t)
+        cnt = min(_int(mm.group(1)) or 1, 6) if mm else 1
+        hgt = _num(r"(?:from|at|height of)\s*(\d+(?:\.\d+)?)\s*(?:m\b|meters?|metres?)", t)
+        for _ in range(cnt):
+            b = ph.add_body(w, mass or 1.0, None, hgt)
+        drop = max(b["y"] - b["r"], 0.0)
+        tail = (f" It falls for {math.sqrt(2 * drop / w['g']):.1f} seconds and lands at {w['g'] * math.sqrt(2 * drop / w['g']):.1f} meters per second."
+                if w["g"] > 0 else " With no gravity it just floats.")
+        out.append(f"Added {cnt} ball{'s' if cnt > 1 else ''}, {b['m']:g} kilograms each, from {b['y']:.1f} meters." + tail)
+    elif is_push:
+        a = ph.body(w, refs[0] if refs else w["sel"])
+        if a is None:
+            return " ".join(out + ["There's no ball to push. Say add a 5 kilogram ball first."])
+        tgt = ph.body(w, refs[1]) if len(refs) > 1 else None
+        F = force or 50.0
+        if tgt:
+            dx, dy = tgt["x"] - a["x"], tgt["y"] - a["y"]
+        else:
+            dx = bool(re.search(r"\bright", t)) - bool(re.search(r"\bleft", t))
+            dy = bool(re.search(r"\bup", t)) - bool(re.search(r"\bdown", t))
+        ph.push(a, F, dx, dy)
+        w["sel"], acc = a["id"], F / a["m"]
+        toward = f" toward ball {tgt['id']}" if tgt else ""
+        out.append(f"Pushing ball {a['id']}{toward} with {F:g} newtons for half a second. That's {acc:.1f} meters per second "
+                   f"squared on {a['m']:g} kilograms, a gain of {acc * 0.5:.1f} meters per second.")
+    return " ".join(out) or "Physics world ready. Say add a 5 kilogram ball, push ball 1 with 50 newtons, or make two balls collide."
+
+
 def _route(labs, t):
     """Returns a reply string if handled (may be ''), or None if not for us."""
     ph, mol, ci = labs.phys, labs.mol, labs.circ
@@ -954,6 +1170,9 @@ def _route(labs, t):
     if re.search(r"\b(?:clear|reset)\s+(?:the\s+)?(?:physics|simulation)\b", t):
         ph.sims = []
         return "Physics cleared."
+    reply = _world_route(labs, t)
+    if reply is not None:
+        return reply
     if _physics_kind(t):
         labs.open("physics")
         return ph.create(t)
