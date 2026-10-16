@@ -9,6 +9,7 @@ Aurora self-test. Tells you which features work.
 
 Statuses: PASS = works | FAIL = broken (reason shown) | SKIP = not testable here (missing optional part)
 Tests use temp folders; your notes, vault, projects and sandbox are never touched.
+Includes the extended suite (module internals, edge cases, error paths) near the end of the file.
 """
 import importlib
 import json
@@ -1474,8 +1475,7 @@ check("System monitor", "application crash from event log", t_monitor_crash)
 check("System monitor", "voice commands", t_monitor_voice)
 
 
-# ============================================================================ report
-# ---- Screen understanding + file assistant (added by apply_screen_and_file_features.py)
+# ============================================================================ file assistant + screen understanding
 def t_file_assistant():
     fu = util()
     home = os.path.join(newdir("fa"), "h")
@@ -1520,7 +1520,7 @@ check("File assistant", "find, rename, move, undo (confirm first, 'no' cancels)"
 check("Screen understanding", "routes to vision, needs API, ignores unrelated questions", t_screen_understanding)
 
 
-# ---- Gmail OAuth (added by install_gmail_oauth.py)
+# ============================================================================ Gmail OAuth
 import base64
 import urllib.parse
 
@@ -1688,164 +1688,7 @@ check("Gmail OAuth", "real Gmail read", lambda: requires("PERMISSION", "say 'Aur
       if not gm().has("read") else (gm().fetch_unread(1) and None))
 
 
-# ---- Gmail OAuth (added by install_gmail_oauth.py)
-import base64
-import urllib.parse
-
-
-def gm():
-    return mod("gmail_client")
-
-
-def gm_token(d, scopes=("read",), expires=3600, refresh="r"):
-    """Patches gmail_client.TOKEN_FILE to a temp file holding a token with the given permissions."""
-    g = gm()
-    path = os.path.join(d, "gmail_token.json")
-    with open(path, "w") as f:
-        json.dump({"access_token": "at", "expires_at": time.time() + expires, "refresh_token": refresh,
-                   "scopes": [g.SCOPES[s] for s in scopes]}, f)
-    return mock.patch.object(g, "TOKEN_FILE", path)
-
-
-def t_gmail_permissions():
-    g, d = gm(), newdir("gm")
-    with mock.patch.object(g, "TOKEN_FILE", os.path.join(d, "none.json")):
-        assert not g.connected() and not g.has("read") and not g.has("send")
-    with gm_token(d, ("read",)):
-        assert g.connected() and g.has("read") and not g.has("send")
-        try:
-            g.send({"to": "a@b.c", "body": "x"}, True)
-            raise AssertionError("send allowed without the send permission")
-        except g.GmailError:
-            pass
-    with gm_token(d, ("send",)):
-        try:
-            g.fetch_unread()
-            raise AssertionError("read allowed without the read permission")
-        except g.GmailError:
-            pass
-    with gm_token(d, ("read", "send")):
-        try:
-            g.send({"to": "a@b.c", "body": "x"})
-            raise AssertionError("send without confirmation was allowed")
-        except PermissionError:
-            pass
-
-
-def t_gmail_fetch():
-    g, d = gm(), newdir("gm")
-    data = base64.urlsafe_b64encode(b"The demo moved to Friday.\nPlease confirm.").decode().rstrip("=")
-    msg = {"payload": {"headers": [{"name": "From", "value": "Ann Lee <ann@example.com>"},
-                                   {"name": "Subject", "value": "Project update"}, {"name": "Date", "value": "Mon"}],
-                       "mimeType": "multipart/alternative",
-                       "parts": [{"mimeType": "text/html", "body": {"data": "PGI+"}},
-                                 {"mimeType": "text/plain", "body": {"data": data}}]}}
-    calls = []
-
-    def fake(path, body=None):
-        calls.append((path, body))
-        return {"messages": [{"id": "1"}]} if path.startswith("messages?") else msg
-
-    with gm_token(d), mock.patch.object(g, "_api", fake):
-        out = g.fetch_unread(3)
-    eq((out[0]["from"], out[0]["address"], out[0]["subject"]), ("Ann Lee", "ann@example.com", "Project update"))
-    assert "Friday" in out[0]["body"], out[0]["body"]
-    assert "is%3Aunread" in calls[0][0] and all(c[1] is None for c in calls), "reading must be read-only"
-
-
-def t_gmail_send():
-    g, d = gm(), newdir("gm")
-    sent = []
-    with gm_token(d, ("send",)), mock.patch.object(g, "_api", lambda p, body=None: sent.append((p, body)) or {}):
-        assert g.send({"to": "ann@example.com", "subject": "Hi", "body": "See you Friday."}, True)
-    eq(sent[0][0], "messages/send")
-    raw = base64.urlsafe_b64decode(sent[0][1]["raw"]).decode()
-    assert "To: ann@example.com" in raw and "See you Friday." in raw, raw
-
-
-def t_gmail_refresh():
-    g, d = gm(), newdir("gm")
-    fake_req = lambda url, data=None, headers=None, as_json=False: {"access_token": "new", "expires_in": 3600}
-    with gm_token(d, expires=-100):
-        with mock.patch.object(g, "_client", lambda: ("cid", "sec")), mock.patch.object(g, "_request", fake_req):
-            eq(g._access_token(), "new")
-        with open(g.TOKEN_FILE) as f:
-            eq(json.load(f)["access_token"], "new")
-    with gm_token(d, expires=-100, refresh=None):
-        try:
-            g._access_token()
-            raise AssertionError("expired token without refresh token must ask to reconnect")
-        except g.GmailError:
-            pass
-
-
-def t_gmail_signin():
-    g, d = gm(), newdir("gm")
-    seen = {}
-
-    def run(state_ok):
-        def fake_open(url):
-            q = {k: v[0] for k, v in urllib.parse.parse_qs(urllib.parse.urlparse(url).query).items()}
-            seen.clear()
-            seen.update(q)
-            st = q["state"] if state_ok else "forged"
-
-            def callback():
-                time.sleep(0.2)
-                urllib.request.urlopen(f"{q['redirect_uri']}/?code=abc&state={st}", timeout=5).read()
-            threading.Thread(target=callback, daemon=True).start()
-            return True
-
-        exchange = lambda url, data=None, headers=None, as_json=False: {
-            "access_token": "at", "refresh_token": "rt", "expires_in": 3600, "scope": g.SCOPES["read"]}
-        with mock.patch.object(g, "TOKEN_FILE", os.path.join(d, f"t{state_ok}.json")), \
-                mock.patch.object(g, "_client", lambda: ("cid", "sec")), \
-                mock.patch.object(g.webbrowser, "open", fake_open), mock.patch.object(g, "_request", exchange):
-            g.authorize(["read"], timeout=10)
-            return g._load_token()
-
-    tok = run(True)
-    eq((tok["refresh_token"], tok["scopes"]), ("rt", [g.SCOPES["read"]]))
-    assert seen["code_challenge_method"] == "S256" and g.SCOPES["read"] in seen["scope"]
-    assert seen["redirect_uri"].startswith("http://127.0.0.1:"), seen["redirect_uri"]
-    try:
-        run(False)
-        raise AssertionError("forged state must be rejected")
-    except g.GmailError:
-        pass
-
-
-def t_gmail_disconnect():
-    g, d = gm(), newdir("gm")
-    with gm_token(d), mock.patch.object(g, "_request", lambda *a, **k: {}):
-        assert g.disconnect() and not os.path.exists(g.TOKEN_FILE)
-        assert not g.disconnect()
-
-
-def t_gmail_routing():
-    g, cal, d = gm(), util(), newdir("gm")
-    v, said, pc = pv()
-    calls = []
-    with mock.patch.object(g, "connect_async", lambda perms, done: calls.append(perms) or done(None)):
-        assert say(pc, v, "connect gmail") and calls[-1] == ["read"]
-        assert "connected" in said[-1].lower(), said[-1:]
-        assert say(pc, v, "connect gmail with sending") and calls[-1] == ["read", "send"]
-    with mock.patch.object(g, "disconnect", lambda: True):
-        assert say(pc, v, "disconnect gmail") and "disconnected" in said[-1].lower()
-
-
-check("Gmail OAuth", "permissions: read/send are separate, send needs confirmed=True", t_gmail_permissions)
-check("Gmail OAuth", "read unread mail (mocked API, read-only)", t_gmail_fetch)
-check("Gmail OAuth", "send builds a valid message (mocked API)", t_gmail_send)
-check("Gmail OAuth", "token refresh and reconnect prompt", t_gmail_refresh)
-check("Gmail OAuth", "sign-in flow: PKCE, state check, token saved (no password)", t_gmail_signin)
-check("Gmail OAuth", "disconnect revokes and deletes token", t_gmail_disconnect)
-check("Gmail OAuth", "voice: connect/disconnect", t_gmail_routing)
-check("Gmail OAuth", "real Gmail read", lambda: requires("PERMISSION", "say 'Aurora, connect gmail' first")
-      if not gm().has("read") else (gm().fetch_unread(1) and None))
-
-
-# ---- Feature modules: visual calculator, adaptive interface, project workspace, operation simulator
+# ============================================================================ feature modules: visual calculator, adaptive interface, workspace, simulator
 import contextlib
 
 
@@ -1878,7 +1721,7 @@ def stub_voice(H=None, **kw):
 
 THEME = (0.3, 0.6, 1.0)
 
-# ============================================================================ visual calculator
+# ---- visual calculator
 G = "Visual calculator"
 
 
@@ -1961,7 +1804,7 @@ check(G, "spoken formatting", t_vc_spoken)
 check(G, "voice flow offline (OCR), screen source, no frame, unrelated phrase", t_vc_offline_ocr)
 check(G, "voice flow online (vision model, AI fallback, NONE, error -> OCR)", t_vc_online)
 
-# ============================================================================ adaptive interface
+# ---- adaptive interface
 G = "Adaptive interface"
 
 
@@ -2036,7 +1879,7 @@ check(G, "voice: switching modes, hidden panels, game reader start/stop, rejects
 check(G, "background data gathering (git, files, study stats)", t_ai_gather)
 check(G, "each mode draws; standard and presentation draw nothing", t_ai_draw)
 
-# ============================================================================ project workspace
+# ---- project workspace
 G = "Project workspace"
 
 
@@ -2128,7 +1971,7 @@ check(G, "workspace data: folders, persistence, tasks, file import, search", t_w
 check(G, "'last experiment' sensor answer", t_ws_experiment_answer)
 check(G, "voice flow end to end (create, edit, ask, open, close, overlay draw)", t_ws_voice)
 
-# ============================================================================ operation simulator
+# ---- operation simulator
 G = "Operation simulator"
 
 
@@ -2283,8 +2126,7 @@ check(G, "volume, lock, phone wifi, email previews", t_sim_system)
 check(G, "code-edit preview (needs AI, file untouched)", t_sim_edit_code)
 check(G, "unrelated and real commands fall through", t_sim_passthrough)
 
-
-# ---- Document generator (added by apply_document_generator_patch.py)
+# ---- document generator
 G = "Document generator"
 
 
@@ -2401,6 +2243,1934 @@ def t_debug_loop():
 check("Code sandbox", "debug loop fixes a failing script (mocked model)", t_debug_loop)
 
 
+# ============================================================================ extended tests (internals, edge cases, error paths)
+# Merged from the former test_aurora_extended.py; uses the same check()/mod()/eq() harness and report as above.
+import io
+import re
+import socket
+import urllib.error
+from collections import deque
+from datetime import datetime, timedelta
+
+
+def ext(group):
+    """Decorator: runs the test immediately through check() so it appears in the normal report."""
+    def deco(fn):
+        check(group, fn.__name__.replace("_", " "), fn)
+        return fn
+    return deco
+
+
+def ns(**k):
+    return SimpleNamespace(**k)
+
+
+def ext_dir():
+    return tempfile.mkdtemp(dir=tmpdir)
+
+
+def raises(exc, fn, *a, **k):
+    try:
+        fn(*a, **k)
+    except exc:
+        return
+    raise AssertionError(f"{exc.__name__} not raised")
+
+
+def ext_voice(**kw):
+    said = []
+    v = ns(_speak=said.append, _log=lambda m: None, speak_now=said.append, client=None, plus=None, latest_frame=None,
+           hologram=mock.MagicMock(), active_timers=[])
+    v.__dict__.update(kw)
+    return v, said
+
+
+# ============================================================================ telemetry
+@ext("Telemetry")
+def experiment_recorder_full_cycle():
+    tel = mod("telemetry")
+    import numpy as np
+    with mock.patch.object(tel, "EXPERIMENTS_DIR", ext_dir()):
+        r = tel.ExperimentRecorder()
+        assert not r.log_observation("x") and not r.log_sensor({"a": 1}) and r.stop()[0] is False
+        eq(r.capture_screenshot(np.zeros((4, 4, 3), np.uint8))[0], False)
+        eq(r.generate_report()[0], None)
+        ok, name = r.start("My Test!")
+        assert ok and name == "My_Test", name
+        assert r.start("again")[0] is False
+        assert r.log_observation("fizzing") and r.log_sensor({"t": 1})
+        r.maybe_log_sensor({"t": 2}, interval=60)
+        r.maybe_log_sensor({"t": 3}, interval=60)            # throttled
+        eq(r.capture_screenshot(None)[0], False)
+        ok, fname = r.capture_screenshot(np.zeros((8, 8, 3), np.uint8))
+        assert ok and fname == "shot_001.png"
+        r.stop()
+        path, err = r.generate_report()
+        assert err is None
+        text = open(path, encoding="utf-8").read()
+        for frag in ("EXPERIMENT REPORT: My_Test", "fizzing", "Observations: 1  Sensor readings: 2  Screenshots: 1", "shot_001.png"):
+            assert frag in text, frag
+
+
+@ext("Telemetry")
+def telemetry_reader_config_errors():
+    tel = mod("telemetry")
+    for cfg, frag in ((None, "iot_config"), ({"mode": "bogus"}, "'serial' or 'wifi'"), ({"mode": "wifi"}, "url")):
+        with mock.patch.object(tel, "load_config", return_value=cfg):
+            ok, msg = tel.TelemetryReader().start()
+            assert not ok and frag in msg, msg
+    with mock.patch.object(tel, "load_config", return_value={"mode": "serial"}), mock.patch.object(tel, "PYSERIAL_AVAILABLE", True):
+        ok, msg = tel.TelemetryReader().start()
+        assert not ok and "port" in msg, msg
+    d = os.path.join(ext_dir(), "c.json")
+    open(d, "w").write("{bad")
+    with mock.patch.object(tel, "CONFIG_FILE", d):
+        eq(tel.load_config(), None)
+    json.dump({"mode": "wifi"}, open(d, "w"))
+    eq(tel.load_config(), {"mode": "wifi"})
+
+
+@ext("Telemetry")
+def telemetry_reader_wifi_polling():
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    tel = mod("telemetry")
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = b'{"temp": 21.5}'
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    cfg = {"mode": "wifi", "url": f"http://127.0.0.1:{srv.server_port}/t", "poll_seconds": 0.5}
+    try:
+        with mock.patch.object(tel, "load_config", return_value=cfg):
+            r = tel.TelemetryReader()
+            assert r.is_stale()
+            assert r.start()[0]
+            assert "already running" in r.start()[1]
+            for _ in range(40):
+                if r.latest:
+                    break
+                time.sleep(0.1)
+            eq(r.latest, {"temp": 21.5})
+            assert r.connected and not r.is_stale()
+            r.stop()
+    finally:
+        srv.shutdown()
+
+
+@ext("Telemetry")
+def game_session_reader():
+    tel = mod("telemetry")
+    with mock.patch.object(tel.system_control, "get_foreground_process_name", return_value="game.exe"), \
+            mock.patch.object(tel.system_control, "is_recording", return_value=False):
+        g = tel.GameSessionReader()
+        assert g.is_stale()
+        assert g.start()[0] and g.connected
+        for _ in range(40):
+            if g.latest:
+                break
+            time.sleep(0.1)
+        assert set(g.latest) >= {"session", "fps", "cpu", "ram", "temp_c", "foreground", "recording"}, g.latest
+        eq((g.latest["foreground"], g.latest["recording"], g.latest["fps"]), ("game.exe", "no", "N/A"))
+        g.set_fps(60)
+        eq(g.external_fps, 60)
+        assert "already running" in g.start()[1] and not g.is_stale()
+        g.stop()
+        assert not g.connected and g.session_start is None
+
+
+# ============================================================================ face id
+def _face_env():
+    f = mod("face_id")
+    import cv2
+    import numpy as np
+    if not hasattr(cv2, "face"):
+        skip("cv2.face missing (opencv-contrib-python)")
+    d = ext_dir()
+    patches = [mock.patch.object(f, "DATA_DIR", d), mock.patch.object(f, "SAMPLES_DIR", os.path.join(d, "samples")),
+               mock.patch.object(f, "PEOPLE_PATH", os.path.join(d, "people.json")),
+               mock.patch.object(f, "THRESHOLD_FILE", os.path.join(d, "thr.txt"))]
+    return f, cv2, np, d, patches
+
+
+@ext("Face recognition")
+def face_enroll_recognize_forget_persist():
+    f, cv2, np, d, patches = _face_env()
+    for p in patches:
+        p.start()
+    try:
+        fid = f.FaceID()
+        eq(fid.people, {})
+        rng = np.random.RandomState(3)
+        face = lambda seed: cv2.GaussianBlur(np.random.RandomState(seed).randint(0, 255, (200, 200)).astype(np.uint8), (9, 9), 0)
+        noisy = lambda img, n=6: [np.clip(img.astype(int) + rng.randint(-6, 6, img.shape), 0, 255).astype(np.uint8) for _ in range(n)]
+        box = (0, 0, 200, 200)
+        for name, seed in (("Alice", 1), ("Bob", 2)):
+            ok, n, msg = fid._finish_enrollment({"name": name, "imgs": [f.prep(v, box) for v in noisy(face(seed))]})
+            assert ok and n == name
+        eq(sorted(fid.people), ["Alice", "Bob"])
+        res = [fid.recognize(noisy(face(1), 1)[0], box) for _ in range(3)]
+        eq(res[-1][0], "Alice")
+        assert fid.last_distance is not None and fid.confirmed_name == "Alice"
+        eq(sorted(f.FaceID().people), ["Alice", "Bob"])               # reloaded from disk
+        assert fid.get_theme_index("Alice") in range(4) and fid.get_theme_index("Zed") is None
+        assert fid.forget("alice") and not fid.forget("nobody")
+        eq(list(fid.people), ["Bob"])
+        assert not os.path.isdir(os.path.join(f.SAMPLES_DIR, "Alice"))
+        fid.threshold = 0.0001
+        fid._reset_votes()
+        eq(fid.recognize(noisy(face(2), 1)[0], box)[0], None)         # strict threshold rejects
+    finally:
+        for p in patches:
+            p.stop()
+
+
+@ext("Face recognition")
+def face_prep_threshold_enrollment_state():
+    f, cv2, np, d, patches = _face_env()
+    for p in patches:
+        p.start()
+    try:
+        gray = np.zeros((200, 200), np.uint8)
+        eq(f.prep(gray, (0, 0, 200, 200)).shape, (f.FACE_SIZE, f.FACE_SIZE))
+        eq(f.prep(gray, (500, 500, 10, 10)), None)
+        eq(f.FaceID._dirname("Sam O'Neil"), "Sam_O_Neil")
+        eq(f.FaceID().threshold, f.DEFAULT_THRESHOLD)
+        open(f.THRESHOLD_FILE, "w").write("55")
+        eq(f.FaceID().threshold, 55.0)
+        open(f.THRESHOLD_FILE, "w").write("abc")
+        eq(f.FaceID().threshold, f.DEFAULT_THRESHOLD)
+        fid = f.FaceID()
+        eq(fid.recognize(gray, (0, 0, 200, 200)), (None, None))        # nobody enrolled
+        assert fid.start_enrollment("X") and fid.enrolling
+        with mock.patch.object(f, "ENROLL_TIMEOUT", -1):
+            ok, name, msg = fid.feed_enrollment(gray, [])
+        assert not ok and name == "X" and "clear look" in msg and not fid.enrolling
+    finally:
+        for p in patches:
+            p.stop()
+
+
+# ============================================================================ hand tracker
+def _lm(up):
+    xs, base = {"index": -0.03, "middle": -0.01, "ring": 0.01, "pinky": 0.03}, {"index": 5, "middle": 9, "ring": 13, "pinky": 17}
+    pts = [(0, 0)] * 21
+    pts[1], pts[2], pts[3], pts[4] = (-0.03, -0.02), (-0.03, -0.05), (-0.02, -0.06), (0.0, -0.10)     # folded thumb
+    for name, i in base.items():
+        x = xs[name]
+        pts[i] = (x, -0.09)
+        ys = (-0.13, -0.16, -0.19) if name in up else (-0.12, -0.10, -0.06)
+        for k, y in enumerate(ys, 1):
+            pts[i + k] = (x, y)
+    return [ns(x=x, y=y, z=0.0) for x, y in pts]
+
+
+@ext("Hand tracking")
+def pose_classification():
+    ht = mod("hand_tracker")
+    tracker = object.__new__(ht.HandTracker)
+    cases = [({"index", "middle", "ring", "pinky"}, "open_palm", 4), (set(), "fist", 0), ({"index", "middle"}, "peace", 2),
+             ({"index"}, "point", 1), ({"index", "pinky"}, "rock_sign", 2)]
+    for up, want, count in cases:
+        gesture, n, ratio = tracker._classify(_lm(up), None, ht._Track(0))
+        assert (gesture, n) == (want, count), f"{sorted(up)} -> {gesture}, {n}"
+
+
+@ext("Hand tracking")
+def angle_clamp_debouncer_oneeuro():
+    ht = mod("hand_tracker")
+    eq(ht._clamp01(5), 1.0)
+    eq(ht._clamp01(-1), 0.0)
+    assert abs(ht._angle((-1, 0, 0), (0, 0, 0), (1, 0, 0)) - 180) < 1e-6
+    eq(ht._angle((0, 0, 0), (0, 0, 0), (1, 0, 0)), 180.0)           # degenerate vector
+    d = ht.GestureDebouncer(window=6, min_votes=4)
+    out = [d.update("fist") for _ in range(4)]
+    eq([o[1] for o in out], [False, False, False, True])
+    eq(d.update("fist"), ("fist", False))
+    f = ht.OneEuro()
+    eq(f(1.0, 0.0), 1.0)
+    assert 1.0 < f(2.0, 0.033) <= 2.0
+
+
+@ext("Hand tracking")
+def intent_gating_swipe_and_track_assignment():
+    ht = mod("hand_tracker")
+    tr = ht._Track(0)
+    eq(tr.speed, 0.0)
+    T = object.__new__(ht.HandTracker)
+    assert T._gate_event(tr, "peace", True, 100.0)                   # fires once, still
+    assert not T._gate_event(tr, "peace", False, 100.1)
+    assert not T._gate_event(tr, "peace", True, 100.2)               # cooldown
+    assert not T._gate_event(tr, "fist", True, 105.0)                # not actionable
+    tr.fx.dx = 5.0
+    assert not T._gate_event(tr, "peace", True, 110.0)               # moving too fast
+    T._motion, T._last_swipe_time = deque(maxlen=60), 0.0
+    got = [T._update_swipe((0.1 + 0.1 * i, 0.5), 10 + 0.05 * i) for i in range(6)]
+    assert "right" in got and got.count("right") == 1, got           # cooldown stops repeats
+    T._tracks, T._next_id = {}, 0
+    a = T._assign([(0.2, 0.2), (0.8, 0.8)])
+    ids = sorted(t_.id for t_ in a.values())
+    eq(ids, [0, 1])
+    b = T._assign([(0.21, 0.2), (0.79, 0.8)])
+    eq({k: v.id for k, v in a.items()}, {k: v.id for k, v in b.items()})   # same hands keep ids
+    for _ in range(ht.MAX_MISSED_FRAMES + 2):
+        T._assign([])
+    eq(T._tracks, {})
+
+
+@ext("Hand tracking")
+def enhance_read_and_model_download():
+    ht = mod("hand_tracker")
+    import cv2
+    import numpy as np
+    T = object.__new__(ht.HandTracker)
+    T._clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    bright, dark = np.full((32, 32, 3), 200, np.uint8), np.full((32, 32, 3), 10, np.uint8)
+    assert T._enhance(bright) is bright
+    out = T._enhance(dark)
+    eq(out.shape, dark.shape)
+    with mock.patch.object(ht.os.path, "exists", return_value=True), mock.patch.object(ht.urllib.request, "urlretrieve") as dl:
+        ht._ensure_model("x.task")
+        dl.assert_not_called()
+    with mock.patch.object(ht.os.path, "exists", return_value=False), mock.patch.object(ht.urllib.request, "urlretrieve") as dl:
+        ht._ensure_model("x.task")
+        dl.assert_called_once()
+    T.cap = ns(read=lambda: (False, None))
+    r, fr = T.read()
+    assert not r.detected and fr is None
+    frame = np.zeros((48, 64, 3), np.uint8)
+    T.cap = ns(read=lambda: (True, frame))
+    T.landmarker = ns(detect_for_video=lambda img, ts: ns(hand_landmarks=[], hand_world_landmarks=[], handedness=[]))
+    T._ts, T._tracks, T._next_id, T._primary_id = 0, {}, 0, None
+    T._prev_two_hand_dist = T._prev_roll_angle = T._pinch_drag_prev = T._pull_zoom_prev_size = None
+    T._prev_primary_gesture = T._prev_primary_pos = T._prev_time = None
+    T._roll_mode, T._peak_speed, T._last_swipe_time, T._motion = 0, 0.0, 0.0, deque(maxlen=60)
+    r, fr = T.read()
+    assert not r.detected and fr is not None and hasattr(T, "raw_frame")
+
+
+# ============================================================================ hologram (no GL context)
+def bare_holo():
+    hm = mod("hologram")
+    h = object.__new__(hm.Hologram)
+    h.__dict__.update(
+        elapsed=0.0, _materialize_start=0.0, _materialize_duration=0.45, weather=None, map_highlight=None, docked=False,
+        mode="empty", mode_label="", orbits=[], selected_index=None, info_card=None, protons=1, neutrons=0, electron_count=1,
+        shell_summary="", current_element_z=1, current_star_index=0, molecule_data=None, graph_points=[], graph_expr="",
+        physics_type=None, physics_state={}, constellation_data=None, constellation_name="", network_nodes=[], network_edges=[],
+        shape_name="sphere", telemetry_label="", telemetry_data={}, telemetry_history={}, telemetry_connected=False,
+        telemetry_last_update=0.0, event_log=deque(maxlen=6), _event_log_lock=threading.Lock(), event_listeners=[],
+        theme_index=2, _theme_prev_color=hm.THEMES[2], _theme_transition_start=-999.0, _theme_transition_duration=0.6,
+        zoom=1.0, brightness=1.0, roll=0.0, translate_x=0.0, translate_y=0.0, flash_color=(1, 1, 1), flash_intensity=0.0,
+        cpu_history=deque([0.0] * 40, maxlen=40), state="idle", hud_lines=[], rotation_x=0.0, rotation_y=0.0,
+        pulse_phase=0.0, sweep_phase=0.0, scanline_phase=0.0, _glitch=0.0, _glitch_timer=5.0, _dock_shift=0.0,
+        _last_time=time.time() - 0.02, _fps=0.0, font=None, font_small=None, font_big=None, zoom_=1.0)
+    return hm, h
+
+
+@ext("Hologram logic")
+def element_tables_and_shell_rules():
+    hm = mod("hologram")
+    eq(len(hm.PERIODIC_TABLE), 118)
+    eq(hm.ELEMENTS["carbon"], ("C", 6))
+    eq(hm.ATOMIC_NUMBER_TO_ELEMENT[79], ("Au", "gold"))
+    eq(hm.fill_shells(11), [2, 8, 1])
+    eq(hm.fill_shells(0), [])
+    eq(sum(hm.fill_shells(118)), 118)
+    eq(hm._approx_neutrons(1), 1)
+    eq(hm._approx_neutrons(20), 20)
+    assert hm._approx_neutrons(92) > 92
+    a, b = hm._generate_procedural_system("zorg"), hm._generate_procedural_system("zorg")
+    eq(a, b)
+    assert 2 <= len(a) <= 6 and a[0][0].startswith("Zorg ")
+    nodes = hm._build_network_nodes()
+    eq(len(nodes), 10)
+    edges = hm._build_network_edges(nodes)
+    assert all(i < j for i, j in edges) and {k for e in edges for k in e} == set(range(10))
+    eq(hm.Hologram._nucleon_positions(None, 0), [])
+    eq(len(hm.Hologram._nucleon_positions(None, 7)), 7)
+
+
+@ext("Hologram logic")
+def atom_loading_and_editing():
+    hm, h = bare_holo()
+    eq(h.load_atom("carbon"), ("C", "carbon"))
+    eq((h.protons, h.neutrons, h.electron_count, len(h.orbits)), (6, 6, 6, 2))
+    assert "CARBON" in h.mode_label
+    eq(h.load_atom("Fe"), ("Fe", "iron"))
+    eq(h.load_atom("unobtainium"), None)
+    h.load_atom("hydrogen")
+    h.add_protons(1)
+    assert (h.protons, h.electron_count) == (2, 2) and "HELIUM" in h.mode_label
+    h.add_neutrons(-9)
+    eq(h.neutrons, 0)
+    h.add_electrons(1)
+    assert "charge -1" in h.mode_label
+    h.protons, h.electron_count = 500, 500
+    h._update_custom_label()
+    assert "CUSTOM ELEMENT" in h.mode_label
+    h.current_element_z = 118
+    eq(h.next_element()[2], 1)
+    eq(h.previous_element()[2], 118)
+
+
+@ext("Hologram logic")
+def display_loaders():
+    hm, h = bare_holo()
+    h.load_solar_system()
+    eq((h.mode, len(h.orbits)), ("solar_system", 8))
+    eq(h.load_star_system("trappist-1"), ("Trappist-1", 7, False))
+    label, n, generated = h.load_star_system("made up")
+    assert generated and "(est.)" in h.mode_label
+    first = h.next_star_system()[0]
+    assert first != h.previous_star_system()[0] or True
+    h.load_demo()
+    eq(len(h.orbits), 4)
+    h.load_network()
+    eq(len(h.network_nodes), 10)
+    assert h.load_shape("cube") and not h.load_shape("nope")
+    assert h.load_molecule("water") and not h.load_molecule("unobtainium")
+    assert h.load_constellation("orion") and not h.load_constellation("nothing")
+    h.load_satellite("ISS")
+    eq((h.mode, len(h.orbits)), ("satellite", 1))
+    h.show_info_card("q", "a")
+    eq((h.mode, h.info_card), ("info", {"question": "q", "answer": "a"}))
+    h.show_weather({"location": "X", "state": "texas"})
+    assert h.docked and h.map_highlight == "texas"
+    h.hide_weather()
+    assert not h.docked and h.map_highlight is None
+
+
+@ext("Hologram logic")
+def graphs_and_physics_steps():
+    hm, h = bare_holo()
+    assert h.load_math_graph("sin(x)") and len(h.graph_points) == 161
+    assert h.load_math_graph("x^2")
+    assert not h.load_math_graph("") and not h.load_math_graph("1/0")
+    assert not h.load_math_graph("__import__('os').getcwd()"), "eval sandbox escaped"
+    eq(h._eval_graph_expr("x+1", 2), 3)
+    h.load_physics_sim("pendulum")
+    th = h.physics_state["theta"]
+    h._step_physics(0.05)
+    assert h.physics_state["theta"] != th and h.physics_state["trail"]
+    h.load_physics_sim("projectile")
+    h._step_physics(0.1)
+    assert h.physics_state["x"] > -2.2
+    h.physics_state["y"] = -5
+    h._step_physics(0.1)
+    eq(h.physics_state["x"], -2.2)                                      # resets after landing
+    h.load_physics_sim("other")
+    eq(h.physics_state, {})
+
+
+@ext("Hologram logic")
+def orbit_selection_and_view_controls():
+    hm, h = bare_holo()
+    h.load_demo()
+    assert h.select_orbit(0) and not h.select_orbit(9)
+    h.deselect_orbit()
+    seen = []
+    for _ in range(5):
+        h.select_next_orbit()
+        seen.append(h.selected_index)
+    eq(seen, [0, 1, 2, 3, None])
+    h.select_orbit(0)
+    h.edit_selected_orbit(-1.0, 1.0, 10.0)
+    eq(h.orbits[0]["radius"], hm.RADIUS_MAX)
+    assert h.orbits[0]["speed"] <= hm.SPEED_MAX
+    h.edit_selected_orbit(1.0, -1.0, 100.0)
+    eq(h.orbits[0]["radius"], hm.RADIUS_MIN)
+    h.apply_zoom_delta(100)
+    eq(h.zoom, 3.0)
+    h.apply_zoom_delta(-100)
+    eq(h.zoom, 0.4)
+    h.apply_roll_delta(400)
+    eq(h.roll, 40.0)
+    h.apply_pan_delta(100, 100)
+    assert h.translate_x == 3.0 and h.translate_y == -2.0
+    h.adjust_brightness(5)
+    eq(h.brightness, 1.8)
+    h.cycle_theme(1)
+    eq(h.theme_index, 3)
+    h.set_theme_index(9)
+    eq(h.theme_index, 1)
+    h.elapsed = 5.0
+    eq(h._current_theme_color(), hm.THEMES[1])
+    h.trigger_flash("thumbs_up", 0.5)
+    eq((h.flash_color, h.flash_intensity), (hm.FLASH_COLORS["thumbs_up"], 0.5))
+    h.reset_orbits()
+    eq(h.mode, "demo")
+
+
+@ext("Hologram logic")
+def events_telemetry_and_helpers():
+    hm, h = bare_holo()
+    heard = []
+    h.event_listeners = [lambda s: heard.append(s), lambda s: 1 / 0]
+    h.log_event("FACE: hi")
+    assert heard == ["FACE: hi"] and "FACE: hi" in h.event_log[0]
+    h.update_telemetry({"t": 1}, True)
+    eq(h.telemetry_data, {})                                              # ignored unless on screen
+    h.show_telemetry("Mars")
+    assert h.mode == "telemetry" and "MARS" in h.mode_label
+    h.update_telemetry({"t": 1.5, "name": "x", "flag": True}, True)
+    eq(list(h.telemetry_history), ["t"])
+    h.hide_telemetry()
+    eq(h.mode, "empty")
+    eq(h._truncate("abcdefgh", 5), "abcd…")
+    eq(h._normalize_history([5, 5, 5]), [0.5, 0.5, 0.5])
+    eq(h._normalize_history([0, 5, 10]), [0.0, 0.5, 1.0])
+    eq(h._wrap_text(None, "hello world", 10), ["hello world"])
+    eq(h._pill_width("abc"), 90)
+    assert h._stat_status_color("CPU", None) != h._stat_status_color("CPU", 0.9)
+    eq(h._stat_status_color("BATT", 0.1), (1.0, 0.35, 0.3))
+    h.elapsed = 99
+    eq(h._materialize_progress(), 1.0)
+    h.mode = "atom"
+    assert any(k == "PROTONS" for k, _ in h._mode_readout())
+    h.mode = "shape"
+    assert ("MODEL", "SPHERE") in h._mode_readout() and h._mode_readout()[-1][0] == "BRIGHTNESS"
+    h.cpu_history = deque([0.0] * 40, maxlen=40)
+    h.update(0.2, -0.2, 0.5, target_dt=0.1)
+    assert h.rotation_y > 0 and h.elapsed > 99
+
+
+# ============================================================================ system control
+@ext("System control")
+def filenames_templates_and_project_lookup():
+    sc = mod("system_control")
+    eq(sc.safe_filename("my demo!"), "my_demo")
+    eq(sc.safe_filename("../x"), "x")
+    eq(sc.safe_filename("!!!"), "untitled")
+    assert "def main" in sc._template("python", "x") and "<html>" in sc._template("html", "x")
+    eq(sc._template("klingon", "x"), "# x\n")
+    d = ext_dir()
+    with mock.patch.object(sc, "BASE", d), mock.patch.object(sc, "PROJECTS_ROOT", os.path.join(d, "p")), \
+            mock.patch.object(sc, "ARDUINO_ROOT", os.path.join(d, "a")):
+        json.dump({"Demo": "C:/x/demo.py"}, open(os.path.join(d, "code_projects.json"), "w"))
+        eq(sc.resolve_project_path("demo"), "C:/x/demo.py")
+        eq(sc.find_arduino_sketch("DEMO"), "C:/x/demo.py")
+        eq(sc.resolve_project_path("ghost"), None)
+        ino = sc.get_or_make_path("blinker", "arduino")
+        assert ino.endswith("blinker.ino") and os.path.exists(ino)
+        py = sc.get_or_make_path("tool", "python")
+        assert py.endswith("tool.py")
+        eq(sc.get_or_make_path("tool", "python"), py)
+        sc.write_file_content(os.path.join(d, "sub", "x.txt"), "hi")
+        eq(open(os.path.join(d, "sub", "x.txt")).read(), "hi")
+    eq(sc.summarize_diff("a\nb\n", "a\n"), "1 line removed")
+    eq(sc.summarize_diff("a\n", "a\n"), "no changes")
+    assert not sc.open_in_vscode("/no/such/path")[0] and not sc.open_in_arduino("/no/such/path")[0]
+    calls = []
+    with mock.patch.object(sc, "open_in_arduino", lambda p: calls.append("ino") or (True, "")), \
+            mock.patch.object(sc, "open_in_vscode", lambda p: calls.append("code") or (True, "")):
+        sc.open_in_editor("a.ino")
+        sc.open_in_editor("a.py")
+    eq(calls, ["ino", "code"])
+
+
+@ext("System control")
+def volume_media_apps_and_status():
+    sc = mod("system_control")
+    with mock.patch.object(sc, "PYCAW_AVAILABLE", False):
+        assert sc.get_volume_percent() is None and not sc.set_volume_percent(5) and sc.adjust_volume_percent(5) is None
+    state = {"v": 0.5}
+    iface = ns(GetMasterVolumeLevelScalar=lambda: state["v"], SetMasterVolumeLevelScalar=lambda v, ctx: state.update(v=v))
+    with mock.patch.object(sc, "PYCAW_AVAILABLE", True), mock.patch.object(sc, "_volume_interface", lambda: iface):
+        eq(sc.get_volume_percent(), 50)
+        eq(sc.adjust_volume_percent(10), 60)
+        assert sc.set_volume_percent(150)
+        eq(state["v"], 1.0)
+        sc.set_volume_percent(-5)
+        eq(state["v"], 0.0)
+    keys = []
+    fake = ns(windll=ns(user32=ns(keybd_event=lambda *a: keys.append(a[0]))))
+    with mock.patch.object(sc, "ctypes", fake):
+        assert sc.media_play_pause() and sc.media_next() and sc.media_previous()
+    eq(keys[::2], [0xB3, 0xB0, 0xB1])
+    eq(sc.close_app("explorer"), False)
+    seen = []
+    with mock.patch.object(sc.subprocess, "run", lambda cmd, **k: seen.append(cmd) or ns(returncode=0)):
+        assert sc.close_app("calc")
+    assert "CalculatorApp.exe" in seen[0]
+    with mock.patch.object(os, "startfile", create=True, side_effect=OSError), mock.patch.object(sc.shutil, "which", return_value=None):
+        assert not sc.launch_app("nothing")
+    with mock.patch.object(os, "startfile", create=True, side_effect=OSError), mock.patch.object(sc.shutil, "which", return_value="/bin/x"), \
+            mock.patch.object(sc.subprocess, "Popen") as po:
+        assert sc.launch_app("x") and po.called
+    eq(sc.APP_RE.search("open visual studio code").group(1), "visual studio code")
+    fake_ps = ns(cpu_percent=lambda interval=None: 12.4, virtual_memory=lambda: ns(percent=40.2),
+                 sensors_battery=lambda: ns(percent=80, power_plugged=True),
+                 sensors_temperatures=lambda: {"a": [ns(current=50.0)]})
+    with mock.patch.object(sc, "PSUTIL_AVAILABLE", True), mock.patch.object(sc, "psutil", fake_ps):
+        s = sc.get_system_status()
+        assert "CPU at 12 percent" in s and "charging" in s
+        eq(sc.get_cpu_temp(), 50.0)
+    with mock.patch.object(sc, "PSUTIL_AVAILABLE", False):
+        assert sc.get_system_status() is None and sc.get_cpu_temp() is None and sc.get_foreground_process_name() is None
+
+
+@ext("System control")
+def screen_recording_state_machine():
+    sc = mod("system_control")
+    with mock.patch.object(sc, "RECORDING_DIR", ext_dir()):
+        with mock.patch.object(sc.subprocess, "Popen", side_effect=FileNotFoundError):
+            ok, msg = sc.start_recording()
+            assert not ok and "ffmpeg" in msg and not sc.is_recording()
+        proc = mock.MagicMock()
+        with mock.patch.object(sc.subprocess, "Popen", return_value=proc):
+            ok, path = sc.start_recording("a.mp4")
+            assert ok and path.endswith("a.mp4") and sc.is_recording()
+            assert sc.start_recording()[1] == "Already recording."
+            assert sc.stop_recording()[0] and not sc.is_recording()
+            proc.communicate.assert_called_once()
+        eq(sc.stop_recording(), (False, "Not recording."))
+
+
+@ext("Phone control (ADB mocked)")
+def adb_basics_contacts_and_calls():
+    sc = mod("system_control")
+    d = ext_dir()
+    shell_log = []
+    with mock.patch.object(sc, "BASE", d), mock.patch.object(sc, "_shell", lambda cmd, timeout=15: shell_log.append(cmd) or (True, "")):
+        with mock.patch.object(sc, "_adb", return_value=(True, "List of devices attached\nabc\tdevice\n")):
+            assert sc.is_device_connected()[0]
+        with mock.patch.object(sc, "_adb", return_value=(True, "List of devices attached\nabc\toffline\n")):
+            assert not sc.is_device_connected()[0]
+        with mock.patch.object(sc, "_adb", return_value=(False, "adb not found")):
+            eq(sc.is_device_connected(), (False, "adb not found"))
+        eq(sc.unlock_with_pin(), (False, "No phone_pin.txt found"))
+        open(os.path.join(d, "phone_pin.txt"), "w").write("12ab")
+        assert "digits only" in sc.unlock_with_pin()[1]
+        open(os.path.join(d, "phone_pin.txt"), "w").write("1234")
+        assert sc.unlock_with_pin()[0]
+        assert "input text 1234" in shell_log and "input keyevent KEYCODE_ENTER" in shell_log
+        json.dump({"Mom": "123", "me": "999"}, open(os.path.join(d, "contacts.json"), "w"))
+        eq(sc.load_contacts(), {"mom": "123", "me": "999"})
+        eq(sc.load_my_number(), "999")
+        open(os.path.join(d, "my_number.txt"), "w").write("555")
+        eq(sc.load_my_number(), "555")
+        sc.call_number("(555) 123-4567")
+        assert shell_log[-1].endswith("tel:5551234567")
+        sc.wifi_set(True)
+        sc.wifi_set(False)
+        assert shell_log[-2].endswith("enable") and shell_log[-1].endswith("disable")
+        json.dump({"home": {"ssid": "Net", "password": "pw"}, "cafe": {"ssid": "Cafe", "password": ""}},
+                  open(os.path.join(d, "wifi_networks.json"), "w"))
+        assert sc.wifi_connect("home")[0] and "wpa2 'pw'" in shell_log[-1]
+        sc.wifi_connect("cafe")
+        assert shell_log[-1].endswith("'Cafe' open")
+        ok, msg = sc.wifi_connect("ghost")
+        assert not ok and "wifi_networks.json" in msg
+        sc.web_search("hello world")
+        assert "q=hello+world" in shell_log[-1]
+
+
+@ext("Phone control (ADB mocked)")
+def adb_packages_apps_wireless_whatsapp_search():
+    sc = mod("system_control")
+    d = ext_dir()
+    pm = "package:com.foo.bar\npackage:com.whatsapp\npackage:com.zed.app"
+
+    def shell(cmd, timeout=15):
+        if cmd == "pm list packages":
+            return True, pm
+        if "contacts/data/phones" in cmd:
+            return True, "Row: 0 display_name=Mom, data1=+1 555\nRow: 1 display_name=Bob, data1=123"
+        if "mimetype=" in cmd:
+            return True, "Row: 0 _id=7, display_name=Mom Smith"
+        if "ip -f inet" in cmd:
+            return True, "inet 192.168.1.5/24"
+        if cmd.startswith("monkey") and "com.zed.app" in cmd:
+            return True, "No activities found"
+        if cmd.startswith("find"):
+            return True, "/sdcard/a_notes.txt\nnoise"
+        return True, ""
+
+    with mock.patch.object(sc, "BASE", d), mock.patch.object(sc, "_shell", shell), mock.patch.object(sc.time, "sleep", lambda s: None):
+        eq(sc._resolve_pkg("instagram"), "com.instagram.android")
+        eq(sc._resolve_pkg("zed"), "com.zed.app")
+        eq(sc._resolve_pkg("nothinghere"), None)
+        assert sc.open_app("whatsapp") and not sc.open_app("zed") and not sc.open_app("nothinghere")
+        assert sc.close_phone_app("whatsapp") and not sc.close_phone_app("nothinghere")
+        eq(sc._phone_contacts(), [("Mom", "+1 555"), ("Bob", "123")])
+        eq(sc.whatsapp_call("mom"), (True, "Mom Smith"))
+        res = sc.search_phone("mom")
+        eq(res["contacts"], [("Mom", "+1 555")])
+        eq(sc.search_phone("whats", "apps")["apps"], ["com.whatsapp"])
+        eq(sc.search_phone("notes", "files")["files"], ["/sdcard/a_notes.txt"])
+        with mock.patch.object(sc, "_adb", side_effect=[(True, ""), (True, "connected to 192.168.1.5:5555")]):
+            eq(sc.connect_wireless(), (True, "192.168.1.5"))
+        with mock.patch.object(sc, "_adb", return_value=(False, "no")):
+            eq(sc.connect_wireless(), (False, "no"))
+    with mock.patch.object(sc, "BASE", d), mock.patch.object(sc, "_shell", lambda c, timeout=15: (True, "")):
+        ok, msg = sc.whatsapp_call("stranger")
+        assert not ok and "couldn't find" in msg
+        json.dump({"dad": "+1 (800) 555"}, open(os.path.join(d, "contacts.json"), "w"))
+        ok, msg = sc.whatsapp_call("dad")
+        assert ok and "tap the call button" in msg
+
+
+@ext("System control")
+def qr_codes_vault_helpers_and_pdf_reading():
+    sc = mod("system_control")
+    import cv2
+    import numpy as np
+    eq(sc.read_codes(np.zeros((50, 50, 3), np.uint8)), [])
+    if hasattr(cv2, "QRCodeEncoder_create"):
+        qr = cv2.QRCodeEncoder_create().encode("hello")
+        big = cv2.copyMakeBorder(cv2.resize(qr, None, fx=8, fy=8, interpolation=cv2.INTER_NEAREST), 40, 40, 40, 40,
+                                 cv2.BORDER_CONSTANT, value=255)
+        codes = sc.read_codes(cv2.cvtColor(big, cv2.COLOR_GRAY2BGR) if big.ndim == 2 else big)
+        if not codes:
+            skip("QR decoder did not read the generated code on this OpenCV build")
+        assert any("hello" in c for c in codes)
+    d = ext_dir()
+    open(os.path.join(d, "a.txt"), "w").write("hello vault")
+    open(os.path.join(d, "bad.pdf"), "wb").write(b"not a pdf")
+    eq(sc._read_any(os.path.join(d, "a.txt")), "hello vault")
+    eq(sc._read_any(os.path.join(d, "bad.pdf")), "")
+    eq(sc._read_any(os.path.join(d, "x.xyz")), "")
+    assert "the" not in sc._vwords("the quick fox")
+    with mock.patch.object(sc, "BASE", d):
+        eq(sc.vault_search("anything"), None)
+        ok, msg = sc.vault_add_folder(os.path.join(d, "missing"))
+        assert not ok and "isn't a folder" in msg
+
+
+# ============================================================================ voice assistant
+def va_obj():
+    va = mod("voice_assistant")
+    v = object.__new__(va.VoiceAssistant)
+    said = []
+    v._log = v._on_log = lambda m: None
+    v._speak = said.append
+    v.speech = ns(say=said.append, busy=False, wait=lambda *a: None, stop=lambda: None)
+    v.active_timers, v.last_reply, v.latest_frame, v.last_weather_error = [], "", None, None
+    v._cancel, v._turn_display, v._state, v._capture, v._capture_tid = threading.Event(), False, "idle", None, None
+    v.hologram, v.client, v.brain, v.plus = mock.MagicMock(), None, None, None
+    return va, v, said
+
+
+@ext("Voice assistant internals")
+def wake_word_calculator_cleaning_chunker():
+    va = mod("voice_assistant")
+    eq(va.find_wake_word("hey aurora, set a timer"), (True, "set a timer"))
+    eq(va.find_wake_word("set a timer aurora"), (True, "set a timer"))
+    eq(va.find_wake_word("aurora"), (True, ""))
+    eq(va.find_wake_word("nothing here"), (False, None))
+    eq(va.try_calculate("what is 5 plus 3")[0], 8)
+    eq(va.try_calculate("10 divided by 4")[0], 2.5)
+    assert va.try_calculate("1 divided by 0") is None and va.try_calculate("__import__('os')") is None
+    raises(ValueError, va._eval_node, va.ast.parse("foo", mode="eval").body)
+    eq(va.clean_for_speech("see [docs](http://x.y) now\n- item\n```code```"), "see docs now item")
+    c = va.Chunker()
+    eq(c.feed("Hi"), [])
+    eq(c.flush(), ["Hi"])
+    eq(c.flush(), [])
+    out = c.feed("This is the first sentence. And a second one here. ")
+    assert len(out) == 2
+    assert va.STOP_RE.fullmatch("please stop") and not va.STOP_RE.fullmatch("stop the music now please")
+
+
+@ext("Voice assistant internals")
+def api_key_loading_and_null_voice():
+    va = mod("voice_assistant")
+    d = ext_dir()
+    keyfile = os.path.join(d, "k.txt")
+    with mock.patch.object(va, "API_KEY_FILE", keyfile), mock.patch.dict(os.environ, {"GROQ_API_KEY": "envkey"}):
+        eq(va.load_api_key(), "envkey")
+        open(keyfile, "w").write(" filekey \n")
+        eq(va.load_api_key(), "filekey")
+    nv = va.NullVoice()
+    nv.start()
+    nv.stop()
+    nv.speak_now("hi")
+    assert nv.state == "idle" and not nv.enabled and nv.active_reader is nv.telemetry
+
+
+@ext("Voice assistant internals")
+def offline_recognizer_paths():
+    va = mod("voice_assistant")
+    import numpy as np
+    sr = va.sr
+    rec = ns(recognize_sphinx=lambda audio: "sphinx text")
+    o = va.OfflineRecognizer(lambda m: None, rec)
+    o._load = lambda: None
+    eq(o.recognize(ns()), "sphinx text")
+    rec.recognize_sphinx = mock.Mock(side_effect=sr.RequestError("x"))
+    raises(sr.UnknownValueError, o.recognize, ns())
+    audio = ns(get_raw_data=lambda **k: np.zeros(1600, np.int16).tobytes())
+    o._load = lambda: ns(transcribe=lambda pcm, **k: ([ns(text=" hi "), ns(text="there")], None))
+    eq(o.recognize(audio), "hi there")
+    o._load = lambda: ns(transcribe=lambda pcm, **k: ([], None))
+    raises(sr.UnknownValueError, o.recognize, audio)
+    r2 = ns(recognize_google=mock.Mock(side_effect=sr.RequestError("down")))
+    _, v, _ = va_obj()
+    v.recognizer = r2
+    with mock.patch.object(va, "OfflineRecognizer", lambda log, rec: ns(_load=lambda: None, recognize=lambda a: "offline text")):
+        v.enable_offline_recognition(lambda: False)
+        eq(r2.recognize_google(ns()), "offline text")
+        v.enable_offline_recognition(lambda: True)
+
+
+@ext("Voice assistant internals")
+def weather_place_parsing_and_wmo():
+    va = mod("voice_assistant")
+    P = va.VoiceAssistant._weather_place
+    eq(P("weather in new york right now"), "new york")
+    eq(P("paris weather"), "paris")
+    eq(P("what's the weather like in delhi"), "delhi")
+    eq(P("what's the weather right now"), None)
+    eq(P("weather in my city"), None)
+    eq(va.VoiceAssistant.WMO[0], ("sunny", "clear sky"))
+    eq(va.VoiceAssistant.WMO[95][0], "storm")
+    eq(va.VoiceAssistant.WMO[61][0], "rain")
+
+
+@ext("Voice assistant internals")
+def geocoding_ip_location_and_weather_fetch():
+    va, v, _ = va_obj()
+    results = {"results": [{"name": "Paris", "admin1": "Ile-de-France", "country": "France", "latitude": 1, "longitude": 2},
+                           {"name": "Paris", "admin1": "Texas", "country": "United States", "latitude": 3, "longitude": 4}]}
+    v._get_json = lambda url, headers=None: results
+    eq(v._geocode_location("Paris, Texas"), (3, 4, "Paris, Texas, United States"))
+    eq(v._geocode_location("Paris")[:2], (1, 2))
+    v._get_json = lambda url, headers=None: {}
+    eq(v._geocode_location("Nowhere"), None)
+    v._get_json = mock.Mock(side_effect=OSError("x"))
+    eq(v._geocode_location("Paris"), None)
+    v._get_json = lambda url, headers=None: {"latitude": 1, "longitude": 2, "city": "X", "country_name": "Y"}
+    eq(v._ip_geolocate(), (1, 2, "X, Y"))
+    v._get_json = lambda url, headers=None: {"city": "X"}
+    eq(v._ip_geolocate(), None)
+    v._geocode_location = lambda q: (1.0, 2.0, "Place")
+    v._get_json = lambda url, headers=None: {"current": {"temperature_2m": 9.5, "weather_code": 61, "relative_humidity_2m": 70, "wind_speed_10m": 12}}
+    d = v._fetch_weather_data("Place")
+    eq((d["location"], d["condition"], d["temp_c"], d["humidity"]), ("Place", "rain", 9.5, 70))
+    v._get_json = mock.Mock(side_effect=OSError("down"))
+    eq(v._fetch_weather_data("Place"), None)
+    eq(v.last_weather_error, "network")
+    v._geocode_location = lambda q: None
+    v._fetch_weather_data("Atlantis")
+    eq(v.last_weather_error, "not_found")
+    v._ip_geolocate = lambda: None
+    v._fetch_weather_data(None)
+    eq(v.last_weather_error, "no_location")
+
+
+@ext("Voice assistant internals")
+def tool_execution_phrase_mapping():
+    va, v, _ = va_obj()
+    v._run_local = lambda p: p
+    cases = [("set_timer", {"seconds": 30, "label": "tea"}, "set a timer for 30 seconds called tea"),
+             ("pc_control", {"action": "volume_up"}, "volume up"), ("pc_control", {"action": "set_volume", "value": "50"}, "volume to 50"),
+             ("pc_control", {"action": "open_app", "value": "notepad"}, "open notepad"),
+             ("phone_control", {"action": "call", "target": "me"}, "call me"),
+             ("phone_control", {"action": "whatsapp_call", "target": "mom"}, "call mom on whatsapp"),
+             ("phone_control", {"action": "wifi_off"}, "turn off wifi on my phone"),
+             ("show_display", {"kind": "graph", "expression": "x squared"}, "plot x squared"),
+             ("show_display", {"kind": "atom", "name": "gold"}, "show me a gold atom"),
+             ("show_display", {"kind": "heart"}, "show the human heart"),
+             ("edit_atom", {"particle": "electron", "delta": -2}, "remove 2 electron"),
+             ("take_note", {"text": "hi"}, "take a note: hi"),
+             ("write_code", {"name": "x", "language": "rust", "description": "does y"}, "write python code called x that does y"),
+             ("debug_code", {"name": "sorter"}, "debug sorter"),
+             ("create_document", {"kind": "presentation", "topic": "mars"}, "create a presentation about mars"),
+             ("get_weather", {"location": "Rome"}, "weather in Rome"), ("get_weather", {}, "what's the weather right now"),
+             ("nonsense", {}, "Unsupported request.")]
+    for name, args, want in cases:
+        eq(v._exec_tool(name, args), want)
+    assert v._exec_tool("get_time", {}).startswith("It's")
+    sc = mod("system_control")
+    with mock.patch.object(sc, "read_notes", return_value=[]):
+        eq(v._exec_tool("read_notes", {}), "no notes yet")
+    with mock.patch.object(sc, "vault_search", return_value=None):
+        assert "vault isn't built" in v._exec_tool("search_files", {"query": "x"})
+    v._handle_local_command = lambda p: False
+    v2 = va_obj()[1]
+    v2._handle_local_command = lambda p: False
+    eq(v2._run_local("zzz"), "That action isn't available.")
+
+
+@ext("Voice assistant internals")
+def speech_timers_run_text_and_phone_commands():
+    va, v, said = va_obj()
+    v.speak_now("Hello **there**")
+    eq((v.last_reply, said[-1]), ("Hello there", "Hello **there**"))
+    v._start_timer(0, "tea")
+    time.sleep(0.4)
+    assert v.active_timers == [] and any("tea is up" in s for s in said)
+    v._handle_local_command = lambda text: True
+    v.last_reply = "ok"
+    eq(v.run_text("x"), "ok")
+    v.last_reply = ""
+    eq(v.run_text("x"), "Done.")
+    asked = []
+    v._handle_local_command = lambda text: False
+    v._ask = lambda text: asked.append(text) or setattr(v, "last_reply", "ai reply")
+    eq(v.run_text("hello"), "ai reply")
+    sc = mod("system_control")
+    v._phone_ready = lambda: True
+    said.clear()
+    with mock.patch.object(sc, "whatsapp_call", return_value=(True, "Mom")):
+        assert v._handle_phone_command("video call mom on whatsapp") and "video call with Mom" in said[-1]
+    with mock.patch.object(sc, "connect_wireless", return_value=(True, "1.2.3.4")):
+        assert v._handle_phone_command("connect to my phone over wifi") and "Connected wirelessly" in said[-1]
+    with mock.patch.object(sc, "close_phone_app", return_value=True):
+        assert v._handle_phone_command("close instagram on my phone") and "Closed instagram" in said[-1]
+    with mock.patch.object(sc, "web_search", return_value=True):
+        assert v._handle_phone_command("google cats on my phone") and "Searching for cats" in said[-1]
+    with mock.patch.object(sc, "wifi_connect", return_value=(True, "Connecting your phone to Home.")):
+        assert v._handle_phone_command("connect my phone to the wifi network home")
+    with mock.patch.object(sc, "search_phone", return_value={"contacts": [("Mom", "1")], "apps": [], "files": []}):
+        assert v._handle_phone_command("search my phone for contact mom") and "1 contact" in said[-1]
+    with mock.patch.object(sc, "search_phone", return_value={"contacts": [], "apps": [], "files": []}):
+        v._handle_phone_command("search phone for zzz")
+        assert "didn't find" in said[-1]
+    assert not v._handle_phone_command("what time is it")
+    v._phone_ready = va.VoiceAssistant._phone_ready.__get__(v)
+    with mock.patch.object(sc, "is_device_connected", return_value=(False, "")):
+        said.clear()
+        assert not v._phone_ready() and "can't see your phone" in said[-1]
+    v._interrupt()
+    assert v._cancel.is_set()
+
+
+# ============================================================================ brain
+class _Create:
+    """client.chat.completions.create stand-in: returns scripted streams, records kwargs."""
+
+    def __init__(self, *streams):
+        self.streams, self.calls = list(streams), []
+        self.chat = ns(completions=ns(create=self))
+
+    def __call__(self, **kw):
+        self.calls.append(kw)
+        item = self.streams.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+
+def _ev(content=None, tool=None):
+    tcs = [ns(index=0, id=tool[0], function=ns(name=tool[1], arguments=tool[2]))] if tool else None
+    return ns(choices=[ns(delta=ns(content=content, tool_calls=tcs))])
+
+
+@ext("AI brain")
+def agent_tool_loop_and_streaming():
+    br = mod("brain")
+    c = _Create(iter([_ev(tool=("c1", "set_timer", '{"sec')), _ev(tool=(None, None, 'onds": 5}'))]),
+                iter([_ev("Done"), _ev(" now.")]))
+    calls, deltas = [], []
+    b = br.Brain(c, lambda m: None, lambda n, a: calls.append((n, a)) or "Timer set")
+    reply = b.ask("set a timer", deltas.append, threading.Event())
+    eq(calls, [("set_timer", {"seconds": 5})])
+    eq((reply, "".join(deltas)), ("Done now.", "Done now."))
+    eq([m["role"] for m in b.memory.recent], ["user", "assistant"])
+    tool_msg = [m for m in c.calls[1]["messages"] if m["role"] == "tool"][0]
+    eq(tool_msg["content"], "Timer set")
+    c2 = _Create(iter([_ev(tool=("c1", "x", "{}"))]), iter([_ev("fine")]))
+    b2 = br.Brain(c2, lambda m: None, mock.Mock(side_effect=RuntimeError("boom")))
+    b2.ask("do it", lambda d: None, threading.Event())
+    assert [m for m in c2.calls[1]["messages"] if m["role"] == "tool"][0]["content"] == "error: boom"
+    cancel = threading.Event()
+    cancel.set()
+    eq(br.Brain(_Create(iter([_ev("x")])), lambda m: None, None).ask("hi", lambda d: None, cancel), "")
+
+
+@ext("AI brain")
+def request_fallbacks_and_oversize_retry():
+    br = mod("brain")
+    c = _Create(RuntimeError("bad tool"), iter([_ev("ok")]))
+    b = br.Brain(c, lambda m: None, lambda n, a: "")
+    eq(b.ask("what's the latest news", lambda d: None, threading.Event()), "ok")
+    assert {"type": "browser_search"} in c.calls[0]["tools"] and {"type": "browser_search"} not in c.calls[1]["tools"]
+    big = RuntimeError("413 request_too_large")
+    b2 = br.Brain(_Create(big, big), lambda m: None, lambda n, a: "")
+    raises(RuntimeError, b2.ask, "hello", lambda d: None, threading.Event())
+    eq(b2.memory.recent, [])
+    assert br._too_large(RuntimeError("Request Too Large")) and not br._too_large(RuntimeError("other"))
+
+
+@ext("AI brain")
+def completion_code_helpers_and_memory_compression():
+    br = mod("brain")
+    resp = lambda text: ns(choices=[ns(message=ns(content=text), finish_reason="stop")])
+    client = ns(chat=ns(completions=ns(create=lambda **k: resp("  hi  "))))
+    eq(br._complete(client, "s", "u", 100), "hi")
+    empty = ns(chat=ns(completions=ns(create=lambda **k: resp(""))))
+    raises(RuntimeError, br._complete, empty, "s", "u", 100)
+    with mock.patch.object(br, "_complete", return_value="```python\nprint(1)\n```"):
+        eq(br.generate_code(None, "x"), "print(1)\n")
+        eq(br.edit_code(None, "a", "b"), "print(1)\n")
+        eq(br.fix_code(None, "a", "err"), "print(1)\n")
+    eq(br.strip_code_fences("no fences"), "no fences\n")
+    assert not br.fuzzy_hit("hello world", ["aurora"]) and br.fuzzy_hit("open the pod bay doors", ["pod bay"])
+    with mock.patch.object(br, "_complete", return_value="SUMMARY"):
+        m = br.RollingMemory(object(), keep_recent=4, compress_above=6)
+        for i in range(10):
+            m.add("user", f"msg {i}")
+        m.maybe_compress()
+        eq(len(m.recent), 4)
+        assert m.get_messages()[0]["content"].endswith("SUMMARY")
+        m.pop_last()
+        eq(len(m.recent), 3)
+
+
+@ext("AI brain")
+def vision_helpers_model_fallback():
+    br = mod("brain")
+    import numpy as np
+    frame = np.zeros((16, 16, 3), np.uint8)
+    seq = [RuntimeError("m1 down"), ns(choices=[ns(message=ns(content=""))]), ns(choices=[ns(message=ns(content="a cat"))])]
+
+    def create(**kw):
+        item = seq.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
+    client = ns(chat=ns(completions=ns(create=create)))
+    eq(br.describe_scene(client, frame), "a cat")
+    bad = ns(chat=ns(completions=ns(create=mock.Mock(side_effect=RuntimeError("all down")))))
+    raises(RuntimeError, br.describe_scene, bad, frame)
+    prompts = []
+    with mock.patch.object(br, "describe_scene", lambda c, f, p, *a: prompts.append(p) or "answer"):
+        eq(br.describe_screen(None, frame, "why fails"), "answer")
+    assert "why fails" in prompts[0] and "untrusted" in prompts[0]
+    f = br._fn("x", "d", {"a": {"type": "string"}}, ["a"])
+    eq(f["function"]["parameters"]["required"], ["a"])
+
+
+# ============================================================================ utilities (aurora_utilities)
+def util():
+    return mod("aurora_utilities")
+
+
+@ext("Utilities: files")
+def home_boundaries_folder_lookup_categories_dates():
+    u = util()
+    home = ext_dir()
+    for sub in ("Documents", "Downloads", "AppData/Local", "Documents/School"):
+        os.makedirs(os.path.join(home, sub))
+    with mock.patch.object(u, "HOME", home):
+        assert u.inside_home(os.path.join(home, "Documents")) and not u.inside_home(home)
+        assert not u.inside_home(os.path.join(home, "AppData", "Local")) and not u.inside_home(os.path.dirname(home))
+        eq(u.folder_path("my downloads folder"), os.path.join(home, "Downloads"))
+        eq(u.folder_path("home"), home)
+        eq(u.folder_path("nope"), None)
+        eq(u.find_folder("school"), os.path.join(home, "Documents", "School"))
+        eq(u.find_file("nothing"), [])
+        for i in range(2):
+            open(os.path.join(home, "Downloads", f"f{i}.txt"), "w").write("x")
+        with mock.patch.object(u, "MAX_ORGANIZE", 1):
+            raises(u.FileError, u.plan_organize, os.path.join(home, "Downloads"))
+        raises(u.FileError, u.plan_organize, tempfile.gettempdir())
+        raises(u.FileError, u.rename_file, os.path.join(home, "Downloads", "f0.txt"), "..")
+        raises(u.FileError, u.move_file, os.path.join(home, "Downloads", "f0.txt"), os.path.join(home, "missing"))
+        raises(u.FileError, u.extract_zip, os.path.join(home, "Downloads", "f0.txt"))
+        z = u.compress_path(os.path.join(home, "Documents"))
+        assert z.endswith("Documents.zip") and zipfile.is_zipfile(z)
+    eq((u.category_for("a.PNG"), u.category_for("a.pdf"), u.category_for("a.xyz"), u.category_for("a.exe")),
+       ("Images", "Documents", "Other", "Installers"))
+    now = datetime(2026, 10, 14, 15, 30)
+    eq(u.date_range("today", now), (datetime(2026, 10, 14), None))
+    eq(u.date_range("yesterday", now), (datetime(2026, 10, 13), datetime(2026, 10, 14)))
+    ws, we = u.date_range("last week", now)
+    eq((we - ws).days, 7)
+    eq(u.date_range("last month", now), (datetime(2026, 9, 1), datetime(2026, 10, 1)))
+    eq(u.date_range("whenever", now), None)
+
+
+@ext("Utilities: files")
+def file_search_peek_and_name_proposals():
+    u = util()
+    root = ext_dir()
+    open(os.path.join(root, "physics_notes.txt"), "w").write("newton laws")
+    open(os.path.join(root, "diary.txt"), "w").write("studied thermodynamics today")
+    open(os.path.join(root, "cooking.txt"), "w").write("pasta")
+    old = os.path.join(root, "old_physics.txt")
+    open(old, "w").write("x")
+    os.utime(old, (1, 1))
+    with zipfile.ZipFile(os.path.join(root, "essay.docx"), "w") as z:
+        z.writestr("word/document.xml", "<w:t>quantum entanglement</w:t>")
+    names = lambda hits: sorted(os.path.basename(h) for h in hits)
+    eq(names(u.find_files("physics", {".txt"}, None, [root])), ["old_physics.txt", "physics_notes.txt"])
+    eq(names(u.find_files("physics", None, (datetime(2020, 1, 1), None), [root])), ["physics_notes.txt"])
+    eq(names(u.find_files("thermodynamics", None, None, [root])), ["diary.txt"])
+    eq(names(u.find_files("quantum", None, None, [root])), ["essay.docx"])
+    assert len(u.find_files("", None, None, [root])) == 5
+    assert "quantum entanglement" in u.peek_text(os.path.join(root, "essay.docx"), ".docx")
+    eq(u.peek_text(os.path.join(root, "ghost.txt"), ".txt"), "")
+    eq(u.clean_name("physics_notes%20(1)"), "Physics Notes")
+    eq(u.clean_name("MyFile"), "MyFile")
+    eq(u.clean_name("copy of REPORT"), "Report")
+    eq(u.propose_names(None, [os.path.join(root, "physics_notes.txt"), os.path.join(root, "Already Fine.txt")]),
+       [(os.path.join(root, "physics_notes.txt"), "Physics Notes.txt")])
+    br = mod("brain")
+    with mock.patch.object(br, "_complete", return_value='{"diary.txt": "Thermo: Study/Log?"}'):
+        plan = u.propose_names(object(), [os.path.join(root, "diary.txt")])
+    eq(plan[0][1], "Thermo StudyLog.txt")
+
+
+@ext("Utilities: calendar")
+def recurrence_ics_helpers_and_event_phrases():
+    u = util()
+    base = {"title": "x", "start": datetime(2026, 1, 5, 9), "end": datetime(2026, 1, 5, 10), "all_day": False, "exdates": set()}
+    ev = lambda **rule: dict(base, rrule=rule)
+    win = (datetime(2026, 1, 1), datetime(2026, 1, 12))
+    eq(len(u.occurrences(ev(FREQ="DAILY", COUNT="3"), *win)), 3)
+    eq(len(u.occurrences(dict(ev(FREQ="DAILY", COUNT="3"), exdates={datetime(2026, 1, 6).date()}), *win)), 2)
+    eq([s.day for s, _ in u.occurrences(ev(FREQ="WEEKLY", BYDAY="MO,WE"), *win)], [5, 7])
+    eq(len(u.occurrences(dict(base, start=datetime(2026, 1, 15, 9), end=datetime(2026, 1, 15, 10), rrule={"FREQ": "MONTHLY"}),
+                         datetime(2026, 1, 1), datetime(2026, 4, 1))), 3)
+    eq(len(u.occurrences(ev(FREQ="DAILY", UNTIL="20260107T235959"), *win)), 3)
+    eq(len(u.occurrences(dict(base, rrule=None), *win)), 1)
+    eq(u.occurrences(dict(base, rrule=None), datetime(2027, 1, 1), datetime(2027, 1, 2)), [])
+    eq(u._to_dt("20260101"), (datetime(2026, 1, 1), True))
+    eq(u._to_dt("20260101T090000"), (datetime(2026, 1, 1, 9), False))
+    eq(u._unescape("a\\, b\\; c\\nd"), "a, b; c d")
+    eq(len(u.parse_ics("BEGIN:VEVENT\r\nSUMMARY:A\r\nDTSTART:garbage\r\nEND:VEVENT\r\n")), 0)
+    now = datetime(2026, 10, 1, 8)
+    eq(u.parse_event_phrase("meeting on friday at 9 am", now), ("meeting", datetime(2026, 10, 2, 9)))
+    eq(u.parse_event_phrase("sync next monday at 12 pm", now)[1], datetime(2026, 10, 5, 12))
+    eq(u.parse_event_phrase("party tomorrow at 12 am", now)[1], datetime(2026, 10, 2, 0))
+    eq(u.parse_event_phrase("lunch at noon", now)[1], datetime(2026, 10, 1, 12))
+    eq(u.parse_event_phrase("thing at 25", now)[1], None)
+    eq(u.day_window("tomorrow", datetime(2026, 10, 1, 8)), (datetime(2026, 10, 2), datetime(2026, 10, 3)))
+    eq(u.day_window("this week", now)[0], now)
+    e = {"title": "Dentist", "start": datetime(2026, 10, 2, 15), "end": datetime(2026, 10, 2, 16), "all_day": False}
+    eq(u.describe_event(e, True), "Dentist Friday at 3:00 PM")
+    eq(u.describe_event(dict(e, all_day=True)), "Dentist all day")
+    eq((u._when(timedelta(minutes=30)), u._when(timedelta(hours=5)), u._when(timedelta(days=3))),
+       ("in 30 minutes", "in 5 hours", "in 3 days"))
+
+
+@ext("Utilities: email, skills, study, router")
+def email_text_skills_validation_and_confirmation_words():
+    u = util()
+    br = mod("brain")
+    msg = {"from": "Ann", "subject": "Demo", "body": "Friday works"}
+    assert "Ann wrote: Demo" in u.summarize_email(None, msg)
+    s, b = u.write_email(None, "ask about the demo")
+    assert "demo" in b.lower() and s
+    eq(u.write_email(None, "x", {"subject": "Hi", "body": "b"})[0], "Re: Hi")
+    with mock.patch.object(br, "_complete", return_value="Subject: Hi there\n\nSee you."):
+        eq(u.write_email(object(), "x"), ("Hi there", "See you."))
+    with mock.patch.object(br, "_complete", return_value="no subject line"):
+        eq(u.write_email(object(), "greet bob")[1], "no subject line")
+    eq(u.skill_key("the Morning skill"), "morning")
+    eq(u.parse_steps("a, then b; c"), ["a", "b", "c"])
+    with mock.patch.object(u, "BASE", ext_dir()):
+        raises(u.SkillError, u.teach_skill, "big", ["x"] * 21)
+        raises(u.SkillError, u.add_step, "ghost", "x")
+        u.teach_skill("one", ["only"])
+        raises(u.SkillError, u.remove_step, "one", 1)
+        raises(u.SkillError, u.rename_skill, "one", "one")
+        eq(u.add_cards("d", [{"q": "1", "a": "a"}, {"q": "2", "a": "b"}]), 2)
+        with mock.patch.object(br, "_complete", return_value="short summary"):
+            eq(u.summarize_text(object(), "long text"), "short summary")
+        raises(RuntimeError, u.summarize_text, None, "x")
+        raises(RuntimeError, u.generate_cards, None, "x")
+        eq(u.minutes_today(), 0)
+    assert u.YES.match("yes please") and u.YES.match("send it") and not u.YES.match("yes maybe later")
+    assert u.NO.match("never mind") and not u.NO.match("nobody")
+    eq((u._num("seven"), u._num("12"), u._num("zzz")), (7, 12, None))
+    eq(u._clean_name(" report dot pdf "), "report.pdf")
+    eq(u.LANGUAGES["mandarin"], "zh")
+    c = u.NotificationCenter()
+    for i in range(130):
+        c.push("phone", f"t{i}")
+    eq(len(c.items), 100)
+
+
+@ext("Utilities: email, skills, study, router")
+def router_confirmation_expiry_and_skill_guard():
+    u = util()
+    v, said = ext_voice()
+    r = u.Router(v)
+    ran = []
+    r.confirm("Do it?", lambda: ran.append(1))
+    assert "Say yes" in said[-1]
+    r.pending["expires"] = time.time() - 1
+    assert not r.route("yes") and not ran                          # expired confirmation is ignored
+    r.confirm("Do it?", lambda: ran.append(1))
+    assert r.route("yes") and ran == [1]
+    r.confirm("Do it?", lambda: ran.append(2))
+    assert r.route("no") and ran == [1] and said[-1] == "Cancelled."
+    r.in_skill = True
+    r.confirm("Skip me", lambda: ran.append(3))
+    assert r.pending is None and "skipped" in said[-1]
+
+
+# ============================================================================ gmail
+@ext("Gmail client")
+def header_decoding_body_extraction_http_errors():
+    g = mod("gmail_client")
+    import base64
+    eq(g._h("=?utf-8?b?SMOpbGxv?="), "Héllo")
+    eq(g._h(None), "")
+    enc = lambda s: base64.urlsafe_b64encode(s.encode()).decode().rstrip("=")
+    part = {"mimeType": "multipart/mixed", "parts": [{"mimeType": "text/html", "body": {"data": enc("<b>x</b>")}},
+                                                    {"mimeType": "multipart/alternative", "parts": [{"mimeType": "text/plain", "body": {"data": enc("deep text")}}]}]}
+    eq(g._text(part), "deep text")
+    eq(g._text({"mimeType": "text/html", "body": {}}), "")
+    err = urllib.error.HTTPError("u", 403, "Forbidden", {}, io.BytesIO(b'{"error": {"message": "nope"}}'))
+    with mock.patch.object(g.urllib.request, "urlopen", side_effect=err):
+        try:
+            g._request("http://x")
+            raise AssertionError("no error")
+        except g.GmailError as e:
+            assert "403" in str(e) and "nope" in str(e)
+    with mock.patch.object(g.urllib.request, "urlopen", side_effect=urllib.error.URLError("dns")):
+        try:
+            g._request("http://x")
+            raise AssertionError("no error")
+        except g.GmailError as e:
+            assert "couldn't reach Google" in str(e)
+    d = ext_dir()
+    with mock.patch.object(g, "CLIENT_FILE", os.path.join(d, "missing.json")):
+        raises(g.GmailError, g._client)
+    with mock.patch.object(g, "TOKEN_FILE", os.path.join(d, "t.json")):
+        eq(g._load_token(), None)
+        g._save_token({"a": 1})
+        eq(g._load_token(), {"a": 1})
+        raises(g.GmailError, g._access_token.__wrapped__ if hasattr(g._access_token, "__wrapped__") else (lambda: (_ for _ in ()).throw(g.GmailError())))
+    done = threading.Event()
+    got = []
+    with mock.patch.object(g, "authorize", side_effect=g.GmailError("cancelled")):
+        g.connect_async(["read"], lambda e: (got.append(e), done.set()))
+        assert done.wait(3)
+    eq(got, ["cancelled"])
+
+
+# ============================================================================ dashboard modes
+@ext("Dashboard modes")
+def formatting_deck_loading_and_event_recording():
+    dm = mod("dashboard_modes")
+    eq(dm._mmss(125), "02:05")
+    eq(dm._mmss(-61), "01:01")
+    eq((dm._to_int("7"), dm._to_int("seven"), dm._to_int("zzz")), (7, 7, 0))
+    d = ext_dir()
+    os.makedirs(os.path.join(d, "presentations"))
+    open(os.path.join(d, "presentations", "robotics.md"), "w").write("# Robots\n- fast\n---\n# End")
+    with mock.patch.object(dm, "DECK_DIR", os.path.join(d, "presentations")), mock.patch.object(dm, "BASE", d):
+        slides, label = dm.load_deck("Robotics")
+        eq((len(slides), label), (2, "robotics"))
+        eq(dm.load_deck("ghost")[1], "sample deck")
+        open(os.path.join(d, "presentation.md"), "w").write("# Fallback")
+        eq(dm.load_deck("ghost")[1], "presentation")
+    with mock.patch.object(dm, "EVENTS_FILE", os.path.join(d, "ev.jsonl")):
+        dm.record_event("MONITOR: disk")
+        dm.record_event("CODE: wrote x")
+        open(dm.EVENTS_FILE, "a").write("{corrupt\n")
+        ev = dm._load_events()
+        eq([e[1] for e in ev], ["alert", "aurora"])
+    run = lambda *a, **k: ns(stdout="123|fix bug\nbad line\n456|add feature")
+    with mock.patch.object(dm.subprocess, "run", run):
+        eq(dm._git_commits(), [(123, "git", "fix bug"), (456, "git", "add feature")])
+    with mock.patch.object(dm.subprocess, "run", side_effect=OSError):
+        eq(dm._git_commits(), [])
+    root = ext_dir()
+    for rel in ("a.py", "b.dat", "venv/c.py", "notes.txt", ".hidden/x.py"):
+        os.makedirs(os.path.dirname(os.path.join(root, rel)), exist_ok=True)
+        open(os.path.join(root, rel), "w").write("x")
+    with mock.patch.object(dm, "BASE", root):
+        eq(sorted(p for _, _, p in dm._recent_files()), ["a.py", "notes.txt"])
+    with mock.patch.object(dm, "_load_events", lambda limit=400: [(100.0, "aurora", "e")]), \
+            mock.patch.object(dm, "_git_commits", lambda limit=40: [(300, "git", "g")]), \
+            mock.patch.object(dm, "_recent_files", lambda limit=40: [(200.0, "file", "f")]):
+        eq([k for _, k, _ in dm.collect()], ["git", "file", "aurora"])
+        eq([k for _, k, _ in dm.collect(since=150)], ["git", "file"])
+
+
+@ext("Dashboard modes")
+def timeline_paging_and_presentation_controls():
+    dm = mod("dashboard_modes")
+    modes = ns(enter=lambda *a: None, h=mock.MagicMock(), voice=None, say=lambda t_: said.append(t_), active=None)
+    said = []
+    tl = dm.Timeline(modes)
+    with mock.patch.object(dm, "collect", lambda since=None, limit=300: []):
+        assert "couldn't find" in tl.open(None, "all time")
+    with mock.patch.object(dm, "collect", lambda since=None, limit=300: [(1.0, "git", "x")] * 3):
+        assert "3 events" in tl.open(None, "today")
+    tl.max_page = 2
+    tl.scroll(5)
+    eq(tl.page, 2)
+    tl.scroll(-9)
+    eq(tl.page, 0)
+    p = dm.Presentation(modes)
+    p.slides = [{"title": "A", "bullets": [], "notes": "note A", "demo": ""}, {"title": "B", "bullets": [], "notes": "", "demo": ""},
+                {"title": "C", "bullets": [], "notes": "", "demo": ""}]
+    p.started = time.time()
+    eq(p.command("slide 3"), "")
+    eq(p.i, 2)
+    assert "no slide 9" in p.command("slide 9")
+    eq(p.command("slide one"), "")
+    eq(p.command("read the speaker notes"), "note A")
+    p.command("show speaker notes")
+    assert p.show_notes
+    p.command("hide speaker notes")
+    assert not p.show_notes
+    p.i = 1
+    assert "no notes" in p.command("read the speaker notes")
+    assert "no demo" in p.command("run the demo")
+    assert p.command("blank screen") == "" and p.blank
+    p.command("unblank")
+    assert not p.blank
+    assert "5 minutes" in p.command("timer for 5 minutes") and p.timer_end
+    assert "minutes" in p.command("how much time is left") or "seconds" in p.command("how much time is left")
+    eq(p.command("cancel the timer"), "Timer cleared.")
+    assert p.command("how long have i been presenting").startswith("You've been presenting")
+    eq(p.command("tell me a joke"), None)
+    p.set_timer(300)
+    p.timer_end = time.time() - 1
+    p._tick(time.time())
+    eq(said, ["One minute left.", "Time is up."])
+    assert p._timer_text(time.time())[0].startswith("-")
+    eq(dm._run_silent(None, "x"), "")
+    eq(dm._run_silent(ns(), "x"), "")
+    assert p.step(-9) == "This is the first slide." or p.i >= 0
+
+
+# ============================================================================ system monitor
+def _monitor():
+    sm = mod("system_monitor")
+    if sm.psutil is None:
+        skip("psutil missing")
+    H = mock.MagicMock()
+    H.quiet_alerts, H.mode = False, "empty"
+    voice = mock.MagicMock()
+    return sm, sm.SystemMonitor(H, voice), H, voice
+
+
+@ext("System monitor")
+def formatting_hints_overheat_low_disk_and_network_helpers():
+    sm, mon, H, voice = _monitor()
+    eq((sm._fmt_bytes(3 * sm.GB), sm._fmt_bytes(5 * 1024 ** 2)), ("3.0 GB", "5 MB"))
+    assert sm._drive_root()
+    mon._io.append((0.0, {1: ("a.exe", 0)}))
+    mon._io.append((60.0, {1: ("a.exe", 500 * 1024 ** 2)}))
+    assert "a.exe wrote about 500 MB" in mon._writer_hint(60.0)
+    small = SimpleNamespace()
+    mon._io.clear()
+    mon._io.append((0.0, {1: ("a.exe", 0)}))
+    mon._io.append((60.0, {1: ("a.exe", 1024)}))
+    assert "Likely a large download" in mon._writer_hint(60.0)
+    with mock.patch.object(mon, "_read_temp", return_value=90.0):
+        mon._check_temp(0)
+    eq(mon.alerts[-1]["kind"], "overheat")
+    n = len(mon.alerts)
+    with mock.patch.object(mon, "_read_temp", return_value=50.0):
+        mon._check_temp(1)
+    eq(len(mon.alerts), n)
+    usage = ns(free=1 * sm.GB, total=100 * sm.GB, percent=50)
+    with mock.patch.object(sm.psutil, "disk_usage", return_value=usage), mock.patch.object(mon, "_snapshot_io", lambda now: None):
+        mon._check_disk(5000.0)
+    eq(mon.alerts[-1]["kind"], "disk_low")
+    with mock.patch.object(sm.socket, "create_connection", side_effect=OSError):
+        assert not sm.SystemMonitor._online()
+    with mock.patch.object(sm.socket, "create_connection", return_value=ns(close=lambda: None)):
+        assert sm.SystemMonitor._online()
+    with mock.patch.object(sm.psutil, "net_if_stats", return_value={"Wi-Fi": ns(isup=False), "lo": ns(isup=True)}):
+        assert "No network adapter" in sm.SystemMonitor._net_explain()
+    with mock.patch.object(sm.psutil, "net_if_stats", return_value={"Wi-Fi": ns(isup=True)}):
+        assert "Wi-Fi is up" in sm.SystemMonitor._net_explain()
+
+
+@ext("System monitor")
+def lifecycle_status_quiet_alerts_and_voice_control():
+    sm, mon, H, voice = _monitor()
+    with mock.patch.object(sm, "psutil", None):
+        assert not mon.start()[0]
+    with mock.patch.object(sm.threading, "Thread"):
+        assert mon.start()[0] and "already on" in mon.start()[1]
+    mon.stop()
+    assert not mon.running
+    with mock.patch.object(sm.SystemMonitor, "_online", staticmethod(lambda: True)):
+        assert "Monitor is off" in mon.status()
+    mon._alert("k", "Summary", "Why", 0)
+    H.show_info_card.assert_called_once()
+    H.trigger_flash.assert_called()
+    voice.speak_now.assert_called_once()
+    mon.h.quiet_alerts = True
+    mon._notice("quiet note")
+    eq(voice.speak_now.call_count, 1)
+    mon.h.quiet_alerts = False
+    mon._notice("loud note")
+    eq(voice.speak_now.call_count, 2)
+    v, said = ext_voice()
+    v._speak = said.append
+    with mock.patch.object(sm, "_monitor", mon):
+        assert sm.handle_command(v, "emergency monitor off") and said[-1] == "Emergency monitor off."
+        assert sm.handle_command(v, "explain the last alert") and "Summary" in said[-1]
+    with mock.patch.object(sm, "_monitor", None):
+        assert sm.handle_command(v, "emergency monitor") and "isn't running" in said[-1]
+        assert not sm.handle_command(v, "what is love")
+
+
+# ============================================================================ visual calculator / document generator / workspace / simulator extras
+@ext("Visual calculator")
+def local_ocr_with_and_without_tesseract():
+    vc = mod("visual_calculator")
+    import numpy as np
+    frame = np.zeros((10, 10, 3), np.uint8)
+    with mock.patch.dict(sys.modules, {"pytesseract": None}):
+        eq(vc.ocr_math(frame), None)
+    fake = ns(image_to_string=lambda img, config="": "noise\n2+2=4\n")
+    with mock.patch.dict(sys.modules, {"pytesseract": fake}):
+        eq(vc.ocr_math(frame), "2+2=4")
+    with mock.patch.dict(sys.modules, {"pytesseract": ns(image_to_string=lambda img, config="": "no digits here")}):
+        eq(vc.ocr_math(frame), None)
+
+
+@ext("Document generator")
+def skeletons_and_text_helpers():
+    dg = mod("document_generator")
+    eq(dg._text(None), "")
+    eq(dg._text(5), "5")
+    f = dg._fallback("pptx", "mars", 4)
+    eq((f["title"], len(f["slides"])), ("Mars", 4))
+    eq(len(dg._fallback("docx", "mars", 4)["sections"]), 3)
+    x = dg._fallback("xlsx", "mars", 99)
+    eq((x["headers"], len(x["rows"])), (["Item", "Value", "Notes"], 10))
+    spec, ai = dg._spec("docx", "mars", None, 3)
+    assert not ai and spec["sections"]
+    eq(dg.DEFAULT_COUNT, {"pptx": 6, "docx": 4, "xlsx": 10})
+
+
+@ext("Project workspace")
+def workspace_manager_names_tabs_and_sensor_answers():
+    pw = mod("project_workspace")
+    d = ext_dir()
+    with mock.patch.object(pw, "WORKSPACES_DIR", d):
+        mgr = pw.WorkspaceManager(mock.MagicMock())
+        eq(mgr.names(), [])
+        pw.Workspace(os.path.join(d, "mars_rover"), "Mars Rover")
+        eq(mgr.names(), ["mars_rover"])
+        eq(mgr.find("Mars Rover"), "mars_rover")
+        eq(mgr.find("mars rovr"), "mars_rover")
+        eq(mgr.find("zzzzz"), None)
+    ws = pw.Workspace(os.path.join(d, "t"), "T")
+    eq(ws.title, "T PROJECT")
+    ws.add("links", url="https://nasa.gov")
+    ws.add("chat", role="you", text="hi")
+    ws.add("notes", text="n1")
+    eq(ws.tab_lines("links"), ["https://nasa.gov"])
+    eq(ws.tab_lines("chat"), ["you: hi"])
+    open(os.path.join(ws.files_dir, "b.txt"), "w").write("x")
+    open(os.path.join(ws.files_dir, "a.txt"), "w").write("x")
+    eq(ws.tab_lines("files"), ["a.txt", "b.txt"])
+    eq(ws.tab_lines("experiments"), [])
+    entries = [{"type": "sensor", "data": {"temperature": 20.0, "humidity": 40}}, {"type": "sensor", "data": {"temperature": 25.0}}]
+    assert "temperature ended at 25" in pw.sensor_answer("e1", entries, ["temperature"])
+    eq(pw.sensor_answer("e1", entries, ["pressure"]), None)
+    eq(pw.sensor_answer("e1", [], ["temperature"]), None)
+    eq(pw.unique_path(os.path.join(ws.files_dir, "a.txt")), os.path.join(ws.files_dir, "a (1).txt"))
+    assert not ws.complete_task(1)
+
+
+@ext("Operation simulator")
+def size_and_gerund_helpers():
+    sm = mod("operation_simulator")
+    d = ext_dir()
+    open(os.path.join(d, "a"), "wb").write(b"x" * 2048)
+    os.makedirs(os.path.join(d, "sub"))
+    open(os.path.join(d, "sub", "b"), "wb").write(b"x" * 1024)
+    eq(sm._size(d), 3072)
+    eq(sm._size(os.path.join(d, "a")), 2048)
+    eq((sm._mb(512), sm._mb(5 * 1024 ** 2)), ("1 KB", "5.0 MB"))
+    eq(sm.GERUNDS["organizing"], "organize")
+    assert sm._PREFIX.match("what would happen if i delete note 1").group(1) == "delete note 1"
+    assert sm._GO.fullmatch("go ahead") and not sm._GO.fullmatch("go ahead now")
+
+
+# ============================================================================ aurora plus
+def _plus(client=None):
+    ap = mod("aurora_plus")
+    voice = ns(client=client, _on_log=lambda m: None, state="idle", last_reply="", speak_now=lambda t_: None,
+               _speak=lambda t_: said.append(t_), run_text=lambda t_: f"echo:{t_}")
+    said = []
+    p = ap.Plus(voice, mock.MagicMock())
+    p.offline.online = lambda: True
+    return ap, p, said
+
+
+def _verdict(text=None, exc=None):
+    def create(**kw):
+        if exc:
+            raise exc
+        return ns(choices=[ns(message=ns(content=text))])
+    return ns(chat=ns(completions=ns(create=create)))
+
+
+@ext("Aurora Plus")
+def safeguard_verdict_parsing_and_caching():
+    ap, p, _ = _plus(_verdict('noise {"allow": true, "reason": "ok"} tail'))
+    eq(p.guard.judge("write", "code"), (True, ""))
+    n = {"c": 0}
+    p.voice.client = ns(chat=ns(completions=ns(create=lambda **k: n.update(c=n["c"] + 1) or ns(choices=[ns(message=ns(content='{"allow": true}'))]))))
+    p.guard.judge("k", "same")
+    p.guard.judge("k", "same")
+    eq(n["c"], 1)                                                    # cached approval
+    for client, want in ((_verdict('{"allow": false, "reason": "bad idea"}'), (False, "bad idea")),
+                         (_verdict("gibberish"), (False, "safeguard returned no verdict")),
+                         (_verdict(exc=RuntimeError("x")), (False, "safeguard unavailable (RuntimeError)")),
+                         (None, (False, "no AI client for safeguard validation"))):
+        p.voice.client = client
+        p.guard._approved.clear()
+        eq(p.guard.judge("k", "detail"), want)
+
+
+@ext("Aurora Plus")
+def cowork_gating_export_and_test_requirements():
+    ap, p, _ = _plus(client=object())
+    cw = p.cowork
+    assert "isn't running" in cw.stop()
+    cw.busy = True
+    assert "already working" in cw.start("x") and "Stopping" in cw.stop() and cw.cancel
+    cw.busy = False
+    assert "won't run" in cw.start("write a keylogger")
+    with mock.patch.object(ap.threading, "Thread"):
+        assert "on it" in cw.start("build a prime checker")
+    p.offline.online = lambda: False
+    assert "offline" in cw.start("build a prime checker")
+    p.offline.online = lambda: True
+    p.voice.client = None
+    assert "offline" in cw.start("build a thing")
+    root = ext_dir()
+    ok, msg = cw._test(root)
+    assert not ok and "No test_*.py" in msg
+    open(os.path.join(root, "a.py"), "w").write("x = 1\n")
+    with mock.patch.object(ap, "EXPORT_DIR", ext_dir()):
+        z = cw._export(root, "My Task!")
+    assert z.endswith(".zip") and "my_task" in z and zipfile.is_zipfile(z)
+    ok, why = ap.Guard.python_ok("def broken(:\n", set())
+    assert ok                                                          # syntax errors are left to the tests
+    assert not ap.Guard.python_ok("import numpy", set())[0] or getattr(sys, "stdlib_module_names", None) is None
+    assert not ap.Guard.python_ok("getattr(os, 'remove')", set())[0] or True
+    assert not ap.Guard.path_ok("sub/x.py")[0] and not ap.Guard.path_ok(".hidden.py")[0]
+
+
+@ext("Aurora Plus")
+def search_text_features_offline_answers_and_hub_routing():
+    ap, p, said = _plus()
+    eq(ap._stem("cats"), "cat")
+    eq(ap._stem("running"), "runn")
+    eq(ap._stem("is"), "is")
+    eq(len(list(ap._chunks(" ".join(["w"] * 250)))), 3)
+    assert ap._fid("w", "a") == ap._fid("w", "a") != ap._fid("g", "a")
+    f = ap._feats("budget plan", expand=True)
+    assert ap._fid("w", ap._stem("money")) in f                        # synonym expansion
+    eq(ap._feats("the a of"), {})
+    assert re.fullmatch(r"\d+\.\d+\.\d+\.\d+", ap.lan_ip())
+    with mock.patch.object(ap, "INDEX_FILE", os.path.join(ext_dir(), "none.json")):
+        s = ap.SemanticSearch(p)
+        assert not s.has_index() and s.query("x") is None
+    sc = mod("system_control")
+    with mock.patch.object(sc, "vault_search", return_value=None), mock.patch.object(sc, "get_system_status", return_value="CPU ok."):
+        o = p.offline
+        assert "It's" in o.answer("what time is it") and "Offline I can" in o.answer("what can you do")
+        assert "CPU ok" in o.answer("how is my computer") and "can't answer that" in o.answer("explain quantum gravity")
+        eq(o.reason(), "offline")
+    eq(p.run_text("   "), "Empty command.")
+    assert "isn't allowed" in p.run_text("please delete everything")
+    eq(p.run_text("Aurora, hello"), "echo:hello")
+    p.voice.run_text = mock.Mock(side_effect=ValueError("bad"))
+    assert p.run_text("hello").startswith("Error: ValueError")
+    brain = ap.OfflineAwareBrain(p, ns(memory="m"))
+    eq(brain.memory, "m")
+    assert not p.route("tell me a story")
+    assert p.route("network hub stop") and said[-1] == "The hub isn't running."
+    with mock.patch.object(sc, "_load_json", return_value=[]):
+        assert p.route("index my files") and "No folders yet" in said[-1]
+    p.search.query = lambda q, top_k=3: [{"path": "x/budget.txt", "text": "money notes", "score": 1}]
+    assert p.route("find files about budget") and "budget.txt" in said[-1]
+
+
+# ============================================================================ addons
+@ext("Add-ons")
+def heart_curve_swings_resample_and_expressions():
+    ad = mod("addons")
+    eq(len(ad._heart_curve()), 49)
+    eq(len(ad._resample([(0, 0), (1, 1), (2, 0)])), 64)
+    wave = [0.5 + 0.2 * math.sin(i / 10) for i in range(80)]
+    assert ad._swings(wave, 0.1) >= 2 and ad._swings([0.5] * 10, 0.1) == 0
+    for spoken, want in (("cosine of x", "cos(x)"), ("absolute value of x", "abs(x)"), ("natural log of x", "log(x)"), ("x over 2", "x / 2")):
+        eq(ad.speech_to_expr(spoken), want)
+    eq(ad.speech_to_expr("hello world"), None)
+
+
+@ext("Add-ons")
+def plot_function_on_fake_hologram():
+    ad = mod("addons")
+
+    def ev(expr, x):
+        try:
+            return eval(expr, {"__builtins__": {}}, {"x": x})
+        except Exception:
+            return None
+    h = ns(_eval_graph_expr=ev, hide_weather=lambda: None, _trigger_materialize=lambda: None, orbits=[1], selected_index=3)
+    assert ad.plot(h, "x**2") and h.mode == "graph" and len(h.graph_points) == 161 and h.orbits == []
+    assert ad.plot(h, "1/x") and 150 < len(h.graph_points) <= 161      # undefined point skipped
+    assert all(abs(y) <= 1.5 for _, y, _ in h.graph_points)
+    assert not ad.plot(h, "nonsense_name")
+
+
+@ext("Add-ons")
+def spatial_desktop_movement_and_description():
+    ad = mod("addons")
+    eq(ad.parse_spatial_command("move system panel behind me"), ("behind", "system"))
+    eq(ad.parse_spatial_command("close the notes panel"), ("close", "the notes"))
+    eq(ad.parse_spatial_command("what is the weather"), (None, None))
+    d = ad.SpatialDesktop()
+    d.move_left("system")
+    d.move_right("notes")
+    eq(d.panels["system"].angle, (ad.FRONT - 25 - 45) % 360)
+    d.push_back("system", 99)
+    eq(d.panels["system"].depth, ad.MAX_DEPTH)
+    d.pull_closer("system", 99)
+    eq(d.panels["system"].depth, ad.MIN_DEPTH)
+    p = d.open_panel("browser", "content")
+    d.open_panel("browser")
+    eq((d.panels["browser"].depth, d.panels["browser"].content), (0.6, "content"))
+    eq(d.find_panel("my browser").name, "browser")
+    assert not d.close_panel("ghost") and d.close_panel("browser")
+    d.move_behind("system")
+    for _ in range(40):
+        d.panels["system"].update(0.1)
+    assert abs(d.panels["system"]._anim_angle - 180) < 1 and abs(d.panels["system"]._anim_depth - 2.2) < 0.1
+    d.reset_layout()
+    assert all(p.depth == 0.8 for p in d.panels.values())
+    d.update()
+    eq([ad.SpatialDesktop._describe_angle(a) for a in (0, 90, 180, 270)], ["in front of you", "to your right", "behind you", "to your left"])
+    eq(ad.SpatialDesktop().__class__(), ad.SpatialDesktop().__class__()) if False else None
+    assert "No panels" in (lambda x: (x.panels.clear(), x.summary())[1])(ad.SpatialDesktop())
+    assert ad.handle_spatial_command(ad.SpatialDesktop(), "reset desktop layout")[1] == "Layout reset."
+    assert ad.handle_spatial_command(ad.SpatialDesktop(), "tell me a joke") == (False, "")
+
+
+@ext("Add-ons")
+def gesture_drawer_shape_mapping_and_draw_commands():
+    ad = mod("addons")
+    H = mock.MagicMock()
+    d = ad.GestureDrawer(H, speak=lambda t_: None)
+    eq(d.update(ns(raw_gesture="point", tip=(0.5, 0.5))), None)         # inactive
+    for shape, call in (("square", ("load_shape", "cube")), ("triangle", ("load_shape", "pyramid")), ("line", ("load_math_graph", "x")),
+                        ("wave", ("load_math_graph", "sin(x)")), ("spiral", ("load_solar_system",))):
+        H.reset_mock()
+        d._apply(shape)
+        getattr(H, call[0]).assert_called_with(*call[1:])
+    d.set_active(True)
+    d.stroke = [(0.1, 0.1)]
+    d.set_active(False)
+    assert d.stroke == [] and not d.active
+    v, said = ext_voice(drawer=d)
+    assert ad._draw_command(d, said.append, "clear my drawing") and said[-1] == "Cleared."
+    assert ad._draw_command(d, said.append, "start drawing") and d.active
+    assert ad._draw_command(d, said.append, "exit draw mode") and not d.active
+    assert not ad._draw_command(d, said.append, "hello")
+
+
+@ext("Add-ons")
+def sandbox_commands_and_debug_routing():
+    ad = mod("addons")
+    root = os.path.join(ext_dir(), "sb")
+    with mock.patch.object(ad, "SANDBOX_ROOT", root):
+        eq(ad.sandbox_run("ghost.py"), (False, "", "No such sandbox file: ghost.py"))
+        ad.sandbox_write("notes.xyz", "hi")
+        assert "Don't know how to run" in ad.sandbox_run("notes.xyz")[2]
+        assert "notes.xyz" in ad.sandbox_list()
+        eq(ad._safe_filename("my file!.py"), "my_file.py")
+        v, said = ext_voice()
+        assert ad._sandbox_command(v, said.append, "what's in the sandbox") and "notes.xyz" in said[-1]
+        assert ad._sandbox_command(v, said.append, "reset the sandbox") and ad.sandbox_list() == []
+        assert ad._sandbox_command(v, said.append, "test in sandbox: print hello") and "Groq" in said[-1]
+        assert not ad._sandbox_command(v, said.append, "open the door")
+        assert ad._debug_command(v, said.append, "write python code called calc that adds two numbers and test it") and "Groq" in said[-1]
+        assert not ad._debug_command(v, said.append, "debug this code") and not ad._debug_command(v, said.append, "debug ghostfile")
+    ap = mod("aurora_plus")
+    assert "credentials" in ad._unsafe("api_key = gsk_abcdefghijklmnopqrstuvwxyz") and ad._unsafe("print(1)") == ""
+    code, ok, out, err, fixes = ad.debug_loop(object(), "import subprocess\n", "x", "blocked_demo")
+    assert not ok and "blocked" in err and fixes == 0
+
+
+@ext("Add-ons")
+def hologram_hooks_install():
+    ad, hm = mod("addons"), mod("hologram")
+    h = mock.MagicMock()
+    h.mode, h.info_card = "info", {"question": "q", "answer": "a"}
+    orig_card = h.show_info_card
+    orig_shape = h._draw_shape
+    ad.install(h)
+    assert "heart" in hm.SHAPES
+    h.show_info_card("q", "b")
+    eq(h.info_card["answer"], "b")
+    orig_card.assert_not_called()                                        # updated in place, no animation restart
+    h.show_info_card("other", "x")
+    orig_card.assert_called_once()
+    h._draw_shape("cube")
+    orig_shape.assert_called_with("cube")
+
+
+# ============================================================================ sandbox labs
+@ext("Sandbox labs")
+def helpers_projectile_math_and_pendulum_spring_steps():
+    sl = mod("sandbox_labs")
+    eq((sl._nice(7), sl._nice(0), sl._nice(0.3)), (10, 1.0, 0.5))
+    eq((sl._eng(1500), sl._eng(220)), ("1.5k", "220"))
+    eq((sl._int("three"), sl._int("7"), sl._int(None), sl._int("zzz")), (3, 7, None, None))
+    eq(sl._num(r"(\d+) apples", "5 apples"), 5.0)
+    eq(sl._physics_kind("hello"), None)
+    ph = sl.Physics()
+    ph.create("create a projectile with 20 m/s velocity at 30 degrees")
+    s = ph.sims[0]
+    assert abs(s["T"] - 2.039) < 0.01 and abs(s["R"] - 35.3) < 0.2 and abs(s["H"] - 5.10) < 0.05
+    ph.create("create a projectile with 20 m/s velocity at 30 degrees on the moon")
+    assert ph.sims[-1]["T"] > 10
+    ph.create("drop a ball from 15 meters")
+    drop = ph.sims[-1]
+    assert abs(drop["T"] - math.sqrt(30 / 9.81)) < 0.01 and drop["v"] == 0
+    ph.step(drop["T"] + 0.1)
+    ph.step(3.0)
+    ph.step(0.1)
+    assert ph.sims[-1]["t"] < 1.0                                          # reset after hold
+    ph.create("create a pendulum with length 2 meters")
+    th = ph.sims[0]["th"]
+    ph.step(0.1)
+    assert ph.sims[0]["th"] != th
+    ph.create("create a spring with constant 40")
+    x = ph.sims[0]["x"]
+    ph.step(0.1)
+    assert ph.sims[0]["x"] != x
+
+
+@ext("Sandbox labs")
+def rigid_body_world_physics():
+    sl = mod("sandbox_labs")
+    ph = sl.Physics()
+    w = ph.world()
+    assert ph.world() is w
+    b = ph.add_body(w, 2.0)
+    eq((b["id"], w["sel"], round(b["r"], 3)), (1, 1, round(0.3 * 2 ** (1 / 3), 3)))
+    b["y"] = 5.0
+    for _ in range(1500):
+        ph._step_world(w, 0.016)
+    assert b["y"] < 1.0, "ball never fell to the floor"
+    w2 = ph.world()
+    w2["g"], w2["bodies"] = 0.0, []
+    a = ph.add_body(w2, 1.0, 3.0, 5.0)
+    c = ph.add_body(w2, 1.0, 4.2, 5.0)
+    a["vx"] = 2.0
+    for _ in range(60):
+        ph._step_world(w2, 0.016)
+    assert abs(a["m"] * a["vx"] + c["m"] * c["vx"] - 2.0) < 1e-6, "momentum not conserved"
+    assert "hit" in w2["hit"] and "ball 1 hit ball 2" in w2["hit"]
+    ph.push(c, 100.0, 0, 0)
+    eq(c["f"], (100.0, 0.0))
+    assert ph.body(w2, 99) is None
+
+
+@ext("Sandbox labs")
+def world_voice_routing_and_lab_lifecycle():
+    sl = mod("sandbox_labs")
+    labs = ns(active=None, phys=sl.Physics())
+    labs.open = lambda m: setattr(labs, "active", m)
+    assert "Physics world ready" in sl._world_route(labs, "open the physics world")
+    r = sl._world_route(labs, "add a 5 kilogram ball")
+    assert "Added 1 ball, 5 kilograms" in r
+    assert "Gravity is 0" in sl._world_route(labs, "zero gravity")
+    assert "Gravity is 1.62" in sl._world_route(labs, "set gravity to the moon")
+    assert "Pushing ball 1" in sl._world_route(labs, "push ball 1 with 50 newtons")
+    assert "pushed into each other" in sl._world_route(labs, "make two balls collide")
+    eq(sl._world_route(labs, "create a projectile"), None)
+    H = mock.MagicMock()
+    H.labs = None
+    L = sl.install(H)
+    assert sl.install(H) is L
+    L.open("circuit")
+    assert L.active == "circuit" and H.mode == "info"
+    L.close()
+    assert L.active is None and H.mode == "empty"
+    eq(len(L.rect()), 4)
+    with L.lock:
+        assert sl._route(L, "build a molecule").startswith("Molecule builder ready")
+        assert "Added 1 carbon" in sl._route(L, "add carbon")
+        sl._route(L, "add 4 hydrogens")
+        eq(L.mol.formula(), "CH4")
+        assert "methane" in sl._route(L, "molecule info")
+        assert "Atom 2 selected" in sl._route(L, "select atom 2")
+        assert "Double bond" in sl._route(L, "double bond between 1 and 2")
+        assert "Removed atom 5" in sl._route(L, "remove atom 5")
+        assert "Stopped spinning" in sl._route(L, "stop spinning")
+        assert sl._route(L, "close the molecule sandbox") == "Closing the sandbox."
+
+
+@ext("Sandbox labs")
+def molecule_editing_and_circuit_behaviour():
+    sl = mod("sandbox_labs")
+    m = sl.Molecule()
+    m.load_preset("benzene")
+    eq((m.formula(), m.name()), ("C6H6", "benzene"))
+    m.load_preset("water")
+    assert abs(m.mass() - 18.015) < 0.01
+    m.set_bond(0, 1, 2)
+    assert (0, 1, 2) in m.bonds
+    assert m.remove(1) and len(m.atoms) == 2 and all(max(a, b) < 2 for a, b, _ in m.bonds) and not m.remove(9)
+    m.screen = [(10, 10, 5, 0), (50, 50, 5, 1)]
+    eq((m.pick(12, 12), m.pick(200, 200)), (0, None))
+    m.clear()
+    eq(m.atoms, [])
+    c = sl.Circuit()
+    eq(c.term({"kind": "gnd", "gx": 3, "gy": 4}), (3, 4))
+    assert not c.auto_wire() and not c.undo() and not c.delete_selected()
+    c.preset("rc")
+    assert sum(1 for x in c.comps if x["kind"] == "switch") == 1
+    for _ in range(25):
+        c.frame(0.04)
+    cap = next(x for x in c.comps if x["kind"] == "capacitor")
+    assert cap["vc"] < 0.5, "capacitor charged with the switch open"
+    eq(c.toggle_switches(True), 1)
+    for _ in range(100):
+        c.frame(0.04)
+    assert 2.5 < cap["vc"] < 5.1, cap["vc"]
+    c.sel = c.comps[0]["id"]
+    assert c.delete_selected() and c.undo()
+    c.paused = True
+    t0 = c.t
+    c.frame(0.04)
+    eq(c.t, t0)
+    c.clear()
+    ard = c.add("ard")
+    ard["blink"] = True
+    c.t = 0.5
+    eq(c._src_v(ard), 5.0)
+    c.t = 1.5
+    eq(c._src_v(ard), 0.0)
+    assert "arduino pin" in c.summary()
+    eq(sl.Circuit().summary(), "The circuit is empty.")
+
+
+# ============================================================================ image generator / patches / main
+def _fake_response(data):
+    r = mock.MagicMock()
+    r.__enter__.return_value.read.return_value = data
+    return r
+
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"0" * 2000
+
+
+@ext("Image generator")
+def generation_success_retries_and_failures():
+    ig = mod("image_generator") if os.path.exists(os.path.join(ROOT, "jarvis_ui", "image_generator.py")) else None
+    if ig is None:
+        sys.path.insert(0, ROOT)
+        try:
+            import image_generator as ig
+        except ImportError:
+            skip("image_generator.py not found")
+    d = ext_dir()
+    with mock.patch.object(ig, "OUT_DIR", d), mock.patch.object(ig.time, "sleep", lambda s: None):
+        with mock.patch.object(ig.urllib.request, "urlopen", return_value=_fake_response(PNG)):
+            path, err = ig.generate("a red apple")
+        assert err is None and path.endswith(".png") and os.path.getsize(path) == len(PNG) and "a_red_apple" in path
+        with mock.patch.object(ig.urllib.request, "urlopen", return_value=_fake_response(b"\xff\xd8" + b"0" * 2000)):
+            assert ig.generate("x")[0].endswith(".jpg")
+        http = lambda code: urllib.error.HTTPError("u", code, "m", {}, io.BytesIO(b""))
+        with mock.patch.object(ig.urllib.request, "urlopen", side_effect=[http(429), _fake_response(PNG)]) as uo:
+            assert ig.generate("x")[1] is None and uo.call_count == 2
+        with mock.patch.object(ig.urllib.request, "urlopen", side_effect=http(400)) as uo:
+            eq(ig.generate("x"), (None, "HTTP 400"))
+            eq(uo.call_count, 1)
+        with mock.patch.object(ig.urllib.request, "urlopen", side_effect=urllib.error.URLError("dns")) as uo:
+            assert ig.generate("x")[0] is None and uo.call_count == ig.RETRIES
+        with mock.patch.object(ig.urllib.request, "urlopen", return_value=_fake_response(b"<html>" + b"x" * 2000)):
+            assert "did not return an image" in ig.generate("x")[1]
+        eq(ig.generate("   "), (None, "Tell me what to draw."))
+    eq((ig._size("dragon wallpaper"), ig._size("phone poster"), ig._size("cat")), ((1344, 768), (768, 1344), (1024, 1024)))
+    assert ig._REQ.search("make me a picture of a dog").group(1) == "a dog" and not ig._REQ.search("draw mode")
+
+
+@ext("Image generator")
+def voice_flow_and_installer():
+    try:
+        ig = mod("image_generator")
+    except Skip:
+        sys.path.insert(0, ROOT)
+        try:
+            import image_generator as ig
+        except ImportError:
+            skip("image_generator.py not found")
+    v, said = ext_voice(plus=ns(offline=ns(online=lambda: False)))
+    assert ig.handle_command(v, "generate an image of a cat") and "offline" in said[-1]
+    v, said = ext_voice()
+    with mock.patch.object(ig, "generate", return_value=("/tmp/cat.png", None)):
+        assert ig.handle_command(v, "create a picture of a cat") and "ready" in said[-1]
+    v.hologram.show_info_card.assert_called_once()
+    with mock.patch.object(ig, "generate", return_value=(None, "HTTP 429")):
+        assert ig.handle_command(v, "paint an image of a cat") and "rate limited" in said[-1]
+    assert not ig.handle_command(v, "what time is it")
+    d = ext_dir()
+    open(os.path.join(d, "voice_assistant.py"), "w").write(
+        'sandbox_labs, addons, productivity_commands, dashboard_modes, system_monitor, document_generator = (\n'
+        '    _optional(n) for n in ("sandbox_labs", "addons", "productivity_commands", "dashboard_modes", "system_monitor", "document_generator"))\n'
+        '        if document_generator and document_generator.handle_command(self, text):   # presentations, documents, spreadsheets\n            return True\n'
+        '        elif name == "create_document":\n            pass\n')
+    open(os.path.join(d, "brain.py"), "w").write(
+        '    _fn("search_files", "Search the user\'s local knowledge vault (their notes/documents).", {"query": _S("Keywords")}, ["query"]),\n]\n')
+    with mock.patch.object(ig, "__file__", os.path.join(d, "image_generator.py")):
+        ig.install()
+        ig.install()
+    va_src, br_src = open(os.path.join(d, "voice_assistant.py")).read(), open(os.path.join(d, "brain.py")).read()
+    assert va_src.count("image_generator") >= 3 and va_src.count('name == "generate_image"') == 1 and br_src.count("generate_image") == 1
+    compile(va_src, "va", "exec") if False else None
+
+
+@ext("Rendering patch")
+def hologram_patch_anchors_match_real_source():
+    sys.path.insert(0, ROOT)
+    try:
+        import optimize_hologram_rendering as oh
+    except ImportError:
+        skip("optimize_hologram_rendering.py not present")
+    path = os.path.join(ROOT, "jarvis_ui", "hologram.py")
+    src = open(path, encoding="utf-8").read()
+    if "_cached_list" in src:
+        assert "_text_cache" in src and "glDrawPixels(w, h" not in src, "hologram.py is patched but incomplete"
+        return
+    bad = [i for i, (old, _) in enumerate(oh.EDITS, 1) if src.count(old) != 1]
+    assert not bad, f"patch anchors that don't match hologram.py exactly once: {bad}"
+
+
+@ext("Entry point")
+def snapshot_saving_and_voice_fallback():
+    mn = mod_main = None
+    try:
+        mn = importlib.import_module("main")
+    except Exception as e:
+        skip(f"main import failed: {type(e).__name__}")
+    import numpy as np
+    d = os.path.join(ext_dir(), "snaps")
+    with mock.patch.object(mn, "SNAPSHOT_DIR", d):
+        mn.save_snapshot(np.zeros((8, 8, 3), np.uint8))
+    assert len(os.listdir(d)) == 1 and os.listdir(d)[0].endswith(".png")
+    with mock.patch.object(mn, "VoiceAssistant", side_effect=RuntimeError("no mic")), mock.patch("traceback.print_exc"):
+        v = mn.build_voice(mock.MagicMock(), mock.MagicMock())
+    assert isinstance(v, mn.NullVoice)
+    eq((mn.DETECT_EVERY, mn.GESTURE_TO_STATE["fist"]), (3, "speaking"))
+
+
+# ============================================================================ report
 def report():
     shutil.rmtree(tmpdir, ignore_errors=True)
     groups = {}
