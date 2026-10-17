@@ -226,7 +226,7 @@ def load_deck(name=None):
     paths = []
     safe = re.sub(r"[^\w\- ]", "", name or "").strip().replace(" ", "_")
     if safe:
-        paths += [os.path.join(DECK_DIR, safe + ".md"), os.path.join(BASE, safe + ".md")]
+        paths += [os.path.join(d, s + ".md") for s in dict.fromkeys((safe, safe.lower())) for d in (DECK_DIR, BASE)]
     paths.append(os.path.join(BASE, "presentation.md"))
     for p in paths:
         if os.path.isfile(p):
@@ -234,7 +234,7 @@ def load_deck(name=None):
                 with open(p, encoding="utf-8") as f:
                     slides = parse_slides(f.read())
                 if slides:
-                    return slides, os.path.splitext(os.path.basename(p))[0]
+                    return slides, os.path.splitext(os.path.basename(p))[0].lower()
             except OSError:
                 continue
     return SAMPLE_DECK, "sample deck"
