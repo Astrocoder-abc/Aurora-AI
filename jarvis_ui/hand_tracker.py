@@ -568,3 +568,65 @@ class HandTracker:
     def close(self):
         self.cap.release()
         self.landmarker.close()
+
+
+# ---- background camera thread (automation upgrade)
+import threading
+
+
+class BackgroundTracker:
+    """Runs a HandTracker on its own thread so camera capture and landmark detection never block UI rendering.
+    read() returns the latest hands plus every delta/event since the previous read, and each frame only once (else None)."""
+
+    def __init__(self, inner, interval=1 / 30):
+        self._inner, self.interval = inner, interval
+        self._lock = threading.Lock()
+        self._hands, self._frame = [], None
+        self._reset()
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def _reset(self):
+        self._zoom = self._roll = 0.0
+        self._pan, self._swipe, self._events = (0.0, 0.0), None, []
+
+    def _loop(self):
+        while self._running:
+            t0 = time.monotonic()
+            try:
+                result, frame = self._inner.read()
+            except Exception:
+                time.sleep(0.2)
+                continue
+            with self._lock:
+                self._hands = list(result.hands)
+                self._zoom += result.zoom_delta
+                self._roll += result.roll_delta
+                self._pan = (self._pan[0] + result.pan_delta[0], self._pan[1] + result.pan_delta[1])
+                self._swipe = result.swipe or self._swipe
+                self._events.extend(result.events)
+                if frame is not None:
+                    self._frame = frame
+            time.sleep(0.05 if frame is None else max(0.0, self.interval - (time.monotonic() - t0)))
+
+    def read(self):
+        out = TrackerResult()
+        with self._lock:
+            out.hands, out.zoom_delta, out.roll_delta, out.pan_delta = list(self._hands), self._zoom, self._roll, self._pan
+            out.swipe, out.events = self._swipe, self._events
+            frame, self._frame = self._frame, None
+            self._reset()
+        return out, frame
+
+    @property
+    def raw_frame(self):
+        return getattr(self._inner, "raw_frame", None)
+
+    def close(self):
+        self._running = False
+        self._thread.join(timeout=2)
+        self._inner.close()
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)

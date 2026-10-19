@@ -322,3 +322,77 @@ def handle_command(voice, text):
         say(f"{mon.alerts[-1]['summary']}. {mon.alerts[-1]['explanation']}")
         return True
     return False
+
+
+# ---- performance governor (automation upgrade): adapts background work to the machine, never the visuals
+class PerformanceGovernor:
+    """Samples CPU and Aurora's render rate and lowers camera, face-detection and recognition frequency under load.
+    Holograms, transitions, colours and Easter eggs are never touched. Degrades after 2 bad samples, recovers after 5 good ones."""
+    LEVELS = {"normal": (3, 0.5, 1 / 30), "light": (6, 1.0, 1 / 20), "critical": (10, 2.0, 1 / 12)}
+    RANK = ("normal", "light", "critical")
+
+    def __init__(self, hologram, tracker=None, voice=None):
+        self.h, self.tracker, self.voice = hologram, tracker, voice
+        self.level, self._streak, self._idle_game, self._stop = "normal", 0, 0, threading.Event()
+        self.detect_every, self.recognition_interval, _ = self.LEVELS["normal"]
+        hologram.governor = self
+        getattr(type(hologram), "_LOG_CATEGORY_COLORS", {}).setdefault("PERF", (0.9, 0.7, 1.0))
+
+    def start(self):
+        if psutil is None:
+            return False
+        threading.Thread(target=self._loop, daemon=True).start()
+        return True
+
+    def stop(self):
+        self._stop.set()
+
+    def _loop(self):
+        psutil.cpu_percent(interval=None)
+        while not self._stop.wait(2.0):
+            try:
+                self.update(psutil.cpu_percent(interval=None), getattr(self.h, "_fps", 0.0))
+                self._reap()
+            except Exception:
+                pass
+
+    @staticmethod
+    def classify(cpu, fps):
+        known = fps is not None and fps > 1
+        if cpu >= 92 or (known and fps < 12):
+            return "critical"
+        return "light" if cpu >= 78 or (known and fps < 24) else "normal"
+
+    def update(self, cpu, fps):
+        want = self.classify(cpu, fps)
+        if want == self.level:
+            self._streak = 0
+            return self.level
+        self._streak += 1
+        if self._streak >= (2 if self.RANK.index(want) > self.RANK.index(self.level) else 5):
+            self._set(want)
+        return self.level
+
+    def _set(self, level):
+        self.level, self._streak = level, 0
+        self.detect_every, self.recognition_interval, interval = self.LEVELS[level]
+        if self.tracker is not None:
+            self.tracker.interval = interval
+        self.h.log_event(f"PERF: {level} processing mode")
+
+    def _reap(self):
+        """Stops the game-stats reader when nothing is showing it any more."""
+        gs, ai = getattr(self.voice, "game_session", None), getattr(self.h, "adaptive_interface", None)
+        wanted = self.h.mode == "telemetry" or getattr(ai, "mode", "") == "gaming"
+        if gs is not None and getattr(gs, "connected", False) and not wanted:
+            self._idle_game += 1
+            if self._idle_game >= 30:
+                gs.stop()
+                self._idle_game = 0
+                self.h.log_event("PERF: stopped idle game session reader")
+        else:
+            self._idle_game = 0
+
+    def status(self):
+        return (f"Performance mode is {self.level}: face detection every {self.detect_every} frames, camera at "
+                f"{1 / self.LEVELS[self.level][2]:.0f} per second. Visuals are unchanged.")
