@@ -4179,6 +4179,380 @@ def snapshot_saving_and_voice_fallback():
     eq((mn.DETECT_EVERY, mn.GESTURE_TO_STATE["fist"]), (3, "speaking"))
 
 
+# ============================================================================ automation upgrade: project context, task engine, diagnostics, performance
+import subprocess as _sp
+
+
+def _eng():
+    pc, te = mod("project_context"), mod("task_engine")
+    said = []
+    H = mock.MagicMock()
+    H.mode, H.quiet_alerts, H.event_listeners = "empty", False, []
+    v = ns(_speak=said.append, speak_now=said.append, _log=lambda m: None, client=None, plus=None, hologram=H,
+           _capture=None, _capture_tid=None, _productivity=None, latest_frame=None)
+    v._handle_local_command = lambda text: False
+    with mock.patch.object(pc, "STATE_FILE", os.path.join(ext_dir(), "state.json")):
+        eng = te.TaskEngine(H, v)
+    eng.store.path = os.path.join(ext_dir(), "state.json")
+    return pc, te, eng, v, said
+
+
+@ext("Project context")
+def test_output_parsing_and_command_detection():
+    pc = mod("project_context")
+    r = pc.parse_test_output("[FAIL] voice thing  -> boom\n 10 passed, 2 failed, 0 skipped", 1)
+    eq((r["passed"], r["failed"], r["failing"], r["ok"]), (10, 2, ["voice thing"], False))
+    r = pc.parse_test_output("FAIL: test_a (m.T)\nRan 5 tests in 0.1s\nFAILED (failures=1, skipped=2)", 1)
+    eq((r["passed"], r["failed"], r["failing"]), (4, 1, ["test_a"]))
+    assert pc.parse_test_output("Ran 3 tests\nOK", 0)["ok"]
+    d = ext_dir()
+    open(os.path.join(d, "test_x.py"), "w").write("x=1\n")
+    eq(pc.detect_test_command(d)[1:], ["-m", "unittest", "discover"])
+    raises(ValueError, pc.run_command, ["rm", "-rf", "x"], d)
+    code, out = pc.run_command([sys.executable, "-c", "print('hi')"], d)
+    assert code == 0 and "hi" in out
+
+
+@ext("Project context")
+def test_run_tests_summary_and_continue():
+    pc, te, eng, v, said = _eng()
+    d = ext_dir()
+    open(os.path.join(d, "test_ok.py"), "w").write("import unittest\nclass T(unittest.TestCase):\n    def test_a(self): self.assertTrue(1)\nif __name__=='__main__': unittest.main()\n")
+    eng.project.activate("demo", d)
+    assert eng.route("run the tests") and "Running the tests for demo" in said[-1]
+    for _ in range(100):
+        if not eng.tasks.running():
+            break
+        time.sleep(0.1)
+    assert any("pass" in s for s in said), said
+    assert eng.route("let's continue") and "tests last ran" in said[-1] and "guess" not in said[-1]
+    assert not eng.route("tell me a joke")
+
+
+@ext("Task engine")
+def test_cleanup_plan_approval_verify_undo():
+    pc, te, eng, v, said = _eng()
+    au = mod("aurora_utilities")
+    home = os.path.join(ext_dir(), "h")
+    dl = os.path.join(home, "Downloads")
+    os.makedirs(dl)
+    for n, c in (("a.pdf", "same"), ("a (1).pdf", "same"), ("pic.png", "p"), ("x.crdownload", "t")):
+        open(os.path.join(dl, n), "w").write(c)
+    with mock.patch.object(au, "HOME", home):
+        assert eng.route("clean up my downloads") and "yes" in said[-1].lower()
+        eq(len(os.listdir(dl)), 4)                                       # nothing moved before approval
+        assert eng.route("yes") and "Cleaned" in said[-1]
+        assert os.path.exists(os.path.join(dl, "Images", "pic.png")) and os.path.isdir(os.path.join(dl, "Duplicates (review)"))
+        assert eng.route("undo the cleanup") and eng.route("yes")
+        assert os.path.exists(os.path.join(dl, "pic.png"))
+
+
+@ext("Task engine")
+def test_background_tasks_limits_and_cancel():
+    pc, te, eng, v, said = _eng()
+    ok, _ = eng.tasks.start("slow", lambda cancel: (cancel.wait(5), "stopped")[1])
+    assert ok and not eng.tasks.start("slow", lambda c: "x")[0]
+    eng.h.governor = ns(level="light")
+    assert not eng.tasks.start("other", lambda c: "x")[0], "light mode allows one task"
+    eng.route("cancel task")
+    for _ in range(50):
+        if not eng.tasks.running():
+            break
+        time.sleep(0.1)
+    assert eng.tasks.items[1]["status"] == "cancelled"
+
+
+@ext("Task engine")
+def test_workflow_offer_preferences_and_capabilities():
+    pc, te, eng, v, said = _eng()
+    au = mod("aurora_utilities")
+    now = time.time()
+    eng.store.data["history"] = [[now - 4000 + k * 1000 + j, p] for k in range(3) for j, p in enumerate(("open notepad", "volume up"))][:-2]
+    eng.observe("open notepad")
+    eng.observe("volume up")
+    assert eng.pending and "save that as a skill" in said[-1]
+    eng.pending = None
+    assert eng.route("save a preference: reports in word") and eng.route("list my preferences") and "reports in word" in said[-1]
+    assert eng.route("delete preference 1") and not eng.store.data["preferences"]
+    assert eng.route("what can you do right now") and "capabilities" in said[-1]
+    assert not eng.route("can you repeat that")
+
+
+@ext("Task engine")
+def test_download_automation_and_url_state():
+    pc, te, eng, v, said = _eng()
+    au = mod("aurora_utilities")
+    home = os.path.join(ext_dir(), "h")
+    dl = os.path.join(home, "Downloads")
+    os.makedirs(dl)
+    with mock.patch.object(au, "HOME", home), mock.patch.object(te.Automations, "start", lambda self: None):
+        assert eng.route("when a download finishes, organize it")
+        it = eng.automations.items[0]
+        eng.automations._check_download(it)                                 # baseline
+        open(os.path.join(dl, "new.png"), "w").write("x")
+        eng.automations._check_download(it)                                 # seen once
+        eng.automations._check_download(it)                                 # stable -> filed
+        assert os.path.exists(os.path.join(dl, "Images", "new.png")) and any("Download finished" in s for s in said)
+    with mock.patch.object(te.Automations, "reachable", side_effect=OSError):
+        u = eng.automations.add("url", "example.com", "notify")
+        for _ in range(2):
+            eng.automations._last.clear()
+            eng.automations._check_url(u)
+    assert any("is down" in s for s in said)
+
+
+@ext("Self-diagnostics")
+def test_classification_sentinel_and_patch_pipeline():
+    sd, pc = mod("self_diagnostics"), mod("project_context")
+    eq(sd.classify_failure("HTTP 429 too many requests")[0], "rate_limit")
+    eq(sd.classify_failure("ModuleNotFoundError: no module named x")[0], "dependency")
+    H = mock.MagicMock()
+    H.event_listeners, H.quiet_alerts = [], True
+    said = []
+    v = ns(_speak=said.append, speak_now=said.append, client=None, plus=None, microphone=None, enabled=False, speech=None,
+           latest_frame=None, task_engine=None)
+    d = sd.SelfDiagnostics(H, v)
+    with mock.patch.object(d, "run_checks", return_value=[{"label": "Model API", "status": "ok", "detail": ""}, {"label": "Speech output", "status": "fail", "detail": "edge failed"}]):
+        for _ in range(4):
+            d._on_event("VOICE: edge-tts failed (x)")
+        time.sleep(0.5)
+    assert d.last_problem and d.last_problem["component"] == "speech output" and d.pending
+    root = ext_dir()
+    open(os.path.join(root, "calc.py"), "w").write("def add(a, b):\n    return a - b\n")
+    open(os.path.join(root, "test_calc.py"), "w").write("import unittest\nfrom calc import add\nclass T(unittest.TestCase):\n    def test_add(self):\n        self.assertEqual(add(1, 2), 3)\nif __name__ == '__main__':\n    unittest.main()\n")
+    reply = "### EDIT: calc.py\n<<<<\n    return a - b\n====\n    return a + b\n>>>>\n### END"
+    brain = mod("brain")
+    with mock.patch.object(brain, "_complete", return_value=reply), mock.patch.object(sd, "PATCH_DIR", ext_dir()):
+        out = d.patches.propose({"kind": "tests", "path": root, "cmd": [sys.executable, "-m", "unittest", "discover"], "text": 'File "calc.py", line 2', "summary": "add broken"}, object(), threading.Event())
+    assert "failing tests went from 1 to 0" in out, out
+    eq(open(os.path.join(root, "calc.py")).read(), "def add(a, b):\n    return a - b\n")      # original untouched until approved
+    assert d.patches.apply(lambda *a: (False, "")).startswith("Applied") and "a + b" in open(os.path.join(root, "calc.py")).read()
+    assert d.patches.revert().startswith("Restored") and "a - b" in open(os.path.join(root, "calc.py")).read()
+    risky = "### EDIT: calc.py\n<<<<\n    return a - b\n====\n    import subprocess\n    return a + b\n>>>>\n### END"
+    with mock.patch.object(brain, "_complete", return_value=risky), mock.patch.object(sd, "PATCH_DIR", ext_dir()):
+        assert "risky" in d.patches.propose({"kind": "tests", "path": root, "cmd": None, "summary": "x", "files": ["calc.py"]}, object(), threading.Event())
+
+
+@ext("Performance")
+def test_governor_levels_and_background_tracker():
+    sm, ht = mod("system_monitor"), mod("hand_tracker")
+    if not hasattr(sm, "PerformanceGovernor") or not hasattr(ht, "BackgroundTracker"):
+        skip("run apply_patches.py first")
+    H = mock.MagicMock()
+    tr = ns(interval=0.03)
+    g = sm.PerformanceGovernor(H, tr)
+    g.update(95, 60)
+    eq(g.level, "normal")
+    g.update(95, 60)
+    eq((g.level, g.detect_every, tr.interval > 0.03), ("critical", 10, True))
+    for _ in range(4):
+        g.update(10, 60)
+    eq(g.level, "critical")
+    g.update(10, 60)
+    eq((g.level, g.detect_every), ("normal", 3))
+
+    class Inner:
+        def __init__(self):
+            self.n = 0
+
+        def read(self):
+            self.n += 1
+            r = ht.TrackerResult()
+            r.zoom_delta, r.events = 0.1, [(0, "peace")]
+            return r, object()
+
+        def close(self):
+            pass
+    bt = ht.BackgroundTracker(Inner(), interval=0.01)
+    time.sleep(0.3)
+    r, frame = bt.read()
+    assert r.zoom_delta > 0.15 and len(r.events) >= 2 and frame is not None
+    r2, f2 = bt.read()
+    assert r2.zoom_delta < r.zoom_delta and (f2 is None or r2.events != r.events)
+    bt.close()
+
+
+@ext("AI brain")
+def test_routing_dedupe_cache_and_recovery():
+    br = mod("brain")
+    if not hasattr(br, "route_request"):
+        skip("run apply_patches.py first")
+    eq(br.route_request("what is two plus two")[0], br.FAST_MODEL)
+    eq(br.route_request("why does my code crash")[0], br.MODEL)
+    eq(br.route_request("what's the latest news")[0], br.MODEL)
+    c = _Create(iter([_ev("Paris is the capital.")]))
+    b = br.Brain(c, lambda m: None, lambda n, a: "")
+    deltas = []
+    q = "what is the capital of france"
+    eq(b.ask(q, deltas.append, threading.Event()), "Paris is the capital.")
+    eq(c.calls[0]["model"], br.FAST_MODEL)
+    deltas.clear()
+    b._recent.clear()
+    eq(b.ask(q, deltas.append, threading.Event()), "Paris is the capital.")
+    eq((len(c.calls), deltas), (1, ["Paris is the capital."]))               # cached, spoken again
+    eq(b.ask(q, deltas.append, threading.Event()), "Paris is the capital.")  # duplicate within seconds: silent
+    eq(len(deltas), 1)
+    b2 = br.Brain(_Create(iter([_ev(tool=("c1", "x", "{}"))]), iter([_ev("ok")])), lambda m: None, mock.Mock(side_effect=[RuntimeError("timeout"), "fine"]))
+    with mock.patch.object(br.time, "sleep", lambda s: None):
+        b2.ask("do the thing right now please", lambda d: None, threading.Event())
+    tool_msg = [m for m in b2.client.calls[1]["messages"] if m["role"] == "tool"][0]
+    eq(tool_msg["content"], "fine")
+
+
+# ============================================================================ hologram 3D upgrade
+import contextlib
+
+_GL_NAMES = ("glBegin", "glEnd", "glVertex2f", "glVertex3f", "glColor4f", "glLineWidth", "glPointSize", "glPushMatrix",
+             "glPopMatrix", "glTranslatef", "glDepthMask", "glBlendFunc", "glGetDoublev", "glGetIntegerv", "glEnable",
+             "glDisable", "glLightfv", "gluNewQuadric", "gluSphere", "gluProject")
+
+
+@contextlib.contextmanager
+def gl_mocks():
+    hm = mod("hologram")
+    with mock.patch.multiple(hm, **{n: mock.DEFAULT for n in _GL_NAMES}) as m:
+        m["gluProject"].return_value = (10.0, 10.0, 0.5)
+        m["gluNewQuadric"].return_value = object()
+        yield hm, m
+
+
+def _patched():
+    hm, h = bare_holo()
+    if not hasattr(hm.Hologram, "_draw_ball"):
+        skip("hologram 3D patch not applied (python apply_hologram_3d_patch.py)")
+    h.width, h.height = 1280, 720
+    return hm, h
+
+
+@ext("Hologram 3D")
+def patch_markers_present_in_source():
+    _patched()
+    src = open(os.path.join(ROOT, "jarvis_ui", "hologram.py"), encoding="utf-8").read()
+    for needle in ("gluSphere", "def _draw_quarks", "MOLECULE_BOND_ORDER", "self._draw_ball(node_r, nc)",
+                   '"satellite", "molecule"):', "self._draw_hologram_stripes(cx, cy, theme_color)", "self._draw_particle_legend()"):
+        assert needle in src, f"missing: {needle}"
+    assert "glVertex3f(ax, ay, 0.0)" not in src, "constellation edges still flat"
+
+
+@ext("Hologram 3D")
+def molecule_bond_orders():
+    hm, h = _patched()
+    for name, want in (("benzene", [2, 1, 2, 1, 2, 1] + [1] * 6), ("carbon dioxide", [2, 2]), ("nitrogen", [3]), ("water", [1, 1])):
+        assert h.load_molecule(name), name
+        eq(h.molecule_orders, want)
+        eq(len(h.molecule_orders), len(h.molecule_data["bonds"]))
+
+
+@ext("Hologram 3D")
+def idle_sway_only_without_a_hand():
+    hm, h = _patched()
+    for _ in range(60):
+        h.update(0, 0, 0.0, target_dt=1 / 30)
+    assert abs(h.rotation_y) > 0.5 and abs(h.rotation_x) > 0.1, (h.rotation_y, h.rotation_x)
+    hm2, h2 = _patched()
+    for _ in range(200):
+        h2.update(0.5, 0, 0.0, target_dt=1 / 30)
+    assert abs(h2.rotation_y - 45) < 1, h2.rotation_y
+
+
+@ext("Hologram 3D")
+def ball_is_lit_and_quadric_is_cached():
+    hm, h = _patched()
+    with gl_mocks() as (hm, m):
+        h._draw_ball(0.2, (1, 0, 0))
+        h._draw_ball(0.3, (0, 1, 0), 0.5)
+    eq(m["gluNewQuadric"].call_count, 1)
+    eq([c.args[1] for c in m["gluSphere"].call_args_list], [0.2, 0.3])
+    assert mock.call(hm.GL_LIGHTING) in m["glEnable"].call_args_list and mock.call(hm.GL_LIGHTING) in m["glDisable"].call_args_list
+
+
+@ext("Hologram 3D")
+def quark_content_matches_proton_and_neutron():
+    hm, h = _patched()
+    for is_p, big in ((True, 2), (False, 1)):
+        radii = []
+        h._draw_ball = lambda r, c, a=1.0, s=14: radii.append(r)
+        with gl_mocks():
+            h._draw_quarks(is_p, 0.09, 3, 1.0)
+        eq(len(radii), 3)
+        eq(sum(1 for r in radii if r == 0.026), big)
+
+
+@ext("Hologram 3D")
+def nucleus_shows_protons_neutrons_and_quarks():
+    hm, h = _patched()
+
+    def run(p, n):
+        quarks, balls = [], []
+        h._draw_quarks = lambda is_p, r, seed, b: quarks.append(is_p)
+        h._draw_ball = lambda r, c, a=1.0, s=14: balls.append((r, a))
+        h._draw_glow_fan = lambda *a, **k: None
+        with gl_mocks():
+            h._draw_nucleus_particles(p, n, 1.0)
+        return quarks, balls
+    q, b = run(6, 6)
+    eq((len(q), sum(q), len(b)), (12, 6, 12))
+    assert all(a < 1 for _, a in b), "nucleon shells should be translucent"
+    q, b = run(92, 146)
+    eq((q, len(b)), ([], h.NUCLEON_RENDER_CAP))
+    eq(run(1, 0)[0], [True])
+    eq(run(0, 0), ([], []))
+
+
+@ext("Hologram 3D")
+def stripes_and_legend_visibility():
+    hm, h = _patched()
+    h.height = 900
+    with gl_mocks() as (_, m):
+        h.mode = "empty"
+        h._draw_hologram_stripes(640, 450, (0.1, 0.6, 1.0))
+        eq(m["glBegin"].call_count, 0)
+        h.mode = "atom"
+        h._draw_hologram_stripes(640, 450, (0.1, 0.6, 1.0))
+        eq(m["glBegin"].call_count, 1)
+    texts = []
+    h.font_small, h._draw_circle_2d = object(), lambda *a, **k: None
+    h._blit_text = lambda f, t, x, y, color=None: texts.append(t)
+    with gl_mocks():
+        h.mode = "atom"
+        h._draw_particle_legend()
+        eq(len(texts), 4)
+        h.mode = "shape"
+        h._draw_particle_legend()
+        h.height, h.mode = 700, "atom"
+        h._draw_particle_legend()
+        eq(len(texts), 4)
+
+
+@ext("Hologram 3D")
+def constellation_stars_have_depth():
+    hm, h = _patched()
+    assert h.load_constellation("orion")
+    h._draw_node_fan = h._draw_ball = lambda *a, **k: None
+    with gl_mocks() as (_, m):
+        h._draw_constellation(None, None)
+    zs = {round(c.args[2], 3) for c in m["glTranslatef"].call_args_list}
+    assert len(zs) >= 5, zs
+    eq(len(h._star_label_positions), 7)
+
+
+@ext("Hologram 3D")
+def patch_script_anchors_match_source():
+    sys.path.insert(0, ROOT)
+    try:
+        import apply_hologram_3d_patch as p
+    except ImportError:
+        skip("apply_hologram_3d_patch.py not present")
+    src = open(p.TARGET, encoding="utf-8").read()
+    if "_draw_ball" in src:
+        compile(src, p.TARGET, "exec")
+        return "already applied"
+    bad = [i for i, (old, _) in enumerate(p.EDITS, 1) if src.count(old) != 1]
+    assert not bad, f"anchors not matching exactly once: {bad}"
+    for name, _ in p.METHODS:
+        eq(len(re.findall(rf"^    def {name}\(", src, re.M)), 1)
+
+
 # ============================================================================ report
 def report():
     shutil.rmtree(tmpdir, ignore_errors=True)

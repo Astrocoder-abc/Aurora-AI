@@ -15,7 +15,8 @@ import cv2
 from jarvis_ui.hologram import Hologram
 from jarvis_ui.voice_assistant import VoiceAssistant, NullVoice
 from jarvis_ui.face_id import FaceID
-from jarvis_ui import system_control, addons, dashboard_modes, system_monitor
+from jarvis_ui import system_control, addons, dashboard_modes, system_monitor, task_engine, self_diagnostics
+from jarvis_ui.hand_tracker import BackgroundTracker
 
 GESTURE_TO_STATE = {"open_palm": "listening", "fist": "speaking"}
 SNAPSHOT_DIR = "snapshots"
@@ -51,7 +52,7 @@ def build_voice(hologram, face_id):
 
 
 def main():
-    tracker = addons.TipHandTracker(camera_index=0)
+    tracker = BackgroundTracker(addons.TipHandTracker(camera_index=0))
     hologram = Hologram()
     face_id = FaceID(on_log=hologram.log_event)
     voice = build_voice(hologram, face_id)
@@ -60,6 +61,10 @@ def main():
     addons.install(hologram, drawer)
     dashboard_modes.install(hologram, voice)
     system_monitor.start(hologram, voice)
+    governor = system_monitor.PerformanceGovernor(hologram, tracker, voice)
+    governor.start()
+    task_engine.install(hologram, voice)
+    self_diagnostics.install(hologram, voice)
 
     last_debug_frame, prev_time, frame_i = None, time.time(), 0
     volume_prev_pitch = None
@@ -84,7 +89,7 @@ def main():
                 voice.latest_frame = raw if raw is not None else debug_frame
                 frame_i += 1
                 gray = cv2.cvtColor(debug_frame, cv2.COLOR_BGR2GRAY)
-                if frame_i % DETECT_EVERY == 0 or face_id.enrolling:
+                if frame_i % governor.detect_every == 0 or face_id.enrolling:
                     faces = face_id.detect_faces(gray)
 
                 if hologram.mode == "telemetry":
@@ -107,7 +112,7 @@ def main():
                         hologram.log_event(f"FACE: enrollment {'ok' if ok else 'failed'}")
                         voice.speak_now(f"Got it, I'll recognize you as {name} from now on." if ok else msg)
                 # ---- recognition (throttled) ----
-                elif faces and now - last_check > RECOGNITION_INTERVAL:
+                elif faces and now - last_check > governor.recognition_interval:
                     last_check = now
                     name, dist = face_id.recognize(gray, faces[0])
                     if name:
