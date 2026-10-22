@@ -34,7 +34,7 @@ import numpy as np
 import pygame
 from pygame.locals import DOUBLEBUF, OPENGL, FULLSCREEN
 from OpenGL.GL import *
-from OpenGL.GLU import gluPerspective, gluProject
+from OpenGL.GLU import gluPerspective, gluProject, gluNewQuadric, gluSphere
 from collections import deque
 import threading
 
@@ -566,6 +566,8 @@ US_STATE_ABBREV = {
     "district of columbia": "DC",
 }
 
+MOLECULE_BOND_ORDER = {"carbon dioxide": 2, "oxygen": 2, "nitrogen": 3}
+
 RADIUS_MIN, RADIUS_MAX = 0.35, 2.6
 SPEED_MIN, SPEED_MAX = -180, 180
 
@@ -673,6 +675,7 @@ class Hologram:
         # Lab Mode state: molecule ball-and-stick data, math graph sample
         # points + source expression, and simple physics sim state.
         self.molecule_data = None
+        self.molecule_orders = []
         self.graph_points = []
         self.graph_expr = ""
         self.physics_type = None
@@ -1101,6 +1104,8 @@ class Hologram:
             return False
         self.hide_weather()
         self.molecule_data = data
+        self.molecule_orders = ([2 if i % 2 == 0 else 1 for i in range(6)] + [1] * 6 if key == "benzene"
+                                else [MOLECULE_BOND_ORDER.get(key, 1)] * len(data["bonds"]))
         self.orbits = []
         self.selected_index = None
         self.mode = "molecule"
@@ -1300,6 +1305,9 @@ class Hologram:
     def update(self, yaw_norm, pitch_norm, pinch_amount, target_dt=1 / 60):
         target_y = yaw_norm * 90
         target_x = pitch_norm * 60
+        if yaw_norm == 0 and pitch_norm == 0 and not pinch_amount:   # no hand: slow idle sway
+            target_y = 14 * math.sin(self.elapsed * 0.35)
+            target_x = 6 * math.sin(self.elapsed * 0.27)
         self.rotation_y += (target_y - self.rotation_y) * 0.15
         self.rotation_x += (target_x - self.rotation_x) * 0.15
 
@@ -1617,14 +1625,21 @@ class Hologram:
             return
         atoms, bonds = data["atoms"], data["bonds"]
 
-        glLineWidth(2.5)
-        glColor4f(0.85 * brightness, 0.85 * brightness, 0.9 * brightness, 0.85)
+        orders = getattr(self, "molecule_orders", [])
+        glLineWidth(3.0)
+        glColor4f(0.85 * brightness, 0.85 * brightness, 0.9 * brightness, 0.9)
         glBegin(GL_LINES)
-        for i, j in bonds:
+        for n, (i, j) in enumerate(bonds):
             _, ax, ay, az = atoms[i]
             _, bx, by, bz = atoms[j]
-            glVertex3f(ax, ay, az)
-            glVertex3f(bx, by, bz)
+            px, py = by - ay, -(bx - ax)
+            ln = math.hypot(px, py)
+            px, py = (px / ln, py / ln) if ln > 1e-6 else (1.0, 0.0)
+            order = orders[n] if n < len(orders) else 1
+            for off in {1: (0,), 2: (-1, 1), 3: (-1.6, 0, 1.6)}.get(order, (0,)):
+                o = 0.035 * off
+                glVertex3f(ax + px * o, ay + py * o, az)
+                glVertex3f(bx + px * o, by + py * o, bz)
         glEnd()
 
         for element, x, y, z in atoms:
@@ -1634,8 +1649,7 @@ class Hologram:
             glTranslatef(x, y, z)
             glColor4f(col[0] * brightness, col[1] * brightness, col[2] * brightness, 0.20)
             self._draw_wireframe_sphere(radius * 1.7, lat_count=2, lon_count=3, segments=14)
-            glColor4f(col[0] * brightness, col[1] * brightness, col[2] * brightness, 1.0)
-            self._draw_wireframe_sphere(radius, lat_count=3, lon_count=4, segments=16)
+            self._draw_ball(radius, tuple(c * brightness for c in col))
             glPopMatrix()
 
     def _draw_graph(self, color, brightness):
@@ -1683,8 +1697,7 @@ class Hologram:
 
             glPushMatrix()
             glTranslatef(*bob)
-            glColor4f(r, g, b, 1.0)
-            self._draw_node_fan(0.12, segments=16)
+            self._draw_ball(0.12, (r, g, b))
             glPopMatrix()
 
         elif self.physics_type == "projectile":
@@ -1703,12 +1716,12 @@ class Hologram:
 
             glPushMatrix()
             glTranslatef(st["x"], st["y"], 0.0)
-            glColor4f(r, g, b, 1.0)
-            self._draw_node_fan(0.1, segments=14)
+            self._draw_ball(0.1, (r, g, b))
             glPopMatrix()
 
     def _draw_earth_core(self, brightness):
         """Simple blue wireframe Earth for satellite mode."""
+        self._draw_ball(0.46, (0.15 * brightness, 0.35 * brightness, 0.8 * brightness), 1.0, 20)
         glColor4f(0.25 * brightness, 0.55 * brightness, 1.0 * brightness, 0.9)
         self._draw_wireframe_sphere(0.5, lat_count=4, lon_count=6, segments=32)
         self._draw_glow_fan(0.5, 0.3 * brightness, 0.6 * brightness, 1.0 * brightness, passes=4)
@@ -1734,6 +1747,7 @@ class Hologram:
         glPointSize(1.0)
 
         stars, edges = data["stars"], data["edges"]
+        zs = [0.45 * math.sin(i * 2.4 + 1.0) for i in range(len(stars))]
 
         glLineWidth(1.3)
         glColor4f(0.4, 0.6, 0.9, 0.5)
@@ -1741,19 +1755,18 @@ class Hologram:
         for i, j in edges:
             _, ax, ay, _ = stars[i]
             _, bx, by, _ = stars[j]
-            glVertex3f(ax, ay, 0.0)
-            glVertex3f(bx, by, 0.0)
+            glVertex3f(ax, ay, zs[i])
+            glVertex3f(bx, by, zs[j])
         glEnd()
 
         twinkle_base = self.elapsed * 1.3
         for i, (name, x, y, size) in enumerate(stars):
             twinkle = 0.75 + 0.25 * math.sin(twinkle_base + i * 1.9)
             glPushMatrix()
-            glTranslatef(x, y, 0.0)
+            glTranslatef(x, y, zs[i])
             glColor4f(0.6, 0.75, 1.0, 0.18 * twinkle)
             self._draw_node_fan(size * 2.2, segments=16)
-            glColor4f(1.0, 1.0, 1.0, 0.95 * twinkle)
-            self._draw_node_fan(size * 0.55, segments=12)
+            self._draw_ball(size * 0.5, (twinkle, twinkle, twinkle))
             glPopMatrix()
 
             try:
@@ -1762,7 +1775,7 @@ class Hologram:
                 # x,y — equivalent to projecting the translated point, without
                 # double-applying the scale.
                 mv = glGetDoublev(GL_MODELVIEW_MATRIX)
-                sx, sy, sz = gluProject(x, y, 0.0, mv, projection, viewport)
+                sx, sy, sz = gluProject(x, y, zs[i], mv, projection, viewport)
                 if 0 <= sz <= 1:
                     self._star_label_positions.append((sx, self.height - sy, name))
             except Exception:
@@ -1956,12 +1969,27 @@ class Hologram:
             glVertex3f(radius * math.cos(theta), radius * math.sin(theta), 0.0)
         glEnd()
 
+    def _draw_ball(self, radius, color, alpha=1.0, slices=14):
+        """Lit solid sphere so particles read as 3D."""
+        if getattr(self, "_quad", None) is None:
+            self._quad = gluNewQuadric()
+        glEnable(GL_LIGHTING)
+        glEnable(GL_LIGHT0)
+        glEnable(GL_COLOR_MATERIAL)
+        glLightfv(GL_LIGHT0, GL_POSITION, (0.5, 0.8, 1.0, 0.0))
+        glLightfv(GL_LIGHT0, GL_DIFFUSE, (1.0, 1.0, 1.0, 1.0))
+        glLightfv(GL_LIGHT0, GL_AMBIENT, (0.35, 0.35, 0.35, 1.0))
+        glColor4f(color[0], color[1], color[2], alpha)
+        gluSphere(self._quad, radius, slices, slices)
+        glDisable(GL_COLOR_MATERIAL)
+        glDisable(GL_LIGHTING)
+
     def _draw_glow_fan(self, base_radius, r, g, b, passes=4):
+        glDepthMask(GL_FALSE)
         for i in range(passes, 0, -1):
-            scale = 1.0 + i * 0.5
-            alpha = 0.10 / i
-            glColor4f(r, g, b, alpha)
-            self._draw_node_fan(base_radius * scale)
+            glColor4f(r, g, b, 0.10 / i)
+            self._draw_node_fan(base_radius * (1.0 + i * 0.5))
+        glDepthMask(GL_TRUE)
 
     def _draw_glow_ring(self, radius, r, g, b, passes=3):
         """Soft additive halo behind an orbit ring — same idea as
@@ -2135,8 +2163,7 @@ class Hologram:
             glTranslatef(px, py, pz)
             nc = tuple(min(1.0, c * 0.5 + accent[j] * 0.5) for j, c in enumerate(color))
             self._draw_glow_fan(0.065, *nc, passes=4)
-            glColor4f(*nc, 1.0)
-            self._draw_node_fan(0.045, segments=14)
+            self._draw_ball(0.045, nc)
             glColor4f(1.0, 1.0, 1.0, 0.85)
             self._draw_node_fan(0.016, segments=10)
             glPopMatrix()
@@ -2166,49 +2193,59 @@ class Hologram:
             glEnd()
             self._blit_text(self.font_small, label.upper(), sx + 18, sy - 32, color=tint)
 
+    QUARK_COLORS = ((1.0, 0.2, 0.2), (0.2, 1.0, 0.3), (0.3, 0.5, 1.0))
+
+    def _draw_quarks(self, is_proton, r, seed, brightness):
+        """Three colour-charge quarks orbiting inside a nucleon, joined by gluon lines (uud / udd)."""
+        sizes = (0.026, 0.026, 0.019) if is_proton else (0.026, 0.019, 0.019)
+        tilt, pts = seed * 1.3, []
+        for k in range(3):
+            a = self.elapsed * 2.2 + seed + k * 2.0944
+            pts.append((0.5 * r * math.cos(a), 0.5 * r * math.sin(a) * math.cos(tilt),
+                        0.5 * r * math.sin(a) * math.sin(tilt)))
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+        glLineWidth(1.2)
+        glColor4f(1.0, 1.0, 1.0, 0.45)
+        glBegin(GL_LINE_LOOP)
+        for p in pts:
+            glVertex3f(*p)
+        glEnd()
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        for k, p in enumerate(pts):
+            glPushMatrix()
+            glTranslatef(*p)
+            self._draw_ball(sizes[k], tuple(c * brightness for c in self.QUARK_COLORS[k]), 1.0, 8)
+            glPopMatrix()
+
     def _draw_nucleus_particles(self, protons, neutrons, brightness):
-        """Real proton/neutron particle cluster instead of a single dot."""
+        """Protons (red) and neutrons (blue-grey) interleaved; small nuclei also show their quarks."""
         total = protons + neutrons
         if total <= 0:
             return
-
-        render_total = min(total, self.NUCLEON_RENDER_CAP)
-        if total > 0:
-            render_protons = max(1, round(render_total * protons / total)) if protons > 0 else 0
-            render_neutrons = render_total - render_protons
-        else:
-            render_protons = render_neutrons = 0
-
-        halo_radius = 0.16 + min(0.26, total * 0.0035)
-        halo_pulse = 1.0 + 0.08 * math.sin(self.elapsed * 2.5)
-        self._draw_glow_fan(halo_radius * halo_pulse, 1.0 * brightness, 0.65 * brightness, 0.35 * brightness, passes=6)
-
-        positions = self._nucleon_positions(render_total, cluster_radius=min(0.3, 0.16 + total * 0.0022))
-
-        def wobble(i):
+        n = min(total, self.NUCLEON_RENDER_CAP)
+        p_count = max(1, round(n * protons / total)) if protons > 0 else 0
+        halo = 0.16 + min(0.26, total * 0.0035)
+        self._draw_glow_fan(halo * (1.0 + 0.08 * math.sin(self.elapsed * 2.5)),
+                            1.0 * brightness, 0.65 * brightness, 0.35 * brightness, passes=6)
+        positions = [(0.0, 0.0, 0.0)] if n == 1 else \
+            self._nucleon_positions(n, cluster_radius=min(0.3, 0.16 + total * 0.0022))
+        quarks = n <= 12
+        r_n = 0.09 if quarks else 0.065
+        for i, (x, y, z) in enumerate(positions):
+            is_p = (i * p_count) // n != ((i + 1) * p_count) // n          # protons spread evenly
+            col = tuple(c * brightness for c in ((1.0, 0.3, 0.25) if is_p else (0.6, 0.7, 0.9)))
             w = 0.010
-            return (w * math.sin(self.elapsed * 3.1 + i * 1.7),
-                    w * math.sin(self.elapsed * 2.7 + i * 2.3),
-                    w * math.sin(self.elapsed * 3.4 + i * 0.9))
-
-        idx = 0
-        for _ in range(render_protons):
-            x, y, z = positions[idx]
-            wx, wy, wz = wobble(idx)
-            idx += 1
             glPushMatrix()
-            glTranslatef(x + wx, y + wy, z + wz)
-            glColor4f(1.0 * brightness, 0.3 * brightness, 0.25 * brightness, 1.0)
-            self._draw_node_fan(0.065, segments=10)
-            glPopMatrix()
-        for _ in range(render_neutrons):
-            x, y, z = positions[idx]
-            wx, wy, wz = wobble(idx)
-            idx += 1
-            glPushMatrix()
-            glTranslatef(x + wx, y + wy, z + wz)
-            glColor4f(0.6 * brightness, 0.7 * brightness, 0.9 * brightness, 1.0)
-            self._draw_node_fan(0.065, segments=10)
+            glTranslatef(x + w * math.sin(self.elapsed * 3.1 + i * 1.7),
+                         y + w * math.sin(self.elapsed * 2.7 + i * 2.3),
+                         z + w * math.sin(self.elapsed * 3.4 + i * 0.9))
+            if quarks:
+                self._draw_quarks(is_p, r_n, i, brightness)
+                glDepthMask(GL_FALSE)
+                self._draw_ball(r_n, col, 0.38, 14)                         # translucent shell
+                glDepthMask(GL_TRUE)
+            else:
+                self._draw_ball(r_n, col, 1.0, 10)
             glPopMatrix()
 
     def _draw_sweep_arc(self, radius, span_deg=50):
@@ -3189,6 +3226,36 @@ class Hologram:
             self._blit_text(self.font_small, f"... {len(items) - max_rows} more field(s) not shown",
                              x, y, color=(120, 150, 175))
 
+    def _draw_hologram_stripes(self, cx, cy, theme_color):
+        """Fine horizontal interference lines drifting up through the projection."""
+        if self.mode in ("empty", "info", "telemetry"):
+            return
+        r, g, b = theme_color
+        R, step = 230, 6
+        y = -R + (self.elapsed * 18) % step
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+        glLineWidth(1.0)
+        glBegin(GL_LINES)
+        while y < R:
+            half = math.sqrt(max(0.0, R * R - y * y))
+            glColor4f(r, g, b, 0.05 * (1 - abs(y) / R))
+            glVertex2f(cx - half, cy + y)
+            glVertex2f(cx + half, cy + y)
+            y += step
+        glEnd()
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+
+    def _draw_particle_legend(self):
+        if self.mode != "atom" or self.docked or self.height < 780 or not self.font_small:
+            return
+        x, y = 34, 520
+        for label, col in (("PROTON (uud)", (1.0, 0.3, 0.25)), ("NEUTRON (udd)", (0.6, 0.7, 0.9)),
+                           ("QUARKS (colour charge)", (0.3, 1.0, 0.5)), ("ELECTRON (shell colour)", (0.3, 0.65, 1.0))):
+            glColor4f(col[0], col[1], col[2], 0.95)
+            self._draw_circle_2d(x, y + 7, 5)
+            self._blit_text(self.font_small, label, x + 14, y, color=(190, 220, 240))
+            y += 20
+
     def _draw_hud_reticle(self, theme_color):
         """Tick ring + arcs that pulse gently (no rotation)."""
         ppu = self.height / 4.97
@@ -3221,6 +3288,7 @@ class Hologram:
                 a = math.radians(start - spin * 1.6 + j * 2.5)
                 glVertex2f(cx + 200 * math.cos(a), cy + 200 * math.sin(a))
             glEnd()
+        self._draw_hologram_stripes(cx, cy, theme_color)
 
     def _wrap_text(self, font, text, max_width):
         if not font:
@@ -3365,6 +3433,7 @@ class Hologram:
             self._draw_event_log()
         if "readout" not in self.hidden_panels:
             self._draw_info_panel(theme_color)
+            self._draw_particle_legend()
         self._draw_weather_panel(theme_color)
         if self.mode == "telemetry":
             self._draw_telemetry_panel(theme_color)
@@ -3432,7 +3501,7 @@ class Hologram:
         scale = (1.0 + pinch_amount * 0.15) * self.zoom * materialize_ease
 
         # sweeping scan band through the hologram
-        if self.mode in ("atom", "solar_system", "demo", "shape", "satellite"):
+        if self.mode in ("atom", "solar_system", "demo", "shape", "satellite", "molecule"):
             glPushMatrix()
             glScalef(scale, scale, scale)
             self._draw_scan_band(color, brightness)
@@ -3518,8 +3587,7 @@ class Hologram:
                     if is_selected:
                         sel_r = node_r * 1.3 if "size" in orbit else 0.09
                         self._draw_glow_fan(sel_r, 1.0, 1.0, 1.0, passes=3)
-                        glColor4f(1.0, 1.0, 1.0, 1.0)
-                        self._draw_node_fan(sel_r + 0.02 * pulse)
+                        self._draw_ball(sel_r + 0.02 * pulse, (1.0, 1.0, 1.0))
                         glColor4f(1.0, 1.0, 1.0, 0.9)
                         glBegin(GL_LINE_LOOP)
                         for i in range(4):
@@ -3529,8 +3597,7 @@ class Hologram:
                     else:
                         nc = tuple(min(1.0, c + 0.2) for c in ring_color)
                         self._draw_glow_fan(node_r, *nc, passes=2)
-                        glColor4f(*nc, 1.0)
-                        self._draw_node_fan(node_r)
+                        self._draw_ball(node_r, nc)
 
                     # Saturn's rings
                     if orbit.get("label") == "Saturn":
