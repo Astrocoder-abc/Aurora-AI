@@ -15,7 +15,7 @@ import cv2
 from jarvis_ui.hologram import Hologram
 from jarvis_ui.voice_assistant import VoiceAssistant, NullVoice
 from jarvis_ui.face_id import FaceID
-from jarvis_ui import system_control, addons, dashboard_modes, system_monitor, task_engine, self_diagnostics
+from jarvis_ui import system_control, addons, dashboard_modes, system_monitor, task_engine, self_diagnostics, procedural_construction
 from jarvis_ui.hand_tracker import BackgroundTracker
 
 GESTURE_TO_STATE = {"open_palm": "listening", "fist": "speaking"}
@@ -59,6 +59,7 @@ def main():
     drawer = addons.GestureDrawer(hologram, speak=voice.speak_now, on_log=hologram.log_event)
     hologram.drawer, voice.drawer = drawer, drawer
     addons.install(hologram, drawer)
+    procedural_construction.install(hologram)
     dashboard_modes.install(hologram, voice)
     system_monitor.start(hologram, voice)
     governor = system_monitor.PerformanceGovernor(hologram, tracker, voice)

@@ -97,7 +97,7 @@ for d in REQUIRED + WINDOWS_ONLY + OPTIONAL:
 
 # ============================================================================ modules import
 for m in ["hologram", "hand_tracker", "face_id", "system_control", "telemetry", "brain", "voice_assistant",
-          "addons", "aurora_plus", "sandbox_labs", "dashboard_modes", "system_monitor", "gmail_client"]:
+          "addons", "aurora_plus", "sandbox_labs", "dashboard_modes", "system_monitor", "gmail_client", "procedural_construction"]:
     check("Modules import", f"jarvis_ui.{m}", (lambda m=m: importlib.import_module(f"jarvis_ui.{m}") and None))
 check("Modules import", "main.py", lambda: importlib.import_module("main") and None)
 
@@ -790,6 +790,16 @@ CASES = [
     ("shapes: sphere/cube/torus/pyramid/cylinder/eiffel/skyscraper/dna",
      lambda h: [h.load_shape(s) or h.render() for s in ("sphere", "cube", "torus", "pyramid", "cylinder", "eiffel tower", "skyscraper", "dna")]),
     ("heart model", lambda h: h.load_shape("heart")),
+    ("construction demo (robot)", lambda h: (mod("procedural_construction").install(h), h.load_construction("robot"),
+                                              [(setattr(h, "elapsed", h._materialize_start + t), h.render()) for t in (0.9, 3.0)])),
+    ("construction demo (drone)", lambda h: (mod("procedural_construction").install(h), h.load_construction("drone"),
+                                             [(setattr(h, "elapsed", h._materialize_start + t), h.render()) for t in (0.9, 3.0)])),
+    ("construction demo (car)", lambda h: (mod("procedural_construction").install(h), h.load_construction("car"),
+                                           [(setattr(h, "elapsed", h._materialize_start + t), h.render()) for t in (0.9, 3.0)])),
+    ("construction demo (spaceship)", lambda h: (mod("procedural_construction").install(h), h.load_construction("spaceship"),
+                                                 [(setattr(h, "elapsed", h._materialize_start + t), h.render()) for t in (0.9, 3.0)])),
+    ("construction instant (car)", lambda h: (mod("procedural_construction").install(h), h.load_construction("car", assemble=False),
+                                              h.render())),
     ("molecule", lambda h: h.load_molecule("water")),
     ("math graph", lambda h: h.load_math_graph("sin(x)")),
     ("physics sim", lambda h: h.load_physics_sim("pendulum")),
@@ -2174,14 +2184,15 @@ def t_dg_ai_content():
     docx = '{"title":"Doc","sections":[{"heading":"Intro","paragraphs":["Hello world."],"bullets":["pt"]}]}'
     with mock.patch.object(d, "OUT_DIR", _fdir()):
         with mock.patch.object(br, "_complete", return_value="```json\n" + pptx + "\n```"):
-            path, n, ai, err = d.create("pptx", "t", object(), 2)
+            path, n, ai, err = d.create("pptx", "t without images", object(), 2)
         if err and err.startswith("Missing"):
             skip(err)
         assert ai and n == 3, (n, ai, err)
         from pptx import Presentation
         prs = Presentation(path)
         eq(len(prs.slides), 3)
-        eq(prs.slides[1].shapes.title.text, "A")
+        texts = [sh.text_frame.text for sh in prs.slides[1].shapes if sh.has_text_frame]
+        assert "A" in texts, texts                     # designed slides use text boxes, not title placeholders
         eq(prs.slides[1].notes_slide.notes_text_frame.text, "n")
         with mock.patch.object(br, "_complete", return_value=xlsx):
             path, n, ai, err = d.create("xlsx", "budget", object())
@@ -4551,6 +4562,583 @@ def patch_script_anchors_match_source():
     assert not bad, f"anchors not matching exactly once: {bad}"
     for name, _ in p.METHODS:
         eq(len(re.findall(rf"^    def {name}\(", src, re.M)), 1)
+
+
+# ============================================================================ holographic construction (stage 1)
+_PC_GL = ("glPushMatrix", "glPopMatrix", "glTranslatef", "glRotatef", "glScalef", "glDeleteLists", "glCallList")
+
+
+@contextlib.contextmanager
+def pc_gl():
+    """Patches the OpenGL names inside procedural_construction (no GL context needed)."""
+    pc = mod("procedural_construction")
+    with mock.patch.multiple(pc, **{n: mock.DEFAULT for n in _PC_GL}) as m:
+        yield pc, m
+
+
+def pc_fake_holo():
+    """Hologram stand-in: records which primitive was drawn, and mimics Hologram._cached_list."""
+    calls, builds = [], []
+    h = ns(elapsed=0.0, _materialize_start=0.0, _gl_lists={}, calls=calls, builds=builds)
+    for prim, meth in (("box", "_draw_wireframe_cube"), ("sphere", "_draw_wireframe_sphere"),
+                       ("cylinder", "_draw_wireframe_cylinder"), ("pyramid", "_draw_wireframe_pyramid")):
+        setattr(h, meth, lambda *a, _p=prim, **k: calls.append(_p))
+
+    def cached(key, build):
+        if key not in h._gl_lists:
+            h._gl_lists[key] = len(h._gl_lists) + 1
+            builds.append(key)
+            build()
+        return h._gl_lists[key]
+    h._cached_list = cached
+    return h
+
+
+def pc_part(**over):
+    d = {"name": "a", "prim": "box", "pos": (0, 0, 0), "size": (1, 1, 1)}
+    d.update(over)
+    return d
+
+
+@ext("Holographic construction")
+def robot_demo_is_valid_and_within_bounds():
+    pc = mod("procedural_construction")
+    m = pc.MODELS["robot"]
+    assert len(m.parts) == 18 and {p.prim for p in m.parts} <= set(pc.PRIMITIVES)
+    assert len({p.name for p in m.parts}) == 18
+    ys = [p.pos[1] + s * 0.5 for p in m.parts for s in (p.size[1], -p.size[1])]
+    assert -1.5 < min(ys) and max(ys) < 1.5, (min(ys), max(ys))      # stays well inside the fog range
+    assert abs(m.duration - (1.10 + pc.GROW_SECONDS)) < 1e-9
+    hash(m)                                                           # hashable: used as the display-list cache key
+
+
+@ext("Holographic construction")
+def validator_rejects_bad_input_and_normalizes_good_input():
+    pc = mod("procedural_construction")
+    bad = [pc_part(prim="torus"), pc_part(prim=None), pc_part(pos=(0, 0)), pc_part(pos=(float("nan"), 0, 0)),
+           pc_part(pos=(0, float("inf"), 0)), pc_part(pos=(3, 0, 0)), pc_part(pos=(True, 0, 0)), pc_part(pos=("1", 0, 0)),
+           pc_part(pos="abc"), pc_part(size=(0, 1, 1)), pc_part(size=(1, 9, 1)), pc_part(size=-1), pc_part(rot=(0, 9999, 0)),
+           pc_part(delay=-1), pc_part(delay=99), pc_part(name=""), pc_part(name="../x"), pc_part(name="x" * 40),
+           pc_part(color="red"), "box", None]
+    for raw in bad:
+        raises(pc.PartError, pc.build_model, "m", [raw])
+    raw_missing = {"name": "a", "prim": "box", "pos": (0, 0, 0)}
+    raises(pc.PartError, pc.build_model, "m", [raw_missing])
+    raises(pc.PartError, pc.build_model, "m", [])
+    raises(pc.PartError, pc.build_model, "m", "box")
+    raises(pc.PartError, pc.build_model, "m", [pc_part()] * 2)                              # duplicate names
+    raises(pc.PartError, pc.build_model, "m", [pc_part(name=f"p{i}") for i in range(pc.MAX_PARTS + 1)])
+    raises(pc.PartError, pc.build_model, "bad/name", [pc_part()])
+    ok = pc.build_model("Tiny", [pc_part(size=0.5, rot=(190, -190, 0), delay=1)])
+    p = ok.parts[0]
+    eq((ok.name, p.size, p.rot, p.delay), ("tiny", (0.5, 0.5, 0.5), (-170.0, 170.0, 0.0), 1.0))
+    eq(len(pc.build_model("m", [pc_part(name=f"p{i}") for i in range(pc.MAX_PARTS)]).parts), pc.MAX_PARTS)
+
+
+@ext("Holographic construction")
+def draw_model_transforms_counts_and_matrix_balance():
+    h = pc_fake_holo()
+    with pc_gl() as (pc, m):
+        model = pc.MODELS["robot"]
+        pc.draw_model(h, model)
+        want = {}
+        for p in model.parts:
+            want[p.prim] = want.get(p.prim, 0) + 1
+        got = {k: h.calls.count(k) for k in set(h.calls)}
+        eq(got, want)
+        eq((m["glPushMatrix"].call_count, m["glPopMatrix"].call_count), (18, 18))
+        first = model.parts[0]
+        eq(m["glTranslatef"].call_args_list[0].args, first.pos)
+        eq(tuple(round(v, 6) for v in m["glScalef"].call_args_list[0].args), tuple(round(0.5 * s, 6) for s in first.size))
+        eq(m["glRotatef"].call_count, 2)                                 # only the two tilted arms rotate (z axis only)
+        assert all(c.args[1:] == (0, 0, 1) for c in m["glRotatef"].call_args_list)
+        # partway through assembly: fewer parts, smaller scale
+        h.calls.clear()
+        m["glScalef"].reset_mock()
+        t = 0.2
+        pc.draw_model(h, model, t)
+        expect = [p for p in model.parts if pc._ease((t - p.delay) / pc.GROW_SECONDS) >= pc.MIN_GROWTH]
+        assert 0 < len(h.calls) == len(expect) < 18, (len(h.calls), len(expect))
+        assert all(c.args[0] <= 0.5 * model.parts[0].size[0] + 1e-9 for c in m["glScalef"].call_args_list[:1])
+        h.calls.clear()
+        pc.draw_model(h, model, 0.0)
+        eq(h.calls, [])                                                   # nothing has started growing yet
+        # a failing primitive must not leave the matrix stack unbalanced
+        m["glPushMatrix"].reset_mock()
+        m["glPopMatrix"].reset_mock()
+        h._draw_wireframe_cube = mock.Mock(side_effect=RuntimeError("gl"))
+        raises(RuntimeError, pc.draw_model, h, model)
+        eq(m["glPushMatrix"].call_count, m["glPopMatrix"].call_count)
+
+
+@ext("Holographic construction")
+def draw_construction_animates_then_replays_cached_list():
+    h = pc_fake_holo()
+    with pc_gl() as (pc, m):
+        dur = pc.MODELS["robot"].duration
+        h._materialize_start = 5.0
+        h.elapsed = 5.0 + pc.ASSEMBLY_DELAY + dur / 2
+        for _ in range(5):                                                # the 5 shape layers
+            pc.draw_construction(h, "robot")
+        eq((h.builds, m["glCallList"].call_count), ([], 0))               # assembling: drawn directly, nothing cached
+        direct = len(h.calls)
+        assert direct > 0 and direct % 5 == 0
+        h.calls.clear()
+        h.elapsed = 5.0 + pc.ASSEMBLY_DELAY + dur + 0.1
+        for _ in range(5):
+            pc.draw_construction(h, "robot")
+        eq((len(h.builds), m["glCallList"].call_count, len(h.calls)), (1, 5, 18))   # compiled once, replayed 5 times
+        eq(h.builds[0][:2], ("construction", "robot"))
+        before = len(h.calls)
+        pc.draw_construction(h, "nothing")
+        eq(len(h.calls), before)
+        del h._cached_list                                                # older Hologram without display lists
+        h.calls.clear()
+        pc.draw_construction(h, "robot")
+        eq(len(h.calls), 18)
+
+
+@ext("Holographic construction")
+def install_wraps_shape_renderer_without_touching_other_shapes():
+    pc = mod("procedural_construction")
+    drawn, calls = [], []
+    h = ns(_draw_shape=drawn.append, hide_weather=lambda: calls.append("hide"), _trigger_materialize=lambda: calls.append("mat"),
+           mode="empty", shape_name="sphere", mode_label="", selected_index=2, elapsed=0.0)
+    assert pc.install(h) is h and pc.install(h) is h
+    h._draw_shape("cube")
+    eq(drawn, ["cube"])                                                   # other shapes pass straight through
+    seen = []
+    with mock.patch.object(pc, "draw_construction", lambda hol, name: seen.append(name)):
+        h._draw_shape("robot")
+    eq((seen, drawn), (["robot"], ["cube"]))                              # installed once: no double wrapping
+    assert h.load_construction("robot") and not h.load_construction("ghost")
+    eq((h.mode, h.shape_name, h.mode_label, h.selected_index, calls), ("shape", "robot", "ROBOT CONSTRUCTION", None, ["hide", "mat"]))
+    h2 = ns(_draw_shape=drawn.append, mode="empty", shape_name="x")
+    pc.install(h2)
+    eq(h2.load_construction("ghost"), False)
+    eq((h2.mode, h2.shape_name), ("empty", "x"))
+
+
+@ext("Holographic construction")
+def installs_on_real_hologram_without_voice_side_effects():
+    pc, (hm, h) = mod("procedural_construction"), bare_holo()
+    drawn = []
+    h._draw_shape = drawn.append
+    pc.install(h)
+    assert "robot" not in hm.SHAPES, "demo name must not join SHAPES (the voice matcher would hijack it)"
+    assert h.load_construction("robot") and h.mode == "shape" and h.shape_name == "robot" and h.selected_index is None
+    h._draw_shape("sphere")
+    eq(drawn, ["sphere"])
+    h.show_info_card("q", "a")
+    eq(h.mode, "info")                                                    # other modes still replace it normally
+
+
+# ============================================================================ holographic construction (stage 2)
+@contextlib.contextmanager
+def pc_registry():
+    """Runs a test against the real registry and restores it afterwards (nothing leaks between tests)."""
+    pc = mod("procedural_construction")
+    with mock.patch.dict(pc.MODELS):
+        yield pc
+
+
+def pc_spec(name="widget", n=2, **over):
+    d = {"name": name, "parts": [pc_part(name=f"p{i}", pos=(0.1 * i, 0, 0)) for i in range(n)]}
+    d.update(over)
+    return d
+
+
+def pc_extent(model):
+    lo, hi = mod("procedural_construction").model_bounds(model)
+    return tuple(h - l for l, h in zip(lo, hi))
+
+
+@ext("Holographic construction 2")
+def built_in_library_is_valid_complete_and_in_bounds():
+    pc = mod("procedural_construction")
+    eq(pc.list_models(), ["car", "drone", "robot", "spaceship"])
+    need = {"robot": {"head", "torso", "arm left", "leg right", "antenna"},
+            "drone": {"body", "motor front left", "propeller rear right", "camera gimbal", "skid left"},
+            "car": {"chassis", "wheel front left", "wheel rear right", "cabin", "headlight left", "spoiler"},
+            "spaceship": {"fuselage", "nose cone", "wing left", "wing right", "engine left", "exhaust right", "tail fin"}}
+    for name, parts in need.items():
+        m = pc.get_model(name)
+        names = {p.name for p in m.parts}
+        assert parts <= names, (name, parts - names)
+        assert 12 <= len(m.parts) <= 24 and len(names) == len(m.parts)
+        assert {p.prim for p in m.parts} <= set(pc.PRIMITIVES)
+        lo, hi = pc.model_bounds(m)
+        assert max(abs(v) for v in lo + hi) <= pc.MAX_EXTENT, (name, lo, hi)
+        delays = [p.delay for p in m.parts]
+        assert delays == sorted(delays) and delays[0] == 0.0 and 1.0 < m.duration < 2.5, (name, delays[-1])
+        assert pc.get_model(name.upper() + " ") is m                      # lookups ignore case and spaces
+    assert {p.prim for n in need for p in pc.get_model(n).parts} == set(pc.PRIMITIVES)
+
+
+@ext("Holographic construction 2")
+def built_in_proportions_are_recognizable():
+    pc = mod("procedural_construction")
+    rx, ry, rz = pc_extent(pc.get_model("robot"))
+    assert ry > 1.6 * rx and ry > 4 * rz, (rx, ry, rz)                    # tall and narrow
+    dx, dy, dz = pc_extent(pc.get_model("drone"))
+    assert dx > 3 * dy and dz > 3 * dy and abs(dx - dz) < 0.1, (dx, dy, dz)  # flat, square footprint
+    cx, cy, cz = pc_extent(pc.get_model("car"))
+    assert cx > 1.8 * cz and cz > 1.2 * cy, (cx, cy, cz)                  # long, wider than tall
+    sx, sy, sz = pc_extent(pc.get_model("spaceship"))
+    assert sx > sz > 2 * sy, (sx, sy, sz)                                 # long hull, swept wings, thin
+    car = {p.name: p for p in pc.get_model("car").parts}
+    assert car["wheel front left"].rot == (90.0, 0.0, 0.0) and car["wheel front left"].pos[1] < car["chassis"].pos[1]
+    assert car["headlight left"].pos[0] > 1.0 > car["cabin"].pos[0]       # nose is +x
+    ship = {p.name: p for p in pc.get_model("spaceship").parts}
+    assert ship["nose cone"].pos[0] > 1.0 and ship["exhaust left"].pos[0] < -1.4
+
+
+@ext("Holographic construction 2")
+def robot_demo_is_unchanged_regression():
+    pc = mod("procedural_construction")
+    m = pc.get_model("robot")
+    eq(len(m.parts), 18)
+    eq((m.parts[0].name, m.parts[0].pos, m.parts[0].size, m.parts[0].delay), ("foot left", (-0.2, -1.25, 0.08), (0.34, 0.14, 0.5), 0.0))
+    eq((m.parts[-1].name, m.parts[-1].prim, m.parts[-1].delay), ("antenna tip", "sphere", 1.1))
+    eq((round(m.duration, 6), pc.GROW_SECONDS, pc.ASSEMBLY_DELAY), (1.45, 0.35, 0.25))
+    eq([p.rot for p in m.parts if p.rot != (0.0, 0.0, 0.0)], [(0.0, 0.0, -6.0), (0.0, 0.0, 6.0)])
+    lo, hi = pc.model_bounds(m)
+    assert abs(lo[1] + 1.32) < 0.02 and abs(hi[1] - 1.30) < 0.02, (lo, hi)
+
+
+@ext("Holographic construction 2")
+def draw_every_built_in_model_balances_matrices():
+    h = pc_fake_holo()
+    with pc_gl() as (pc, m):
+        for name in pc.list_models():
+            model = pc.get_model(name)
+            h.calls.clear()
+            for mk in ("glPushMatrix", "glPopMatrix", "glRotatef"):
+                m[mk].reset_mock()
+            pc.draw_model(h, model)
+            eq((len(h.calls), m["glPushMatrix"].call_count, m["glPopMatrix"].call_count), (len(model.parts),) * 3)
+            eq(m["glRotatef"].call_count, sum(1 for p in model.parts for a in p.rot if a))
+
+
+@ext("Holographic construction 2")
+def registry_register_get_list_unregister():
+    with pc_registry() as pc, pc_gl() as (_, m):
+        w = pc.define_model("Widget", [pc_part(name="a"), pc_part(name="b", pos=(0.5, 0, 0))])
+        eq((w.name, pc.list_models(), pc.get_model("WIDGET")), ("widget", ["car", "drone", "robot", "spaceship", "widget"], w))
+        assert pc.register_model(w) is w                                  # identical re-registration is a no-op
+        assert pc.define_model("widget", [pc_part(name="a"), pc_part(name="b", pos=(0.5, 0, 0))]) is w
+        assert pc.unregister_model(" Widget ") and not pc.unregister_model("widget")
+        raises(pc.PartError, pc.get_model, "widget")
+        raises(pc.PartError, pc.get_model, None)
+        for name in pc.BUILTIN_MODELS:
+            raises(pc.PartError, pc.unregister_model, name)
+        assert all(m[k].call_count == 0 for k in _PC_GL), "registry operations must never issue OpenGL calls"
+
+
+@ext("Holographic construction 2")
+def registry_never_silently_overwrites():
+    with pc_registry() as pc:
+        w1 = pc.define_model("widget", [pc_part(name="a")])
+        raises(pc.PartError, pc.define_model, "widget", [pc_part(name="a", size=(2, 1, 1))])
+        assert pc.get_model("widget") is w1
+        w2 = pc.define_model("widget", [pc_part(name="a", size=(2, 1, 1))], replace=True)
+        assert pc.get_model("widget") is w2 and w2.uid != w1.uid
+        before = pc.get_model("robot")
+        for replace in (False, True):
+            raises(pc.PartError, pc.define_model, "robot", [pc_part(name="a")], None, replace)
+        assert pc.get_model("robot") is before
+        raises(pc.PartError, pc.register_model, "robot")                  # only Model instances
+        raises(pc.PartError, pc.register_model, {"name": "x"})
+        for i in range(pc.MAX_USER_MODELS - 1):                            # "widget" already uses one slot
+            pc.define_model(f"m{i}", [pc_part()])
+        raises(pc.PartError, pc.define_model, "one too many", [pc_part()])
+        assert len(pc.list_models()) == len(pc.BUILTIN_MODELS) + pc.MAX_USER_MODELS
+
+
+@ext("Holographic construction 2")
+def hand_built_models_go_through_the_same_validator():
+    with pc_registry() as pc:
+        bad = pc.Model("evil", (pc.Part("a", "torus", (0, 0, 0), (1, 1, 1)),))
+        raises(pc.PartError, pc.register_model, bad)
+        nan = pc.Model("nan", (pc.Part("a", "box", (float("nan"), 0, 0), (1, 1, 1)),))
+        raises(pc.PartError, pc.register_model, nan)
+        dup = pc.Model("dup", (pc.Part("a", "box", (0, 0, 0), (1, 1, 1)), pc.Part("A", "box", (0, 0, 0), (1, 1, 1))))
+        raises(pc.PartError, pc.register_model, dup)
+        raw = pc.Model("raw", (pc.Part("a", "box", (0, 0, 0), (1, 1, 1), (0, 0, 190), 0.0),))
+        got = pc.register_model(raw)
+        eq(got.parts[0].rot, (0.0, 0.0, -170.0))                           # normalized by the shared validator
+        eq([n for n in pc.list_models() if n in ("evil", "nan", "dup")], [])
+
+
+@ext("Holographic construction 2")
+def model_dicts_stagger_and_malformed_data():
+    pc = mod("procedural_construction")
+    m = pc.model_from_dict({"name": "Demo", "stagger": 0.1,
+                            "parts": [pc_part(name="a"), pc_part(name="b", delay=2.0), pc_part(name="c")]})
+    eq((m.name, [round(p.delay, 6) for p in m.parts]), ("demo", [0.0, 2.0, 0.2]))
+    assert "demo" not in pc.MODELS                                        # model_from_dict never registers
+    eq(pc.build_model("d", [pc_part(name="a"), pc_part(name="b")]).parts[1].delay, 0.0)   # no stagger: unchanged behaviour
+    with pc_registry():
+        assert pc.register_model_dict(pc_spec("viaDict")).name == "viadict" and "viadict" in pc.MODELS
+    for spec in (None, [], "x", {}, {"name": "x"}, {"parts": [pc_part()]}, pc_spec(extra=1), pc_spec(parts="box"),
+                 pc_spec(parts=[]), pc_spec(name="bad/name"), pc_spec(name=3), pc_spec(stagger=-1), pc_spec(stagger=5),
+                 pc_spec(stagger=float("nan")), pc_spec(stagger="0.1"), pc_spec(parts=[pc_part(prim="torus")]),
+                 pc_spec(parts=[pc_part(pos=(0, float("inf"), 0))]), pc_spec(parts=[pc_part(), pc_part()]),
+                 pc_spec(parts=[pc_part(name=f"p{i}") for i in range(pc.MAX_PARTS + 1)]),
+                 pc_spec(parts=[None]), pc_spec(parts=[pc_part(size=(1, 1))]), pc_spec(stagger=0.9, parts=[pc_part(name=f"p{i}") for i in range(40)])):
+        raises(pc.PartError, pc.model_from_dict, spec)
+
+
+@ext("Holographic construction 2")
+def whole_model_dimensions_are_bounded_and_rotation_aware():
+    pc = mod("procedural_construction")
+    raises(pc.PartError, pc.build_model, "far", [pc_part(pos=(2.0, 2.0, 2.0), size=2.5)])     # each part legal, model is not
+    raises(pc.PartError, pc.build_model, "long", [pc_part(pos=(1.5, 0, 0), size=(2.5, 0.1, 0.1))])
+    ok = pc.build_model("edge", [pc_part(pos=(1.7, 0, 0), size=1.0)])                         # 2.2 from the origin
+    assert abs(max(pc_extent(ok)) - 1.0) < 1e-9
+    raises(pc.PartError, pc.build_model, "tilted", [pc_part(pos=(1.7, 0, 0), size=1.0, rot=(0, 0, 45))])   # 2.407 once rotated
+    lo, hi = pc.model_bounds(pc.build_model("r", [pc_part(size=(2.0, 0.2, 0.2), rot=(0, 90, 0))]))
+    assert abs(hi[2] - 1.0) < 1e-9 and abs(hi[0] - 0.1) < 1e-9, (lo, hi)                     # long axis swung onto z
+    raises(pc.PartError, pc.build_model, "tiny", [pc_part(size=0.001)])
+
+
+@ext("Holographic construction 2")
+def instant_versus_animated_assembly():
+    h = pc_fake_holo()
+    with pc_gl() as (pc, m):
+        model = pc.get_model("car")
+        h._materialize_start, h.elapsed = 3.0, 3.0                         # the moment a model is loaded
+        pc.draw_construction(h, "car")
+        eq((h.calls, m["glCallList"].call_count), ([], 0))                 # sequential: nothing has started growing
+        h._construction_assemble = False
+        pc.draw_construction(h, "car")
+        eq((len(h.calls), m["glCallList"].call_count, len(h.builds)), (len(model.parts), 1, 1))   # instant: whole model at once
+        h._construction_assemble = True
+        h.calls.clear()
+        h.elapsed = 3.0 + pc.ASSEMBLY_DELAY + 0.3
+        pc.draw_construction(h, "car")
+        assert 0 < len(h.calls) < len(model.parts)                         # partway through the sequence
+        h.elapsed = 3.0 + pc.ASSEMBLY_DELAY + model.duration + 0.01
+        before = m["glCallList"].call_count
+        pc.draw_construction(h, "car")
+        eq((m["glCallList"].call_count, len(h.builds)), (before + 1, 1))   # finished: replays the list compiled for instant mode
+
+
+@ext("Holographic construction 2")
+def load_construction_modes_names_and_failures():
+    pc = mod("procedural_construction")
+    calls = []
+    h = ns(hide_weather=lambda: calls.append("hide"), _trigger_materialize=lambda: calls.append("mat"), mode="empty",
+           shape_name="x", mode_label="", selected_index=1, _draw_shape=lambda n: None)
+    assert pc.load_construction(h, " Drone ") and (h.mode, h.shape_name, h.mode_label, h._construction_assemble) == ("shape", "drone", "DRONE CONSTRUCTION", True)
+    assert pc.load_construction(h, "car", assemble=False) and h._construction_assemble is False
+    assert pc.load_construction(h, "robot") and h._construction_assemble is True
+    calls.clear()
+    for bad in ("ghost", "", None, 5, ["car"]):
+        eq(pc.load_construction(h, bad), False)
+    eq((calls, h.shape_name), ([], "robot"))                               # failed loads change nothing
+    pc.install(h)                                                          # lambda signature carries assemble through
+    with mock.patch.object(pc, "load_construction", lambda hol, name, assemble: calls.append((name, assemble))):
+        h.load_construction("car", False)
+    eq(calls, [("car", False)])
+
+
+@ext("Holographic construction 2")
+def cache_invalidation_when_a_model_is_replaced():
+    h = pc_fake_holo()
+    h.elapsed = 100.0                                                      # long finished
+    with pc_registry() as pc, pc_gl() as (_, m):
+        v1 = pc.define_model("temp", [pc_part(name="a")])
+        for _ in range(5):
+            pc.draw_construction(h, "temp")
+        eq((len(h.builds), m["glCallList"].call_count, m["glDeleteLists"].call_count), (1, 5, 0))
+        first_id = h._gl_lists[("construction", "temp", v1.uid)]
+        assert pc.define_model("temp", [pc_part(name="a")]) is v1          # identical: cache stays valid
+        pc.draw_construction(h, "temp")
+        eq(len(h.builds), 1)
+        v2 = pc.define_model("temp", [pc_part(name="a"), pc_part(name="b")], replace=True)
+        pc.draw_construction(h, "temp")
+        pc.draw_construction(h, "temp")
+        eq(len(h.builds), 2)                                               # recompiled exactly once
+        eq(m["glDeleteLists"].call_args_list[0].args, (first_id, 1))       # stale list freed on the render path
+        eq(set(h._gl_lists), {("construction", "temp", v2.uid)})
+        pc.draw_construction(h, "robot")                                   # other models' lists are never touched
+        pc.define_model("temp", [pc_part(name="z")], replace=True)
+        pc.draw_construction(h, "temp")
+        assert ("construction", "robot", pc.get_model("robot").uid) in h._gl_lists and m["glDeleteLists"].call_count == 2
+        pc.unregister_model("temp")
+        before = m["glCallList"].call_count
+        pc.draw_construction(h, "temp")
+        eq(m["glCallList"].call_count, before)                             # unregistered: draws nothing, no error
+
+
+@ext("Holographic construction 2")
+def cache_key_is_a_stable_uid_not_a_per_frame_hash():
+    h = pc_fake_holo()
+    h.elapsed = 100.0
+    with pc_gl() as (pc, m):
+        model = pc.get_model("drone")
+        with mock.patch.object(pc.Model, "__hash__", side_effect=AssertionError("model hashed during drawing")):
+            for _ in range(5):
+                pc.draw_construction(h, "drone")
+        eq(list(h._gl_lists), [("construction", "drone", model.uid)])
+        a, b = pc.build_model("same", [pc_part()]), pc.build_model("same", [pc_part()])
+        assert a == b and a.uid != b.uid and isinstance(a.uid, int)
+
+
+# ============================================================================ presentation builder
+G = "Presentation builder"
+
+
+def pbm():
+    return mod("presentation_builder")
+
+
+def _need_pptx():
+    try:
+        import pptx   # noqa: F401
+        import PIL    # noqa: F401
+    except ImportError as e:
+        skip(f"missing library: {e.name}")
+
+
+def _pb_deck(theme="aurora"):
+    # one slide of every layout, so a single render exercises all of them
+    return pbm()._normalize({"title": "Black Holes", "subtitle": "Where gravity wins", "theme": theme, "slides": [
+        {"layout": "bullets_image", "title": "What they are", "bullets": ["Escape velocity exceeds light speed"],
+         "image": "a black hole bending light", "caption": "Artist impression", "notes": "intro"},
+        {"layout": "bullets_image", "title": "How they form", "bullets": ["A massive star collapses"], "image": "a supernova"},
+        {"layout": "stats", "title": "By the numbers", "bullets": ["M87 was imaged first"],
+         "stats": [{"value": "4.3M", "label": "solar masses"}, {"value": "1915", "label": "general relativity"}, {"value": "2019", "label": "first image"}]},
+        {"layout": "two_column", "title": "Types", "left_title": "Stellar", "left": ["3 to 100 solar masses"],
+         "right_title": "Supermassive", "right": ["Millions of solar masses"]},
+        {"layout": "section", "title": "Observing", "bullets": ["How we see the unseeable"], "image": "a radio telescope"},
+        {"layout": "image_full", "title": "Event horizon", "bullets": ["The point of no return"], "image": "a glowing accretion disk"},
+        {"layout": "quote", "title": "Quote", "quote": "Black holes ain't as black as they are painted.", "author": "Stephen Hawking"},
+        {"layout": "bullets", "title": "Plain", "bullets": ["one", "two"]},
+        {"layout": "closing", "title": "Thank you", "bullets": ["Questions?"], "image": "a starry sky"}]}, "black holes")
+
+
+def t_pb_options():
+    pb = pbm()
+    eq(pb.split_options("volcanoes in the sunset theme without images"), ("volcanoes", "sunset", False))
+    eq(pb.split_options("black holes"), ("black holes", None, True))
+    eq(pb.split_options("cats in the neon style"), ("cats", "aurora", True))
+    eq(pb.split_options("space with no pictures"), ("space", None, False))
+    eq(pb.split_options("music in the purple theme"), ("music in the purple theme", None, True))     # unknown theme words stay in the topic
+
+
+def t_pb_normalize():
+    pb = pbm()
+    spec = pb._normalize({"title": "T", "theme": "nope", "slides": [
+        "junk", {"layout": "bogus", "title": "A", "bullets": ["x"] * 9},
+        {"layout": "stats", "title": "B", "stats": [{"value": "1", "label": "x"}]},
+        {"layout": "two_column", "title": "C", "left": ["a"]},
+        {"layout": "quote", "title": "D"}]}, "topic")
+    eq(spec["theme"], "aurora")
+    eq([s["layout"] for s in spec["slides"]], ["bullets_image", "bullets_image", "bullets_image", "bullets"])
+    eq(len(spec["slides"][0]["bullets"]), 5)
+    eq(pb._normalize({}, "my topic")["title"], "My Topic")
+    eq(pb._fallback("mars", 4)["slides"][-1]["layout"], "closing")
+
+
+def t_pb_art():
+    _need_pptx()
+    from PIL import Image
+    pb, d = pbm(), _fdir()
+    a, b = os.path.join(d, "a.png"), os.path.join(d, "b.png")
+    pb.make_art("same seed", 320, 200, "sunset", a)
+    pb.make_art("same seed", 320, 200, "sunset", b)
+    eq(Image.open(a).size, (320, 200))
+    eq(open(a, "rb").read(), open(b, "rb").read())                 # deterministic per description
+    pb.make_art("other seed", 320, 200, "sunset", b)
+    assert open(a, "rb").read() != open(b, "rb").read()
+    wide = Image.new("RGB", (400, 100))
+    wide.save(os.path.join(d, "w.png"))
+    pb._crop_to(os.path.join(d, "w.png"), 100, 100)
+    eq(Image.open(os.path.join(d, "w.png")).size, (100, 100))      # cropped, never stretched
+
+
+def _pictures(prs):
+    from pptx.enum.shapes import MSO_SHAPE_TYPE
+    return sum(sh.shape_type == MSO_SHAPE_TYPE.PICTURE for s in prs.slides for sh in s.shapes)
+
+
+def t_pb_render_every_theme():
+    _need_pptx()
+    from pptx import Presentation
+    pb, d = pbm(), _fdir()
+    for theme in pb.THEMES:
+        path = os.path.join(d, f"{theme}.pptx")
+        total, ai = pb.render(_pb_deck(theme), path, images=True, ai_images=False)
+        prs = Presentation(path)
+        eq((total, len(prs.slides), ai), (10, 10, 0))
+        assert _pictures(prs) >= 5, f"{theme}: no pictures drawn"
+        eq(prs.slides[1].notes_slide.notes_text_frame.text, "intro")
+        eq(round(prs.slide_width / 914400, 2), 13.33)
+    path = os.path.join(d, "plain.pptx")
+    pb.render(_pb_deck(), path, images=False)
+    eq(_pictures(Presentation(path)), 0)                              # "without images" means no pictures at all
+
+
+def t_pb_offline_deck():
+    _need_pptx()
+    pb, d = pbm(), _fdir()
+    calls = []
+    with mock.patch.object(mod("image_generator"), "generate", lambda *a, **k: calls.append(a) or (None, "offline")):
+        path, total, used_ai, ai_imgs, err = pb.create("Solar Power!", None, 4, "forest", True, out_dir=d)
+    assert not err and not used_ai and ai_imgs == 0, err
+    assert not calls, "offline decks must not call the image service"
+    eq(total, 5)
+    assert os.path.dirname(path) == d and os.path.basename(path).startswith("solar_power_") and os.path.getsize(path) > 5000
+    path, total, *_rest, err = pb.create("x", None, 3, None, False, out_dir=d)
+    assert not err and total == 4
+
+
+def t_pb_ai_content():
+    _need_pptx()
+    from pptx import Presentation
+    pb, br, d = pbm(), mod("brain"), _fdir()
+    reply = ('Sure! ```json {"title": "Volcanoes", "subtitle": "Fire from below", "theme": "sunset", "slides": ['
+             '{"layout": "stats", "title": "Big numbers", "stats": [{"value": "1,350", "label": "active volcanoes"}, {"value": "70", "label": "erupt each year"}]},'
+             '{"layout": "closing", "title": "Thank you", "bullets": ["Questions?"]}]} ```')
+    with mock.patch.object(br, "_complete", return_value=reply):
+        path, total, used_ai, _, err = pb.create("volcanoes", object(), 2, None, False, out_dir=d)
+    assert not err and used_ai and total == 3, (err, used_ai, total)
+    prs = Presentation(path)
+    texts = " ".join(sh.text_frame.text for s in prs.slides for sh in s.shapes if sh.has_text_frame)
+    assert "Volcanoes" in texts and "1,350" in texts and "Thank you" in texts, texts
+    with mock.patch.object(br, "_complete", return_value="not json at all"):
+        path, total, used_ai, _, err = pb.create("volcanoes", object(), 3, None, False, out_dir=d)
+    assert not err and not used_ai and total == 4, "bad AI output must fall back to the skeleton"
+    with mock.patch.object(br, "_complete", return_value=reply):
+        eq(pb.build_spec("volcanoes", object(), 2, "paper")[0]["theme"], "paper")      # a requested theme wins over the AI's
+        eq(pb.build_spec("volcanoes", object(), 2)[0]["theme"], "sunset")
+
+
+def t_pb_voice_command():
+    _need_pptx()
+    dg = mod("document_generator")
+    d = _fdir()
+    voice, said = stub_voice()
+    with mock.patch.object(dg, "OUT_DIR", d):
+        assert dg.handle_command(voice, "make a 3 slide presentation about mars in the paper theme without images")
+    assert "presentation is ready with 4 slides" in said[-1], said
+    files = os.listdir(d)
+    assert len(files) == 1 and files[0].startswith("mars_") and files[0].endswith(".pptx"), files   # options stripped from the file name
+    with mock.patch.object(dg, "OUT_DIR", d):
+        path, size, ai, err = dg.create("docx", "mars", None, 2)
+    if not (err and err.startswith("Missing")):
+        assert path.endswith(".docx") and not err, "docx must still use the original builder"
+
+
+check(G, "voice options: theme and 'without images' parsing", t_pb_options)
+check(G, "AI output is normalised (bad layouts, missing data, unknown theme)", t_pb_normalize)
+check(G, "local artwork: deterministic, correct size, crop never stretches", t_pb_art)
+check(G, "all six themes render all nine layouts; 'without images' draws none", t_pb_render_every_theme)
+check(G, "offline deck: themed local art, no network, no AI", t_pb_offline_deck)
+check(G, "AI content -> deck (mocked model), bad output falls back, requested theme wins", t_pb_ai_content)
+check(G, "voice command builds a designed deck; docx still uses the old builder", t_pb_voice_command)
 
 
 # ============================================================================ report

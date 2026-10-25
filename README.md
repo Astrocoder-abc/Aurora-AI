@@ -288,7 +288,9 @@ Anything that changes data asks for a "yes" first.
 ### Creation
 | Say | Action |
 |---|---|
-| "make a 5 slide presentation about black holes" | PowerPoint in `documents/` |
+| "make a 5 slide presentation about black holes" | Designed PowerPoint in `documents/`: themed layouts, facts and figures, speaker notes, pictures |
+| "make a presentation about volcanoes in the sunset theme" | Themes: aurora, ocean, sunset, forest, minimal, paper |
+| "make a presentation about Rome without images" | Text-only deck (images are AI-generated online, drawn locally offline) |
 | "create a document about climate change" / "write a report on ..." | Word file |
 | "build a spreadsheet for a monthly budget" / "10 row spreadsheet for ..." | Excel file |
 | "generate an image of a neon city at night" | AI image in `generated_images/` ("wallpaper" = wide, "portrait" = tall) |
@@ -454,7 +456,8 @@ jarvis_ui/
   project_workspace.py        per-project notes, tasks, links, files, data, experiments, chat
   operation_simulator.py      Simulation Room: dry-run previews of disruptive commands
   visual_calculator.py        read and solve math from the camera or screen
-  document_generator.py       PowerPoint, Word and Excel creation
+  document_generator.py       Word and Excel creation, routes presentations to the builder below
+  presentation_builder.py     designed PowerPoint decks: themes, layouts, images, speaker notes
   image_generator.py          AI image creation
 requirements.txt
 api_key.txt                  your Groq key (create from .example)
