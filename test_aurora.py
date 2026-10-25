@@ -4208,6 +4208,17 @@ def _eng():
     return pc, te, eng, v, said
 
 
+@ext("Task engine")
+def test_daily_briefing():
+    pc, te, eng, v, said = _eng()
+    v._fetch_weather_data = lambda q: {"temp_c": 21.4, "description": "clear skies", "location": "Delhi"}
+    v.active_timers = []
+    assert eng.route("Aurora, brief me")
+    out = said[-1]
+    assert out.startswith("Good ") and "21 degrees" in out and "Reminders" in out or "No reminders" in out, out
+    assert not eng.route("brief the team on nothing")
+
+
 @ext("Project context")
 def test_output_parsing_and_command_detection():
     pc = mod("project_context")
