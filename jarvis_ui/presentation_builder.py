@@ -397,8 +397,9 @@ def _closing(slide, s, c, img):
 
 
 # ============================================================================ deck assembly
-def render(spec, path, images=True):
-    """Builds the .pptx. -> (slide_count, image_count)."""
+def render(spec, path, images=True, ai_images=True):
+    """Builds the .pptx. images=False draws no pictures at all; ai_images=False (offline) uses local artwork only.
+    -> (slide_count, ai_image_count)."""
     from pptx import Presentation
     from pptx.util import Inches
     theme = spec["theme"]
@@ -407,10 +408,12 @@ def render(spec, path, images=True):
     prs.slide_width, prs.slide_height = Inches(SLIDE_W), Inches(SLIDE_H)
     blank = prs.slide_layouts[6]
     tmp = tempfile.mkdtemp(prefix="aurora_deck_")
-    ai_budget, ai_count, total = (MAX_IMAGES if images else 0), 0, len(spec["slides"]) + 1
+    ai_budget, ai_count, total = (MAX_IMAGES if images and ai_images else 0), 0, len(spec["slides"]) + 1
 
     def picture(prompt, w, h):
         nonlocal ai_budget, ai_count
+        if not images:
+            return None
         use_ai = ai_budget > 0
         path, from_ai = get_image(prompt, w, h, theme, tmp, use_ai)
         if use_ai:
@@ -449,14 +452,16 @@ def render(spec, path, images=True):
     return total, ai_count
 
 
-def create(topic, client=None, count=6, theme=None, images=True):
-    """Builds a designed deck. -> (path, slide_count, used_ai, image_count, error). Never raises."""
+def create(topic, client=None, count=6, theme=None, images=True, out_dir=None):
+    """Builds a designed deck. -> (path, slide_count, used_ai, ai_image_count, error). Never raises.
+    Without an AI client (offline) pictures are drawn locally instead of generated."""
     try:
         spec, used_ai = build_spec(topic, client, count, theme)
-        os.makedirs(OUT_DIR, exist_ok=True)
+        out_dir = out_dir or OUT_DIR
+        os.makedirs(out_dir, exist_ok=True)
         slug = re.sub(r"[^a-z0-9]+", "_", topic.lower()).strip("_")[:40] or "untitled"
-        path = os.path.join(OUT_DIR, f"{slug}_{time.strftime('%Y%m%d_%H%M%S')}.pptx")
-        total, ai_images = render(spec, path, images)
+        path = os.path.join(out_dir, f"{slug}_{time.strftime('%Y%m%d_%H%M%S')}.pptx")
+        total, ai_images = render(spec, path, images, ai_images=client is not None)
         return path, total, used_ai, ai_images, None
     except ImportError as e:
         return None, 0, False, 0, f"Missing library. Run: pip install python-pptx Pillow ({e.name})"

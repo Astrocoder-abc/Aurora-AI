@@ -139,6 +139,11 @@ BUILDERS = {"pptx": build_pptx, "docx": build_docx, "xlsx": build_xlsx}
 def create(kind, topic, client=None, count=None):
     """Builds the file. -> (path, size_count, used_ai, error). Never raises."""
     n = count or DEFAULT_COUNT[kind]
+    if kind == "pptx":                 # designed decks: themes, layouts, AI or locally drawn pictures
+        from jarvis_ui import presentation_builder as pb
+        topic, theme, images = pb.split_options(topic)     # "... in the ocean theme without images"
+        path, total, used_ai, _, err = pb.create(topic, client, n, theme, images, out_dir=OUT_DIR)
+        return path, total, used_ai, err
     try:
         spec, used_ai = _spec(kind, topic, client, n)
         os.makedirs(OUT_DIR, exist_ok=True)

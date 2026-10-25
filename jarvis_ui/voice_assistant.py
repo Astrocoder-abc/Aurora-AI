@@ -365,6 +365,56 @@ class NullVoice:
     def stop(self): pass
 
 
+class MicrophoneSource(sr.AudioSource):
+    """Direct PyAudio input (replaces sr.Microphone, whose stream came back None on some setups)."""
+
+    class _Stream:
+        def __init__(self, s):
+            self.s = s
+
+        def read(self, n):
+            return self.s.read(n, exception_on_overflow=False)
+
+        def close(self):
+            try:
+                if not self.s.is_stopped():
+                    self.s.stop_stream()
+            finally:
+                self.s.close()
+
+    def __init__(self, device_index=None, chunk=1024):
+        import pyaudio
+        self._pa_mod, self.device_index, self.CHUNK = pyaudio, device_index, chunk
+        self.SAMPLE_WIDTH, self.SAMPLE_RATE = 2, 16000
+        self.audio = self.stream = None
+
+    def __enter__(self):
+        pa = self._pa_mod
+        self.audio = pa.PyAudio()
+        try:
+            info = (self.audio.get_device_info_by_index(self.device_index) if self.device_index is not None
+                    else self.audio.get_default_input_device_info())
+            self.SAMPLE_RATE = int(info["defaultSampleRate"])
+            self.stream = self._Stream(self.audio.open(
+                input_device_index=int(info["index"]), channels=1, format=pa.paInt16, rate=self.SAMPLE_RATE,
+                frames_per_buffer=self.CHUNK, input=True))
+        except Exception:
+            self.audio.terminate()
+            self.audio = None
+            raise
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            if self.stream:
+                self.stream.close()
+        finally:
+            self.stream = None
+            if self.audio:
+                self.audio.terminate()
+                self.audio = None
+
+
 class VoiceAssistant:
     WMO = {}
     for _codes, _cond, _desc in [((0,), "sunny", "clear sky"), ((1,), "sunny", "mainly clear"), ((2,), "partly_cloudy", "partly cloudy"),
@@ -422,7 +472,7 @@ class VoiceAssistant:
                 log(f"  [{i}] {n}")
             idx = self._read_number("mic_index.txt", int)
             self._mic_index = idx
-            self.microphone = sr.Microphone(device_index=idx) if idx is not None else sr.Microphone()
+            self.microphone = MicrophoneSource(idx)
             log(f"VOICE: using mic_index.txt override -> [{idx}]" if idx is not None else
                 "VOICE: using system default input (create mic_index.txt if nothing is heard)")
         except Exception as e:
@@ -445,7 +495,7 @@ class VoiceAssistant:
 
     def _open_mic(self):
         """Fresh Microphone per use: one shared instance breaks when two threads enter/exit it."""
-        return sr.Microphone(device_index=self._mic_index)
+        return MicrophoneSource(self._mic_index)
 
     def start(self):
         if not self.microphone:                   # an API key is NOT required: local commands work offline
@@ -1392,12 +1442,14 @@ class VoiceAssistant:
         r.dynamic_energy_threshold = False       # dynamic mode learns Aurora's own voice as "noise"
         r.pause_threshold, r.non_speaking_duration, r.phrase_threshold = 0.9, 0.4, 0.3
         override = self._read_number("energy_threshold.txt", float)
+        fails = 0
         while self._running:
             try:
                 with self._open_mic() as src:
                     self._log("VOICE: calibrating for ambient noise (2 sec)...")
                     self._calibrate(src, override, 2)
                     self._log(f"VOICE: microphone stays on (energy_threshold={r.energy_threshold:.0f})")
+                    fails = 0
                     last_cal = time.time()
                     while self._running:
                         if not override and time.time() - last_cal > 120 and not self.speech.busy and self._state == "idle":
@@ -1416,8 +1468,12 @@ class VoiceAssistant:
                         except queue.Full:
                             pass
             except Exception as e:
-                self._log(f"VOICE ERROR: microphone stream lost ({e}), reopening")
-                time.sleep(1)
+                fails += 1
+                self._log(f"VOICE ERROR: microphone stream lost ({type(e).__name__}: {e}), retry {fails}")
+                if fails == 3 and self._mic_index is not None:
+                    self._log("VOICE: configured mic keeps failing, falling back to the system default")
+                    self._mic_index = None
+                time.sleep(min(10, 2 * fails))
 
     def _transcribe(self, audio):
         with self._stt_lock:
