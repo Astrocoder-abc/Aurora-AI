@@ -34,6 +34,11 @@ HARDWARE, GUI, LIVE = ALL or "--hardware" in ARGS, ALL or "--gui" in ARGS, ALL o
 
 RESULTS = []
 
+# Tests must never launch PowerPoint/Word/Excel/image viewers. The voice handlers call os.startfile to open
+# what they create, so replace it for the whole run and just record what would have opened.
+OPENED_BY_TESTS = []
+os.startfile = lambda path, *args, **kwargs: OPENED_BY_TESTS.append(path)
+
 
 class Skip(Exception):
     def __init__(self, msg="", status="SKIP"):
@@ -4206,6 +4211,17 @@ def _eng():
         eng = te.TaskEngine(H, v)
     eng.store.path = os.path.join(ext_dir(), "state.json")
     return pc, te, eng, v, said
+
+
+@ext("Task engine")
+def test_daily_briefing():
+    pc, te, eng, v, said = _eng()
+    v._fetch_weather_data = lambda q: {"temp_c": 21.4, "description": "clear skies", "location": "Delhi"}
+    v.active_timers = []
+    assert eng.route("Aurora, brief me")
+    out = said[-1]
+    assert out.startswith("Good ") and "21 degrees" in out and "Reminders" in out or "No reminders" in out, out
+    assert not eng.route("brief the team on nothing")
 
 
 @ext("Project context")
