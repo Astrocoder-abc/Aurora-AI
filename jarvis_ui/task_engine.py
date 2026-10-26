@@ -9,6 +9,7 @@ Task engine: turns goals into approved, verified, multi-step work, and keeps lon
   BACKGROUND    "task status" / "cancel task"   tests, drafts and plans run in parallel with resource limits
   AUTOMATIONS   "when a download finishes, organize it" / "when i start studying, review flashcards about bio"
                 "watch example.com and tell me if it goes down" / "list automations" / "remove automation 2"
+  BRIEFING      "brief me" / "daily briefing" / "morning briefing"   weather, calendar, unread email, reminders, battery, storage, top tasks in one summary
   LEARNING      repeated command sequences are offered as skills (nothing is saved without "yes")
                 "save a preference: ..." / "list my preferences" / "delete preference 1" / "stop suggesting workflows"
   KNOWLEDGE     "what do i know about batteries" searches only sources you allow ("stop searching notes", "allow searching calendar")
@@ -26,6 +27,8 @@ import socket
 import threading
 import time
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from collections import Counter, defaultdict
 
 from jarvis_ui import project_context as pc
@@ -57,6 +60,7 @@ _DRAFT = re.compile(r"^(?:prepare|put together)\s+(?:me\s+)?(?:an?\s+)?(presenta
                     r"^research\s+(.+?)\s+and\s+(?:make|create|build|write)\s+(?:me\s+)?(?:an?\s+)?(presentation|report|document)$", re.I)
 _NOTES = re.compile(r"^turn\s+(?:my\s+|these\s+|the\s+)?(.+?)\s+notes\s+into\s+(?:an?\s+)?(?:project\s+)?(report|document|presentation|spreadsheet)"
                     r"(?:\s+(?:about|on|called)\s+(.+))?$", re.I)
+_BRIEF = re.compile(r"^(?:(?:aurora,?\s+)?brief me(?: for today)?|(?:give me |read |start )?(?:my |the )?(?:daily|morning) (?:briefing|brief)|what(?:'s| is) my (?:daily|morning) briefing)$", re.I)
 _PLAN = re.compile(r"^(?:plan and run|achieve goal)\s*[:,]\s*(.+)$", re.I)
 _CLEAN = re.compile(r"^(?:clean up|tidy up|tidy|declutter|sort out|clear out)\s+(?:my\s+|the\s+)?(.+?)(?:\s+folder)?$", re.I)
 _WHEN_DL = re.compile(r"^when\s+(?:a\s+|an\s+|my\s+)?downloads?\s+(?:completes?|finish(?:es|ed)?|(?:is|are)\s+done),?\s*"
@@ -382,7 +386,7 @@ class TaskEngine:
                     elif NO.match(t):
                         reply = "Cancelled."
             if reply is None:
-                chain = (self.project.route,) if stepping else (self.project.route, self._goals, self._cleanup, self._automation, self._memory,
+                chain = (self.project.route,) if stepping else (self.project.route, self._briefing, self._goals, self._cleanup, self._automation, self._memory,
                                                                self._knowledge, self._tasks, self._capabilities, self._screen)
                 for fn in chain:
                     reply = fn(o, t)
@@ -835,6 +839,56 @@ class TaskEngine:
                 pass
         answer = answer or f"From {hits[0][1]} in {hits[0][0]}: {hits[0][2][:160]}"
         return answer + f" Sources used: {', '.join(sorted({h[0].split()[0] for h in hits}))}. Details are on screen."
+
+    # ---- daily briefing ------------------------------------------------------------------------------
+    def _briefing(self, o, t):
+        if not _BRIEF.match(o):
+            return None
+        au, sm = _au(), pc.sibling("system_monitor")
+
+        def weather():
+            d = self.v._fetch_weather_data("")
+            return f"It's {d['temp_c']:.0f} degrees and {d['description']} in {d['location']}." if d and d.get("temp_c") is not None else "Weather isn't available right now."
+
+        def calendar():
+            if not (au and au.calendar_sources()):
+                return "No calendar is connected."
+            now = datetime.now()
+            evs, _ = au.events_between(now, datetime.combine(now.date(), datetime.max.time()))
+            evs = [e for e in evs if e["all_day"] or e["end"] > now]
+            return (f"{len(evs)} event{'s' if len(evs) != 1 else ''} left today: " + "; ".join(au.describe_event(e) for e in evs[:3]) + ".") if evs else "Nothing left on your calendar today."
+
+        def email():
+            n = len(au.fetch_unread(20)) if au else 0
+            return f"{'20 or more' if n >= 20 else n} unread email{'s' if n != 1 else ''}."
+
+        def reminders():
+            timers = [f"{x['label']} in {max(1, round((x['ends_at'] - time.time()) / 60))} minutes" for x in getattr(self.v, "active_timers", []) if x["ends_at"] > time.time()]
+            notes = [n[2][9:].strip() for n in (au.list_notes() if au else []) if n[2].lower().startswith("remember to")]
+            items = timers + notes[-3:]
+            return ("Reminders: " + "; ".join(items[:4]) + ".") if items else "No reminders."
+
+        def device():
+            return (sm.device_summary().capitalize() + ".") if sm and sm.device_summary() else "Device stats aren't available."
+
+        def top_tasks():
+            ws = getattr(getattr(self.h, "workspace", None), "ws", None)
+            tasks = [x["text"] for x in (ws.meta["tasks"] if ws else []) if not x.get("done")]
+            return ("Top tasks: " + "; ".join(tasks[:3]) + ".") if tasks else "No open tasks."
+
+        jobs = (("Weather", weather), ("Calendar", calendar), ("Email", email), ("Reminders", reminders), ("Device", device), ("Tasks", top_tasks))
+        hour = datetime.now().hour
+        parts = []
+        with ThreadPoolExecutor(len(jobs)) as pool:
+            futures = [(name, pool.submit(fn)) for name, fn in jobs]
+            for name, f in futures:
+                try:
+                    parts.append((name, f.result(timeout=12)))
+                except Exception as e:
+                    self.v._log(f"TASK: briefing {name} failed ({type(e).__name__})")
+                    parts.append((name, f"{name} isn't available right now."))
+        self.card("Daily briefing", " | ".join(p[1] for p in parts))
+        return f"Good {'morning' if hour < 12 else 'afternoon' if hour < 18 else 'evening'}. " + " ".join(p[1] for p in parts)
 
     # ---- tasks / capabilities / screen -----------------------------------------------------------------
     def _tasks(self, o, t):

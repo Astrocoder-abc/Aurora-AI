@@ -286,6 +286,22 @@ class SystemMonitor:
                 f"{len(self.alerts)} alert{'s' if len(self.alerts) != 1 else ''} so far.")
 
 
+def device_summary():
+    """Battery and free storage as spoken text (used by the daily briefing). '' if psutil is missing."""
+    if not psutil:
+        return ""
+    parts = []
+    b = psutil.sensors_battery()
+    if b is not None:
+        parts.append(f"battery at {round(b.percent)} percent, {'charging' if b.power_plugged else 'on battery'}")
+    try:
+        u = psutil.disk_usage(_drive_root())
+        parts.append(f"{_fmt_bytes(u.free)} of storage free")
+    except OSError:
+        pass
+    return ", ".join(parts)
+
+
 _monitor = None
 
 

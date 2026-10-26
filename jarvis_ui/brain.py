@@ -412,8 +412,8 @@ class Brain(_CoreBrain):
         self._model, self._effort = self.last_route = route_request(text)
         try:
             reply = super().ask(text, on_delta, cancel)
-        except Exception:
-            if self._model == MODEL:
+        except Exception as e:
+            if self._model == MODEL or _too_large(e):
                 raise
             self.log("BRAIN: fast model failed, retrying with the strong model")
             self._model, self._effort = MODEL, EFFORT
@@ -449,4 +449,4 @@ class Brain(_CoreBrain):
             if not retry.startswith("error:"):
                 return retry
             out = retry
-        return f"{out} (diagnosis: {hint})"
+        return out if cat == "unknown" else f"{out} (diagnosis: {hint})"

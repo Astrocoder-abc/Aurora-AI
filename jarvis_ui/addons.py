@@ -664,11 +664,15 @@ _WRITE_DEBUG_RE = re.compile(r"(?:write|make|build) (?:and (?:test|debug|run) )?
                              r"(?:called (.+?) )?that (.+?)(?: and (?:test|debug|fix|run)(?: it| any errors| the errors)?)?$")
 
 
-def _unsafe(text):
-    """Reason string if the text holds secrets or destructive intent (reuses Cowork's guard), else ''."""
+def _unsafe(text, lang="python"):
+    """Reason string if the text holds secrets, destructive intent or blocked Python constructs, else ''."""
     try:
         from jarvis_ui.aurora_plus import Guard
         ok, why = Guard.text_ok(text)
+        if ok and lang == "python":
+            ok, why = Guard.python_ok(text, set())
+            if not ok and "third-party" in why:      # the sandbox may use installed packages
+                ok = True
         return "" if ok else why
     except Exception:
         return ""
@@ -678,7 +682,7 @@ def debug_loop(client, code, goal="", name="debug_run", lang="python", rounds=MA
     """Run code in the sandbox; on failure ask the model for a fix using the error. -> (code, ok, out, err, fixes)"""
     from jarvis_ui import brain
     for fixes in range(rounds + 1):
-        bad = _unsafe(code)
+        bad = _unsafe(code, lang)
         if bad:
             return code, False, "", f"blocked because {bad}", fixes
         _, ok, out, err = sandbox_write_and_run(name, code, lang)
