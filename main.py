@@ -191,6 +191,9 @@ def main():
                     system_control.media_play_pause()
                     hologram.trigger_flash("ok_sign")
                     hologram.log_event("MEDIA: play/pause (gesture)")
+                elif gesture == "thumbs_up" and getattr(hologram, "construction", None) and hologram.construction.gesture_select_next():
+                    hologram.trigger_flash("thumbs_up")
+                    hologram.log_event(f"SELECT -> part {hologram.construction.selected_part or 'none'}")
                 elif gesture in ("thumbs_up", "rock_sign", "throw"):
                     hologram.trigger_flash(gesture)
                     hologram.log_event(f"{gesture.upper()} detected")

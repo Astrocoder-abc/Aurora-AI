@@ -4581,7 +4581,7 @@ def patch_script_anchors_match_source():
 
 
 # ============================================================================ holographic construction (stage 1)
-_PC_GL = ("glPushMatrix", "glPopMatrix", "glTranslatef", "glRotatef", "glScalef", "glDeleteLists", "glCallList")
+_PC_GL = ("glPushMatrix", "glPopMatrix", "glTranslatef", "glRotatef", "glScalef", "glDeleteLists", "glCallList", "glColor4f", "glLineWidth")
 
 
 @contextlib.contextmanager
@@ -5000,6 +5000,323 @@ def cache_key_is_a_stable_uid_not_a_per_frame_hash():
         eq(list(h._gl_lists), [("construction", "drone", model.uid)])
         a, b = pc.build_model("same", [pc_part()]), pc.build_model("same", [pc_part()])
         assert a == b and a.uid != b.uid and isinstance(a.uid, int)
+
+
+# ============================================================================ holographic construction (stage 3)
+# Insert after the "Holographic construction 2" tests in test_aurora.py (before the presentation builder section).
+# Also extend the GL name list used by pc_gl():  _PC_GL = (..., "glColor4f", "glLineWidth")
+def pc3_setup(name="robot", mode="shape"):
+    """Fake hologram with the editor installed and the model 'displayed' (fully built unless elapsed is changed)."""
+    pc = mod("procedural_construction")
+    h = pc_fake_holo()
+    h.mode, h.shape_name, h.elapsed, h.selected_index, h._draw_shape = mode, name, 100.0, 2, (lambda n: None)
+    h.hide_weather, h._trigger_materialize = (lambda: None), (lambda: None)
+    pc.install(h)
+    return pc, h, h.construction
+
+
+def pc3_part(model, name):
+    return next(p for p in model.parts if p.name == name)
+
+
+@ext("Holographic construction 3")
+def model_transform_limits_composition_and_registry_untouched():
+    with pc_gl() as (pc, m):
+        _, h, ed = pc3_setup()
+        base = pc.MODELS["robot"]
+        eq(ed.transform_for("robot"), None)
+        assert ed.move_model(0.5, -0.25, 1.0) and ed.rotate_model(0, 370, 0) and ed.scale_model(1.5)
+        eq(ed.transform_for("robot"), ((0.5, -0.25, 1.0), (0.0, 10.0, 0.0), 1.5))
+        assert ed.move_model(10, -10, 0) and ed.transform_for("robot")[0] == (2.0, -2.0, 1.0)            # clamped
+        assert ed.scale_model(100) and ed.transform_for("robot")[2] == pc.MAX_MODEL_SCALE
+        assert ed.scale_model(0.001, absolute=True) and ed.transform_for("robot")[2] == pc.MIN_MODEL_SCALE
+        assert ed.move_model(1, 1, 1, absolute=True) and ed.transform_for("robot")[0] == (1.0, 1.0, 1.0)
+        for bad in (float("nan"), float("inf"), "1", None, True):
+            assert not ed.move_model(bad) and "finite" in ed.last_error
+        for bad in (0, -1, float("nan"), "2", True):
+            assert not ed.scale_model(bad) and "positive" in ed.last_error
+        assert pc.MODELS["robot"] is base and base.uid == pc.get_model("robot").uid                       # definition untouched
+        ed.reset_transform()
+        eq(ed.transform_for("robot"), None)
+        # composition: outer transform is applied first (translate, rotate z/y/x, scale), geometry then draws inside it
+        ed.move_model(0.5, 0.0, 0.0), ed.rotate_model(10, 20, 30), ed.scale_model(2.0)
+        for k in ("glPushMatrix", "glPopMatrix", "glTranslatef", "glRotatef", "glScalef"):
+            m[k].reset_mock()
+        pc.draw_construction(h, "robot")
+        eq(m["glTranslatef"].call_args_list[0].args, (0.5, 0.0, 0.0))
+        eq([c.args for c in m["glRotatef"].call_args_list[:3]], [(30.0, 0, 0, 1), (20.0, 0, 1, 0), (10.0, 1, 0, 0)])
+        eq(m["glScalef"].call_args_list[0].args, (2.0, 2.0, 2.0))
+        eq(m["glPushMatrix"].call_count, m["glPopMatrix"].call_count)
+        m["glTranslatef"].reset_mock()
+        ed.reset_transform()
+        pc.draw_construction(h, "robot")
+        assert m["glTranslatef"].call_count == 0, "identity transform must add no matrix work"             # cached call only
+
+
+@ext("Holographic construction 3")
+def transform_never_touches_the_geometry_cache():
+    with pc_gl() as (pc, m):
+        _, h, ed = pc3_setup()
+        pc.draw_construction(h, "robot")
+        eq((len(h.builds), m["glDeleteLists"].call_count), (1, 0))
+        for _ in range(5):
+            ed.move_model(0.1), ed.rotate_model(0, 5, 0), ed.scale_model(1.05)
+            pc.draw_construction(h, "robot")
+        eq((len(h.builds), m["glDeleteLists"].call_count), (1, 0))                                       # same display list
+
+
+@ext("Holographic construction 3")
+def part_selection_api_and_orbit_selection_untouched():
+    with pc_gl() as (pc, m):
+        _, h, ed = pc3_setup()
+        names = [p.name for p in pc.MODELS["robot"].parts]
+        eq(ed.part_names(), names)
+        eq(ed.selected_part, None)
+        assert ed.select_part("  HEAD ") and ed.selected_part == "head"
+        assert not ed.select_part("nope") and ed.selected_part == "head" and "no part" in ed.last_error
+        assert not ed.select_part(None) and not ed.select_part(5)
+        ed.deselect_part()
+        eq([ed.select_next_part() for _ in range(len(names) + 1)], names + [None])                      # walks, then deselects
+        eq(ed.select_previous_part(), names[-1])
+        eq(ed.select_previous_part(), names[-2])
+        ed.select_part(names[0])
+        eq(ed.select_previous_part(), None)
+        eq(h.selected_index, 2)                                                                          # orbit selection untouched
+
+
+@ext("Holographic construction 3")
+def selection_clears_on_model_or_mode_change_and_edits_need_a_model():
+    with pc_gl() as (pc, m):
+        _, h, ed = pc3_setup()
+        ed.select_part("head")
+        h.mode = "atom"                                                                                  # another hologram mode
+        eq(ed.selected_part, None)
+        for call in (lambda: ed.select_part("head"), ed.undo, ed.reset, lambda: ed.move_part(1), lambda: ed.move_model(1)):
+            assert call() is False and "no construction model" in ed.last_error
+        eq((ed.select_next_part(), ed.part_names(), ed.undo_depth, ed.gesture_select_next()), (None, [], 0, False))
+        h.mode = "shape"
+        eq(ed.selected_part, None)                                                                       # not resurrected by returning
+        ed.select_part("head")
+        h.shape_name = "cube"                                                                            # a non-construction shape
+        eq(ed.selected_part, None)
+        h.shape_name = "robot"
+        h.shape_name = "ghost"
+        assert not ed.move_model(1) and ed.selected_part is None                                         # unknown/unregistered model
+        h.shape_name = "robot"
+        ed.select_part("head")
+        assert h.load_construction("car") and ed.selected_part is None                                   # load clears selection
+        h.shape_name = "robot"
+        ed.select_part("head")
+        h.shape_name = "car"
+        eq(ed.selected_part, None)                                                                       # other model's part name
+
+
+@ext("Holographic construction 3")
+def part_edits_clamp_validate_and_preserve_the_original():
+    with pc_gl() as (pc, m):
+        _, h, ed = pc3_setup()
+        base = pc.MODELS["robot"]
+        assert not ed.move_part(1) and ed.last_error == "no part selected"
+        ed.select_part("head")
+        h0 = pc3_part(base, "head")
+        assert ed.move_part(0.2, -0.1, 0.0)
+        p = pc3_part(ed.model_for("robot"), "head")
+        eq(tuple(round(a - b, 9) for a, b in zip(p.pos, h0.pos)), (0.2, -0.1, 0.0))
+        assert ed.move_part(50, 0, 0) and pc3_part(ed.model_for("robot"), "head").pos[0] == pc.MAX_POS     # clamped, accepted
+        assert ed.rotate_part(0, 200, 0) and ed.rotate_part(0, 200, 0)
+        eq(pc3_part(ed.model_for("robot"), "head").rot, (0.0, 40.0, 0.0))                               # 400 degrees wraps to 40
+        assert ed.move_part(0, 0, 0, absolute=True)                                                      # back to the origin
+        assert ed.resize_part(2.0) and pc3_part(ed.model_for("robot"), "head").size == (1.0, 0.84, 0.84)
+        assert ed.resize_part((1, 100, 1)) and pc3_part(ed.model_for("robot"), "head").size[1] == pc.MAX_SIZE
+        assert ed.resize_part(0.0001) and pc3_part(ed.model_for("robot"), "head").size[0] == pc.MIN_SIZE      # clamped to the minimum
+        for bad in (0, -1, float("nan"), "2", None, (1, 1), True):
+            before = ed.model_for("robot")
+            assert not ed.resize_part(bad) and ed.model_for("robot") is before, bad
+        assert pc.MODELS["robot"] is base and pc3_part(base, "head") == h0                               # registry model intact
+        names_before = [p.name for p in ed.model_for("robot").parts]
+        eq([p.name for p in base.parts], names_before)                                                   # order and names kept
+        eq(ed.model_for("robot").name, "robot")
+
+
+@ext("Holographic construction 3")
+def edit_that_breaks_whole_model_limits_is_rejected_atomically():
+    with pc_gl() as (pc, m):
+        _, h, ed = pc3_setup()
+        ed.select_part("torso")
+        before = ed.model_for("robot")
+        assert ed.move_part(2.0, 2.0, 2.0, absolute=True) is False and "extends" in ed.last_error
+        assert ed.model_for("robot") is before and ed.undo_depth == 0                                    # nothing recorded
+        ed.select_part("head")
+        assert ed.move_part(2.0, 0.0, 0.0, absolute=True)                                                # fits (reach 2.25)
+        mid = ed.model_for("robot")
+        assert ed.resize_part(5.0) is False and ed.model_for("robot") is mid and ed.undo_depth == 1      # would reach 3.25
+        assert not ed.move_part(0, 0, 0) and ed.last_error == "no change" and ed.undo_depth == 1
+
+
+@ext("Holographic construction 3")
+def undo_is_bounded_reset_is_undoable_and_state_is_per_model():
+    with pc_gl() as (pc, m), mock.patch.object(pc, "MAX_UNDO", 3):
+        _, h, ed = pc3_setup()
+        assert not ed.undo() and ed.last_error == "nothing to undo"
+        ed.select_part("head")
+        base_pos = pc3_part(pc.MODELS["robot"], "head").pos
+        snaps = []
+        for i in range(5):
+            snaps.append(ed.model_for("robot"))
+            ed.move_part(0.01 * (i + 1), 0, 0)
+        eq(ed.undo_depth, 3)                                                                             # oldest two dropped
+        for expect in reversed(snaps[2:]):
+            assert ed.undo() and ed.model_for("robot") is expect
+        assert not ed.undo()
+        ed.rotate_model(0, 90, 0)
+        ed.move_part(0.1)
+        assert ed.reset() and ed.model_for("robot") is pc.MODELS["robot"] and ed.transform_for("robot") is None
+        assert ed.undo() and ed.transform_for("robot")[1] == (0.0, 90.0, 0.0) and ed.model_for("robot") is not pc.MODELS["robot"]
+        ed.reset()
+        assert not ed.reset() and ed.last_error == "no change"
+        h.shape_name = "car"
+        eq(ed.undo_depth, 0)                                                                             # history is per model
+        h.shape_name = "robot"
+        assert ed.undo_depth > 0
+
+
+@ext("Holographic construction 3")
+def edits_render_immediately_and_cache_invalidates_exactly_when_needed():
+    with pc_gl() as (pc, m):
+        _, h, ed = pc3_setup()
+        pc.draw_construction(h, "robot")
+        eq(len(h.builds), 1)
+        first = pc.MODELS["robot"].uid
+        eq(set(h._gl_lists), {("construction", "robot", first)})
+        ed.select_part("head")
+        assert ed.move_part(0.0, 0.1, 0.0)
+        m["glTranslatef"].reset_mock()
+        pc.draw_construction(h, "robot")                                                                 # next frame shows the edit
+        head = pc3_part(ed.model_for("robot"), "head")
+        assert any(c.args == head.pos for c in m["glTranslatef"].call_args_list), "edited head never drawn"
+        eq((len(h.builds), m["glDeleteLists"].call_count), (2, 1))                                       # recompiled once, old freed
+        second = ed.model_for("robot").uid
+        assert second != first and set(h._gl_lists) == {("construction", "robot", second)}
+        for _ in range(3):
+            pc.draw_construction(h, "robot")
+        eq(len(h.builds), 2)                                                                             # stable between edits
+        assert ed.undo()
+        pc.draw_construction(h, "robot")
+        eq((len(h.builds), set(h._gl_lists)), (3, {("construction", "robot", first)}))                   # undo recompiles
+        ed.reset()
+        pc.draw_construction(h, "robot")
+        eq(len(h.builds), 3)                                                                             # already base: no rebuild
+        ed.select_part("head"), ed.move_part(0.1), pc.draw_construction(h, "robot"), ed.reset(), pc.draw_construction(h, "robot")
+        eq(set(h._gl_lists), {("construction", "robot", first)})
+        for k in h._gl_lists:
+            assert k[1] == "robot"
+        pc.draw_construction(h, "car")                                                                   # other models cache separately
+        assert ("construction", "robot", first) in h._gl_lists and len(h._gl_lists) == 2
+
+
+@ext("Holographic construction 3")
+def edits_during_assembly_draw_directly_and_model_matrices_balance():
+    with pc_gl() as (pc, m):
+        _, h, ed = pc3_setup()
+        h._materialize_start, h.elapsed = 10.0, 10.0 + pc.ASSEMBLY_DELAY + 0.4
+        ed.select_part("torso")
+        ed.move_part(0.1)
+        ed.move_model(0.2)
+        h.calls.clear()
+        pc.draw_construction(h, "robot")
+        assert 0 < len(h.calls) < 18 and m["glCallList"].call_count == 0 and not h.builds
+        eq(m["glPushMatrix"].call_count, m["glPopMatrix"].call_count)
+        h._draw_wireframe_cube = mock.Mock(side_effect=RuntimeError("gl"))
+        m["glPushMatrix"].reset_mock(), m["glPopMatrix"].reset_mock()
+        raises(RuntimeError, pc.draw_construction, h, "robot")
+        eq(m["glPushMatrix"].call_count, m["glPopMatrix"].call_count)                                    # transform popped on error
+
+
+@ext("Holographic construction 3")
+def highlight_draws_only_the_selected_part_and_leaves_state_clean():
+    with pc_gl() as (pc, m):
+        _, h, ed = pc3_setup()
+        pc.draw_construction(h, "robot")                                                                 # compile once
+        h.calls.clear()
+        m["glCallList"].reset_mock()
+        pc.draw_construction(h, "robot")
+        eq((h.calls, m["glCallList"].call_count, m["glColor4f"].call_count), ([], 1, 0))                 # nothing extra unselected
+        ed.select_part("head")
+        pc.draw_construction(h, "robot")
+        eq(h.calls, ["box"])                                                                             # head is a box: one outline
+        eq(m["glColor4f"].call_args.args[:3], (1.0, 1.0, 1.0))
+        eq(m["glLineWidth"].call_args_list[-1].args, (2.0,))                                             # line width restored
+        h.calls.clear()
+        ed.select_part("core")
+        pc.draw_construction(h, "robot")
+        eq(h.calls, ["sphere"])
+        h._materialize_start, h.elapsed = 100.0, 100.0 + pc.ASSEMBLY_DELAY                               # head not grown yet
+        ed.select_part("head")
+        h.calls.clear()
+        pc.draw_construction(h, "robot")
+        eq(h.calls, [])                                                                                  # not grown: no outline, nothing built
+
+
+@ext("Holographic construction 3")
+def switching_models_registry_replacement_and_keep_edits():
+    with pc_registry() as pc, pc_gl() as (_, m):
+        _, h, ed = pc3_setup()
+        h.hide_weather, h._trigger_materialize = (lambda: None), (lambda: None)
+        ed.select_part("head"), ed.move_part(0.1), ed.rotate_model(0, 30, 0)
+        assert h.load_construction("car") and (h.shape_name, ed.selected_part) == ("car", None)
+        assert h.load_construction("robot", keep_edits=True)
+        assert ed.model_for("robot") is not pc.MODELS["robot"] and ed.transform_for("robot")[1] == (0.0, 30.0, 0.0)
+        assert h.load_construction("robot")                                                              # default: fresh model
+        assert ed.model_for("robot") is pc.MODELS["robot"] and ed.transform_for("robot") is None
+        assert not h.load_construction("ghost") and h.shape_name == "robot"
+        pc.define_model("temp", [pc_part(name="a"), pc_part(name="b", pos=(0.5, 0, 0))])
+        assert h.load_construction("temp")
+        ed.select_part("a"), ed.move_part(0.1)
+        assert ed.model_for("temp") is not pc.MODELS["temp"]
+        pc.define_model("temp", [pc_part(name="a"), pc_part(name="z")], replace=True)                    # replaced: edits are stale
+        assert ed.model_for("temp") is pc.MODELS["temp"] and ed.selected_part is None
+        pc.unregister_model("temp")
+        eq(ed.model_for("temp"), None)
+        h.mode = "shape"
+        assert not ed.move_model(1)
+        pc.draw_construction(h, "temp")                                                                  # draws nothing, no error
+        h.shape_name = "robot"
+        eq(ed.part_names(), [p.name for p in pc.MODELS["robot"].parts])
+
+
+@ext("Holographic construction 3")
+def gesture_hook_consumes_only_when_a_model_is_shown():
+    with pc_gl() as (pc, m):
+        _, h, ed = pc3_setup()
+        names = ed.part_names()
+        eq([(ed.gesture_select_next(), ed.selected_part) for _ in range(3)], [(True, names[0]), (True, names[1]), (True, names[2])])
+        for _ in range(len(names) - 3):
+            ed.gesture_select_next()
+        assert ed.gesture_select_next() and ed.selected_part is None                                     # last -> deselect
+        h.mode = "info"
+        eq(ed.gesture_select_next(), False)                                                              # other modes: not consumed
+    main_src = open(os.path.join(ROOT, "main.py"), encoding="utf-8").read()
+    assert 'gesture == "thumbs_up" and getattr(hologram, "construction", None)' in main_src
+    assert "construction" not in main_src.split('gesture == "thumbs_down"')[1].split("elif")[0], "thumbs_down must stay non-destructive"
+
+
+@ext("Holographic construction 3")
+def stage3_leaves_stage1_and_2_behaviour_intact():
+    pc = mod("procedural_construction")
+    eq(pc.list_models(), ["car", "drone", "robot", "spaceship"])
+    eq((len(pc.MODELS["robot"].parts), pc.GROW_SECONDS, pc.ASSEMBLY_DELAY), (18, 0.35, 0.25))
+    drawn = []
+    h = ns(_draw_shape=drawn.append, hide_weather=lambda: None, _trigger_materialize=lambda: None, mode="empty", shape_name="x",
+           mode_label="", selected_index=None, elapsed=0.0)
+    pc.install(h)
+    assert isinstance(h.construction, pc.ConstructionEditor)
+    h._draw_shape("cube")
+    eq(drawn, ["cube"])
+    assert h.load_construction("robot") and h.load_construction("car", False)
+    eq((h.mode, h.shape_name, h._construction_assemble), ("shape", "car", False))
+    h.mode = "info"
+    h._draw_shape("sphere")
+    eq(drawn, ["cube", "sphere"])
 
 
 # ============================================================================ presentation builder
