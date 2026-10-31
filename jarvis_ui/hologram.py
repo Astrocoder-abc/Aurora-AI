@@ -44,6 +44,8 @@ try:
 except ImportError:
     PSUTIL_AVAILABLE = False
 
+from jarvis_ui import earth_renderer
+
 COLOR_LISTENING = (0.1, 1.0, 0.9)
 COLOR_SPEAKING = (0.2, 1.0, 0.3)
 
@@ -1720,7 +1722,9 @@ class Hologram:
             glPopMatrix()
 
     def _draw_earth_core(self, brightness):
-        """Simple blue wireframe Earth for satellite mode."""
+        """Satellite-imagery Earth (earth_renderer); wireframe fallback while imagery loads or offline."""
+        if earth_renderer.draw(self, brightness):
+            return
         self._draw_ball(0.46, (0.15 * brightness, 0.35 * brightness, 0.8 * brightness), 1.0, 20)
         glColor4f(0.25 * brightness, 0.55 * brightness, 1.0 * brightness, 0.9)
         self._draw_wireframe_sphere(0.5, lat_count=4, lon_count=6, segments=32)
@@ -3426,6 +3430,8 @@ class Hologram:
             self._draw_planet_labels()
         if self.mode == "constellation":
             self._draw_constellation_labels()
+        if self.mode == "satellite":
+            earth_renderer.draw_labels(self)
         self._draw_top_bar(theme_color)
         if "system" not in self.hidden_panels:
             self._draw_system_panel(theme_color)

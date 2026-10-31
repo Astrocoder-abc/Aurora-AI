@@ -1266,6 +1266,10 @@ class VoiceAssistant:
             H.load_physics_sim("projectile")
             speak("Simulating a projectile")
             return True
+        if re.search(r"\b(?:earth|planet earth|the globe)\b", t) and showing and not has("satellite", "solar", "weather"):
+            H.load_satellite("ISS")
+            speak("Displaying Earth in satellite view")
+            return True
         if "satellite" in t and has("show", "display"):
             nm = re.search(r"(?:show|display)\s+(?:a\s+|the\s+)?(.+?)\s+satellite", t)
             sat = nm.group(1).strip().upper() if nm and nm.group(1).strip() else "ISS"
