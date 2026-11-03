@@ -26,6 +26,12 @@ from types import SimpleNamespace
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def mem_path(base, name):
+    """Path inside <base>/memory/ (created on demand), where persistent user data lives."""
+    os.makedirs(os.path.join(base, "memory"), exist_ok=True)
+    return os.path.join(base, "memory", name)
 sys.path.insert(0, ROOT)
 os.chdir(ROOT)
 ARGS = set(sys.argv[1:])
@@ -1011,7 +1017,7 @@ def cal_env():
     today = datetime.now().date()
     ics = os.path.join(d, "c.ics")
     open(ics, "w").write(ICS.format(d=(today - timedelta(days=14)).strftime("%Y%m%d"), t=(today + timedelta(days=1)).strftime("%Y%m%d")))
-    json.dump({"ics": [ics]}, open(os.path.join(d, "calendar_config.json"), "w"))
+    json.dump({"ics": [ics]}, open(mem_path(d, "calendar_config.json"), "w"))
     return cal, d
 
 
@@ -1036,8 +1042,8 @@ def t_calendar():
 
 check("Calendar", "ICS parsing, recurrence, time phrases, local events, next event", t_calendar)
 check("Calendar", "live calendar source (ICS URL / file you configured)",
-      lambda: (_ for _ in ()).throw(Skip("no calendar_config.json in project root", "REQUIRES PERMISSION"))
-      if not os.path.exists(os.path.join(ROOT, "calendar_config.json")) else
+      lambda: (_ for _ in ()).throw(Skip("no calendar_config.json in memory/", "REQUIRES PERMISSION"))
+      if not os.path.exists(mem_path(ROOT, "calendar_config.json")) else
       (lambda c: (c.events_between(datetime.now(), datetime.now() + timedelta(days=7)) and None))(util()))
 
 
@@ -1045,7 +1051,7 @@ check("Calendar", "live calendar source (ICS URL / file you configured)",
 def mail_env():
     cal = util()
     d = newdir("mail")
-    with open(os.path.join(d, "email_config.json"), "w") as f:
+    with open(mem_path(d, "email_config.json"), "w") as f:
         json.dump({"contacts": {"ann": "ann@example.com"}}, f)
     return cal, d
 
@@ -1306,8 +1312,8 @@ def t_route_notes_skills_calendar():
         assert say(pc, v, "yes") and not skm.get_skill("warmup")
         assert say(pc, v, "what do i have tomorrow") and ("Dentist" in said[-1] or "Birthday" in said[-1]), said[-1]
         assert say(pc, v, "add lunch with sam tomorrow at noon to my calendar") and "yes" in said[-1].lower()
-        assert not os.path.exists(os.path.join(d, "calendar_local.json")), "calendar changed before confirmation"
-        assert say(pc, v, "yes") and os.path.exists(os.path.join(d, "calendar_local.json"))
+        assert not os.path.exists(mem_path(d, "calendar_local.json")), "calendar changed before confirmation"
+        assert say(pc, v, "yes") and os.path.exists(mem_path(d, "calendar_local.json"))
 
 
 def t_route_study_translate():
@@ -2778,7 +2784,7 @@ def filenames_templates_and_project_lookup():
     d = ext_dir()
     with mock.patch.object(sc, "BASE", d), mock.patch.object(sc, "PROJECTS_ROOT", os.path.join(d, "p")), \
             mock.patch.object(sc, "ARDUINO_ROOT", os.path.join(d, "a")):
-        json.dump({"Demo": "C:/x/demo.py"}, open(os.path.join(d, "code_projects.json"), "w"))
+        json.dump({"Demo": "C:/x/demo.py"}, open(mem_path(d, "code_projects.json"), "w"))
         eq(sc.resolve_project_path("demo"), "C:/x/demo.py")
         eq(sc.find_arduino_sketch("DEMO"), "C:/x/demo.py")
         eq(sc.resolve_project_path("ghost"), None)
@@ -2876,7 +2882,7 @@ def adb_basics_contacts_and_calls():
         open(os.path.join(d, "phone_pin.txt"), "w").write("1234")
         assert sc.unlock_with_pin()[0]
         assert "input text 1234" in shell_log and "input keyevent KEYCODE_ENTER" in shell_log
-        json.dump({"Mom": "123", "me": "999"}, open(os.path.join(d, "contacts.json"), "w"))
+        json.dump({"Mom": "123", "me": "999"}, open(mem_path(d, "contacts.json"), "w"))
         eq(sc.load_contacts(), {"mom": "123", "me": "999"})
         eq(sc.load_my_number(), "999")
         open(os.path.join(d, "my_number.txt"), "w").write("555")
@@ -2887,7 +2893,7 @@ def adb_basics_contacts_and_calls():
         sc.wifi_set(False)
         assert shell_log[-2].endswith("enable") and shell_log[-1].endswith("disable")
         json.dump({"home": {"ssid": "Net", "password": "pw"}, "cafe": {"ssid": "Cafe", "password": ""}},
-                  open(os.path.join(d, "wifi_networks.json"), "w"))
+                  open(mem_path(d, "wifi_networks.json"), "w"))
         assert sc.wifi_connect("home")[0] and "wpa2 'pw'" in shell_log[-1]
         sc.wifi_connect("cafe")
         assert shell_log[-1].endswith("'Cafe' open")
@@ -2937,7 +2943,7 @@ def adb_packages_apps_wireless_whatsapp_search():
     with mock.patch.object(sc, "BASE", d), mock.patch.object(sc, "_shell", lambda c, timeout=15: (True, "")):
         ok, msg = sc.whatsapp_call("stranger")
         assert not ok and "couldn't find" in msg
-        json.dump({"dad": "+1 (800) 555"}, open(os.path.join(d, "contacts.json"), "w"))
+        json.dump({"dad": "+1 (800) 555"}, open(mem_path(d, "contacts.json"), "w"))
         ok, msg = sc.whatsapp_call("dad")
         assert ok and "tap the call button" in msg
 

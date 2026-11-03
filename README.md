@@ -125,20 +125,20 @@ Config files live next to `api_key.txt`. None are required.
 
 | Feature | Requirement |
 |---|---|
-| Phone control & notifications | [ADB](https://developer.android.com/tools/releases/platform-tools), USB debugging on; `contacts.json`, `my_number.txt`, `phone_pin.txt`, `wifi_networks.json` |
+| Phone control & notifications | [ADB](https://developer.android.com/tools/releases/platform-tools), USB debugging on; `memory/contacts.json`, `memory/wifi_networks.json`, `my_number.txt`, `phone_pin.txt` |
 | Arduino/ESP32 telemetry | `iot_config.json` — `{"mode":"serial","port":"COM5","baud":9600}` or `{"mode":"wifi","url":"http://<ip>/telemetry"}` |
-| Calendar | `calendar_config.json` — `{"ics": ["C:/path/cal.ics", "https://.../basic.ics"]}` (read-only) |
-| Email | `email_config.json` (`imap_host`, `smtp_host`, `username`, `contacts`) + env `AURORA_EMAIL_PASSWORD` or `email_password.txt` (use an app password) |
+| Calendar | `memory/calendar_config.json` — `{"ics": ["C:/path/cal.ics", "https://.../basic.ics"]}` (read-only) |
+| Email | `memory/email_config.json` (`imap_host`, `smtp_host`, `username`, `contacts`) + env `AURORA_EMAIL_PASSWORD` or `email_password.txt` (use an app password) |
 | Screen recording | `ffmpeg` on PATH |
 | Offline speech recognition | `pip install pocketsphinx` |
 | Presentations | `presentations/<name>.md` or `presentation.md` (see below) |
-| Code projects / file vault | `code_projects.json`, `vault_folders.json` |
+| Code projects / file vault | `memory/code_projects.json`, `memory/vault_folders.json` |
 | Custom background | drop `background.jpg`/`.png` in the project root |
 | Custom fonts | drop `Rajdhani-*.ttf` / `Orbitron-Bold.ttf` in a `fonts/` folder |
 | Mic / sensitivity | `mic_index.txt`, `energy_threshold.txt` |
 | Face match strictness | `face_threshold.txt` (lower = stricter, default 80) |
 | Cowork models | `cowork_model.txt`, `safeguard_model.txt` |
-| Gmail (OAuth) | `google_client.json` (Desktop-app OAuth client from Google Cloud with the Gmail API enabled), then say "connect gmail" (see Gmail setup below). `email_config.json` now only needs `contacts` |
+| Gmail (OAuth) | `google_client.json` (Desktop-app OAuth client from Google Cloud with the Gmail API enabled), then say "connect gmail" (see Gmail setup below). `memory/email_config.json` now only needs `contacts` |
 | Offline math reading | `pip install pytesseract` plus the Tesseract program |
 | Offline speech (better) | `pip install faster-whisper` (Whisper small, used before PocketSphinx) |
 | Documents | `pip install python-pptx python-docx openpyxl`; files land in `documents/` |
@@ -273,7 +273,7 @@ Anything that changes data asks for a "yes" first.
 |---|---|
 | "connect gmail" / "connect gmail with sending" / "disconnect gmail" | Google sign-in in your browser (read-only, or read + send) |
 | "reply on WhatsApp saying I'm on my way" / "reply to the latest WhatsApp from Mom" | Reply to a WhatsApp notification (AI-written unless you say "saying ...", confirmed) |
-| "send Mom a WhatsApp saying I'll be late" / "send Sam a WhatsApp about the demo" | New WhatsApp message (confirmed, needs a number in `contacts.json` or your phone contacts) |
+| "send Mom a WhatsApp saying I'll be late" / "send Sam a WhatsApp about the demo" | New WhatsApp message (confirmed, needs a number in `memory/contacts.json` or your phone contacts) |
 | "find PDFs about physics from this month" / "find images in downloads from last week" | Search by type, topic, date and folder |
 | "rename these files properly" / "move these into my school folder" | Batch rename or move the last search results (confirmed) |
 | "undo the move" / "undo the rename" | Reverse the last batch (confirmed) |
@@ -429,7 +429,7 @@ python test_aurora.py --all
   image per 15 seconds. Wait a moment and try again.
 - **"Generate an image" isn't recognised** — run
   `python jarvis_ui/image_generator.py --install` once.
-- **WhatsApp reply can't find the contact** — add them to `contacts.json`
+- **WhatsApp reply can't find the contact** — add them to `memory/contacts.json`
   with the country code, or save them in your phone contacts.
 
 ## Project structure
@@ -443,6 +443,7 @@ jarvis_ui/
   voice_assistant.py          wake word, STT, local commands, TTS
   brain.py                    Groq model, tools, code generation, vision
   face_id.py                  consent-based face enrollment/recognition
+  memory_store.py             memory/ folder paths for saved data (contacts, notes, calendar, timeline...), auto-moves old root files
   system_control.py           volume, media, apps, phone (ADB), code files, QR, notes, vault
   telemetry.py                Arduino/IoT reader, game companion, experiment recorder
   sandbox_labs.py             physics, molecule builder, circuit simulator
