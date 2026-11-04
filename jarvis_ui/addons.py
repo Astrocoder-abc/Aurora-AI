@@ -610,7 +610,7 @@ def sandbox_run(name, timeout=RUN_TIMEOUT_SECONDS):
     if os.name == "nt":
         env["SYSTEMROOT"] = os.environ.get("SYSTEMROOT", "")
     try:
-        r = subprocess.run(runner + [path], cwd=SANDBOX_ROOT, env=env, capture_output=True, text=True,
+        r = subprocess.run(runner + [path], cwd=SANDBOX_ROOT, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace",
                            timeout=timeout, shell=False, stdin=subprocess.DEVNULL)
         return r.returncode == 0, (r.stdout or "")[:MAX_OUTPUT_CHARS], (r.stderr or "")[:MAX_OUTPUT_CHARS]
     except subprocess.TimeoutExpired:

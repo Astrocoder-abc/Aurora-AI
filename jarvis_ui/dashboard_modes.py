@@ -106,7 +106,7 @@ def _load_events(limit=400):
 def _git_commits(limit=40):
     try:
         r = subprocess.run(["git", "-C", BASE, "log", f"-n{limit}", "--pretty=format:%ct|%s"],
-                           capture_output=True, text=True, timeout=5)
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5)
     except Exception:
         return []
     out = []

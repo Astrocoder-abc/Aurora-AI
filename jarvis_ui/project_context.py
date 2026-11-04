@@ -112,7 +112,7 @@ def run_command(cmd, cwd, cancel=None, timeout=TEST_TIMEOUT, env=None):
     exe = cmd[0] if cmd[0] == sys.executable else (shutil.which(cmd[0]) or cmd[0])
     try:
         p = subprocess.Popen([exe, *cmd[1:]], cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             stdin=subprocess.DEVNULL, text=True, errors="replace", creationflags=NO_WINDOW)
+                             stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace", creationflags=NO_WINDOW)
     except OSError as e:
         return None, f"could not start {cmd[0]}: {e}"
     end = time.time() + timeout
@@ -237,7 +237,7 @@ def scan_modules(path):
 
 def _git(path, *args):
     try:
-        r = subprocess.run(["git", "-C", path, *args], capture_output=True, text=True, timeout=3, creationflags=NO_WINDOW)
+        r = subprocess.run(["git", "-C", path, *args], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3, creationflags=NO_WINDOW)
         return r.stdout if r.returncode == 0 else None
     except Exception:
         return None

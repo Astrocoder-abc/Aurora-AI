@@ -286,7 +286,7 @@ def is_recording():
 # ============================================================================
 def _adb(args, timeout=15):
     try:
-        r = subprocess.run(["adb"] + args, capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(["adb"] + args, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
         return r.returncode == 0, (r.stdout + r.stderr).strip()
     except FileNotFoundError:
         return False, "adb not found - install platform-tools and add it to PATH"
@@ -547,7 +547,7 @@ def open_in_vscode(path):
     if not os.path.exists(path):
         return False, f"Path not found: {path}"
     try:
-        r = subprocess.run(f'code "{path}"', shell=True, capture_output=True, text=True, timeout=10)
+        r = subprocess.run(f'code "{path}"', shell=True, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10)
         return (True, "") if r.returncode == 0 else (False, (r.stdout + r.stderr).strip() or "'code' isn't on PATH")
     except Exception as e:
         return False, str(e)

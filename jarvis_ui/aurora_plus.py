@@ -298,7 +298,7 @@ class Cowork:
         if os.name == "nt":
             env["SYSTEMROOT"] = os.environ.get("SYSTEMROOT", "")
         try:
-            r = subprocess.run(TEST_CMD, cwd=root, env=env, capture_output=True, text=True, timeout=RUN_TIMEOUT)
+            r = subprocess.run(TEST_CMD, cwd=root, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=RUN_TIMEOUT)
         except subprocess.TimeoutExpired:
             return False, f"Timed out after {RUN_TIMEOUT}s (infinite loop?)"
         out = (r.stdout + r.stderr)[-4000:]

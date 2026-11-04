@@ -205,7 +205,7 @@ class SystemMonitor:
             r = subprocess.run(["powershell", "-NoProfile", "-Command",
                                 "(Get-CimInstance -Namespace root/wmi -ClassName MSAcpi_ThermalZoneTemperature"
                                 " | Select-Object -First 1).CurrentTemperature"],
-                               capture_output=True, text=True, timeout=10, creationflags=NO_WINDOW)
+                               capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10, creationflags=NO_WINDOW)
             temp = float(r.stdout.strip()) / 10 - 273.15
             if 0 < temp < 130:
                 return temp
@@ -258,7 +258,7 @@ class SystemMonitor:
         if os.name != "nt":
             return
         r = subprocess.run(["wevtutil", "qe", "Application", "/q:*[System[(EventID=1000)]]", "/c:1", "/rd:true", "/f:text"],
-                           capture_output=True, text=True, timeout=8, creationflags=NO_WINDOW)
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=8, creationflags=NO_WINDOW)
         first, self._crash_primed = not self._crash_primed, True
         app = re.search(r"Faulting application name:\s*([^,\r\n]+)", r.stdout)
         stamp = re.search(r"Date:\s*(\S+)", r.stdout)

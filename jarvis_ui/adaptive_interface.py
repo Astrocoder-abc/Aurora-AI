@@ -51,7 +51,7 @@ class AdaptiveInterface:
     def _gather(self):
         info = {}
         try:
-            git = lambda *a: subprocess.run(["git", "-C", BASE, *a], capture_output=True, text=True, timeout=3).stdout
+            git = lambda *a: subprocess.run(["git", "-C", BASE, *a], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3).stdout
             info["branch"], info["dirty"] = git("rev-parse", "--abbrev-ref", "HEAD").strip(), len(git("status", "--porcelain").splitlines())
         except Exception:
             info["branch"] = ""
