@@ -23,8 +23,10 @@ import sys
 import threading
 import time
 
+from jarvis_ui.memory_store import memory_path
+
 BASE = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-STATE_FILE = os.path.join(BASE, "task_state.json")
+STATE_FILE = memory_path("task_state.json", BASE)
 NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 TEST_TIMEOUT = 300
 RUNNERS = {"python", "python3", "py", "pytest", "npm", "npx", "node", "cargo", "go", "dotnet", "mvn", "gradle", "make"}

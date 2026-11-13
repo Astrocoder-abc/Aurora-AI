@@ -24,8 +24,10 @@ from collections import Counter, deque
 import cv2
 import numpy as np
 
+from jarvis_ui.memory_store import memory_path
+
 BASE = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-DATA_DIR = os.path.join(BASE, "face_data")
+DATA_DIR = memory_path("face_data", BASE)
 SAMPLES_DIR = os.path.join(DATA_DIR, "samples")
 PEOPLE_PATH = os.path.join(DATA_DIR, "people.json")
 THRESHOLD_FILE = os.path.join(BASE, "face_threshold.txt")

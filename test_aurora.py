@@ -26,6 +26,12 @@ from types import SimpleNamespace
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def mem_path(base, name):
+    """Path inside <base>/memory/ (created on demand), where persistent user data lives."""
+    os.makedirs(os.path.join(base, "memory"), exist_ok=True)
+    return os.path.join(base, "memory", name)
 sys.path.insert(0, ROOT)
 os.chdir(ROOT)
 ARGS = set(sys.argv[1:])
@@ -1011,7 +1017,7 @@ def cal_env():
     today = datetime.now().date()
     ics = os.path.join(d, "c.ics")
     open(ics, "w").write(ICS.format(d=(today - timedelta(days=14)).strftime("%Y%m%d"), t=(today + timedelta(days=1)).strftime("%Y%m%d")))
-    json.dump({"ics": [ics]}, open(os.path.join(d, "calendar_config.json"), "w"))
+    json.dump({"ics": [ics]}, open(mem_path(d, "calendar_config.json"), "w"))
     return cal, d
 
 
@@ -1036,8 +1042,8 @@ def t_calendar():
 
 check("Calendar", "ICS parsing, recurrence, time phrases, local events, next event", t_calendar)
 check("Calendar", "live calendar source (ICS URL / file you configured)",
-      lambda: (_ for _ in ()).throw(Skip("no calendar_config.json in project root", "REQUIRES PERMISSION"))
-      if not os.path.exists(os.path.join(ROOT, "calendar_config.json")) else
+      lambda: (_ for _ in ()).throw(Skip("no calendar_config.json in memory/", "REQUIRES PERMISSION"))
+      if not os.path.exists(mem_path(ROOT, "calendar_config.json")) else
       (lambda c: (c.events_between(datetime.now(), datetime.now() + timedelta(days=7)) and None))(util()))
 
 
@@ -1045,7 +1051,7 @@ check("Calendar", "live calendar source (ICS URL / file you configured)",
 def mail_env():
     cal = util()
     d = newdir("mail")
-    with open(os.path.join(d, "email_config.json"), "w") as f:
+    with open(mem_path(d, "email_config.json"), "w") as f:
         json.dump({"contacts": {"ann": "ann@example.com"}}, f)
     return cal, d
 
@@ -1306,8 +1312,8 @@ def t_route_notes_skills_calendar():
         assert say(pc, v, "yes") and not skm.get_skill("warmup")
         assert say(pc, v, "what do i have tomorrow") and ("Dentist" in said[-1] or "Birthday" in said[-1]), said[-1]
         assert say(pc, v, "add lunch with sam tomorrow at noon to my calendar") and "yes" in said[-1].lower()
-        assert not os.path.exists(os.path.join(d, "calendar_local.json")), "calendar changed before confirmation"
-        assert say(pc, v, "yes") and os.path.exists(os.path.join(d, "calendar_local.json"))
+        assert not os.path.exists(mem_path(d, "calendar_local.json")), "calendar changed before confirmation"
+        assert say(pc, v, "yes") and os.path.exists(mem_path(d, "calendar_local.json"))
 
 
 def t_route_study_translate():
@@ -2778,7 +2784,7 @@ def filenames_templates_and_project_lookup():
     d = ext_dir()
     with mock.patch.object(sc, "BASE", d), mock.patch.object(sc, "PROJECTS_ROOT", os.path.join(d, "p")), \
             mock.patch.object(sc, "ARDUINO_ROOT", os.path.join(d, "a")):
-        json.dump({"Demo": "C:/x/demo.py"}, open(os.path.join(d, "code_projects.json"), "w"))
+        json.dump({"Demo": "C:/x/demo.py"}, open(mem_path(d, "code_projects.json"), "w"))
         eq(sc.resolve_project_path("demo"), "C:/x/demo.py")
         eq(sc.find_arduino_sketch("DEMO"), "C:/x/demo.py")
         eq(sc.resolve_project_path("ghost"), None)
@@ -2876,7 +2882,7 @@ def adb_basics_contacts_and_calls():
         open(os.path.join(d, "phone_pin.txt"), "w").write("1234")
         assert sc.unlock_with_pin()[0]
         assert "input text 1234" in shell_log and "input keyevent KEYCODE_ENTER" in shell_log
-        json.dump({"Mom": "123", "me": "999"}, open(os.path.join(d, "contacts.json"), "w"))
+        json.dump({"Mom": "123", "me": "999"}, open(mem_path(d, "contacts.json"), "w"))
         eq(sc.load_contacts(), {"mom": "123", "me": "999"})
         eq(sc.load_my_number(), "999")
         open(os.path.join(d, "my_number.txt"), "w").write("555")
@@ -2887,7 +2893,7 @@ def adb_basics_contacts_and_calls():
         sc.wifi_set(False)
         assert shell_log[-2].endswith("enable") and shell_log[-1].endswith("disable")
         json.dump({"home": {"ssid": "Net", "password": "pw"}, "cafe": {"ssid": "Cafe", "password": ""}},
-                  open(os.path.join(d, "wifi_networks.json"), "w"))
+                  open(mem_path(d, "wifi_networks.json"), "w"))
         assert sc.wifi_connect("home")[0] and "wpa2 'pw'" in shell_log[-1]
         sc.wifi_connect("cafe")
         assert shell_log[-1].endswith("'Cafe' open")
@@ -2937,7 +2943,7 @@ def adb_packages_apps_wireless_whatsapp_search():
     with mock.patch.object(sc, "BASE", d), mock.patch.object(sc, "_shell", lambda c, timeout=15: (True, "")):
         ok, msg = sc.whatsapp_call("stranger")
         assert not ok and "couldn't find" in msg
-        json.dump({"dad": "+1 (800) 555"}, open(os.path.join(d, "contacts.json"), "w"))
+        json.dump({"dad": "+1 (800) 555"}, open(mem_path(d, "contacts.json"), "w"))
         ok, msg = sc.whatsapp_call("dad")
         assert ok and "tap the call button" in msg
 
@@ -4581,7 +4587,8 @@ def patch_script_anchors_match_source():
 
 
 # ============================================================================ holographic construction (stage 1)
-_PC_GL = ("glPushMatrix", "glPopMatrix", "glTranslatef", "glRotatef", "glScalef", "glDeleteLists", "glCallList", "glColor4f", "glLineWidth")
+_PC_GL = ("glPushMatrix", "glPopMatrix", "glTranslatef", "glRotatef", "glScalef", "glDeleteLists", "glCallList",
+          "glColor4f", "glLineWidth", "glGetFloatv", "glPushAttrib", "glPopAttrib")
 
 
 @contextlib.contextmanager
@@ -5004,7 +5011,7 @@ def cache_key_is_a_stable_uid_not_a_per_frame_hash():
 
 # ============================================================================ holographic construction (stage 3)
 # Insert after the "Holographic construction 2" tests in test_aurora.py (before the presentation builder section).
-# Also extend the GL name list used by pc_gl():  _PC_GL = (..., "glColor4f", "glLineWidth")
+# Also extend the GL name list used by pc_gl() with:  "glColor4f", "glLineWidth", "glGetFloatv", "glPushAttrib", "glPopAttrib"
 def pc3_setup(name="robot", mode="shape"):
     """Fake hologram with the editor installed and the model 'displayed' (fully built unless elapsed is changed)."""
     pc = mod("procedural_construction")
@@ -5245,7 +5252,9 @@ def highlight_draws_only_the_selected_part_and_leaves_state_clean():
         pc.draw_construction(h, "robot")
         eq(h.calls, ["box"])                                                                             # head is a box: one outline
         eq(m["glColor4f"].call_args.args[:3], (1.0, 1.0, 1.0))
-        eq(m["glLineWidth"].call_args_list[-1].args, (2.0,))                                             # line width restored
+        eq((m["glPushAttrib"].call_count, m["glPopAttrib"].call_count), (1, 1))                          # state saved and restored
+        assert m["glPushAttrib"].call_args.args[0] == pc.GL_CURRENT_BIT | pc.GL_LINE_BIT
+        assert all(c.args != (2.0,) for c in m["glLineWidth"].call_args_list), "no hard-coded line-width reset"
         h.calls.clear()
         ed.select_part("core")
         pc.draw_construction(h, "robot")
@@ -5317,6 +5326,171 @@ def stage3_leaves_stage1_and_2_behaviour_intact():
     h.mode = "info"
     h._draw_shape("sphere")
     eq(drawn, ["cube", "sphere"])
+
+
+@ext("Holographic construction 3")
+def highlight_follows_each_rendering_layer_and_restores_gl_state():
+    layers = [(0.18, 1.6), (0.033, 6.6), (0.05, 4.4), (0.95, 2.0)]                                      # ghost, ghost, bloom, bloom, crisp
+    with pc_gl() as (pc, m):
+        _, h, ed = pc3_setup()
+        pc.draw_construction(h, "robot")
+        ed.select_part("head")
+        for alpha, width in layers:
+            for k in ("glColor4f", "glLineWidth", "glPushAttrib", "glPopAttrib"):
+                m[k].reset_mock()
+            m["glGetFloatv"].side_effect = lambda e, a=alpha, w=width: (0.1, 0.2, 0.3, a) if e == pc.GL_CURRENT_COLOR else w
+            pc.draw_construction(h, "robot")
+            r, g, b, a = m["glColor4f"].call_args.args
+            assert (r, g, b) == (1.0, 1.0, 1.0) and 0.5 * alpha <= a <= alpha + 1e-9, (alpha, a)         # scales with the layer
+            eq(m["glLineWidth"].call_args.args, (width + 1.5,))
+            eq((m["glPushAttrib"].call_count, m["glPopAttrib"].call_count), (1, 1))
+        m["glPopAttrib"].reset_mock()
+        h._draw_wireframe_cube = mock.Mock(side_effect=RuntimeError("gl"))
+        raises(RuntimeError, pc.draw_construction, h, "robot")
+        eq(m["glPopAttrib"].call_count, 1)                                                               # restored even on error
+        m["glGetFloatv"].side_effect = RuntimeError("no context")
+        h._draw_wireframe_cube = lambda *a, **k: None
+        pc.draw_construction(h, "robot")                                                                 # state read fails: safe defaults
+
+
+@ext("Holographic construction 3")
+def stale_selection_is_never_rendered_after_a_mode_switch_and_return():
+    with pc_gl() as (pc, m):
+        _, h, ed = pc3_setup()
+        ed.select_part("head")
+        eq(ed.selected_part_for("robot"), "head")
+        h.mode = "atom"                                                                                  # no editor method is called here
+        eq(ed.selected_part_for("robot"), None)                                                          # renderer-side check clears it
+        h.mode = "shape"
+        eq((ed.selected_part_for("robot"), ed.selected_part), (None, None))                              # not resurrected on return
+        ed.select_part("head")
+        h._materialize_start += 5.0                                                                      # any loader showed new content
+        eq(ed.selected_part_for("robot"), None)
+        ed.select_part("head")
+        h.shape_name = "car"
+        eq((ed.selected_part_for("robot"), ed.selected_part_for("car")), (None, None))
+        h.shape_name = "robot"
+        eq(ed.selected_part_for("robot"), None)
+        ed.select_part("head")
+        pc.draw_construction(h, "robot")
+        h.calls.clear()
+        h.mode = "info"
+        h._materialize_start += 1.0                                                                      # what every loader does (_trigger_materialize)
+        h.mode = "shape"
+        pc.draw_construction(h, "robot")
+        eq(h.calls, [])                                                                                  # no highlight drawn
+
+
+@ext("Holographic construction 3")
+def construction_loads_are_atomic_against_rendering_and_gl_stays_on_the_render_thread():
+    with pc_gl() as (pc, m):
+        h = pc_fake_holo()
+        h.mode, h.shape_name, h.elapsed, h._materialize_start, h.selected_index = "empty", "x", 100.0, 0.0, None
+        h._construction_assemble, h.mode_label = True, ""
+        h.hide_weather, h._draw_shape = (lambda: None), (lambda n: None)
+        h._trigger_materialize = lambda: setattr(h, "_materialize_start", h.elapsed)
+        seen, started, loaded, release = [], threading.Event(), threading.Event(), threading.Event()
+        snap = lambda: (h.mode, h.shape_name, h._construction_assemble, h.mode_label)
+
+        def render():                                                                                    # stands in for Hologram.render
+            seen.append(snap())
+            started.set()
+            seen.append(("blocked", not loaded.wait(0.3)))                                               # loader must wait for the frame
+            seen.append(snap())
+        h.render = render
+        pc.install(h)
+        h.load_construction("robot")
+        seen.clear()
+        render_thread = threading.get_ident()
+        gl_threads = []
+        for k in ("glPushMatrix", "glTranslatef", "glCallList", "glColor4f", "glDeleteLists"):
+            m[k].side_effect = lambda *a, k=k: gl_threads.append(threading.get_ident())
+
+        def loader():
+            started.wait(2)
+            h.load_construction("car", False)
+            ed = h.construction
+            ed.select_part("chassis"), ed.move_part(0.1), ed.move_model(0.1), ed.undo(), ed.reset()
+            loaded.set()
+        t = threading.Thread(target=loader)
+        t.start()
+        h.render()
+        t.join(3)
+        assert not t.is_alive()
+        first, blocked, second = seen
+        eq(blocked, ("blocked", True))                                                                   # loader was held off the whole frame
+        eq(first, second)                                                                                # frame state was consistent
+        eq(first[:2], ("shape", "robot"))
+        eq((h.shape_name, h._construction_assemble), ("car", False))                                     # applied right after the frame
+        eq(gl_threads, [])                                                                               # worker thread made no GL calls
+        pc.draw_construction(h, "car")
+        assert gl_threads and set(gl_threads) == {render_thread}
+
+
+# >>> construction-editor-hardening v2
+@ext("Holographic construction 3 hardening")
+def render_state_is_one_consistent_snapshot():
+    with pc_gl() as (pc, m):
+        _, h, ed = pc3_setup()
+        eq(ed.render_state("robot"), (pc.MODELS["robot"], None, None))
+        ed.select_part("head"), ed.move_part(0.1), ed.move_model(0.2)
+        model, xf, sel = ed.render_state("robot")
+        assert model is ed.model_for("robot") and xf == ed.transform_for("robot") and sel == "head"
+        eq(ed.render_state("ghost"), (None, None, None))
+
+
+def _no_gl(pc):
+    return mock.patch.multiple(pc, glPushAttrib=mock.DEFAULT, glPopAttrib=mock.DEFAULT, glGetFloatv=mock.DEFAULT)
+
+
+@ext("Holographic construction 3 hardening")
+def highlight_restores_gl_state_when_drawing_fails():
+    with pc_gl() as (pc, m), _no_gl(pc) as g:
+        _, h, ed = pc3_setup()
+        h._draw_wireframe_cube = mock.Mock(side_effect=RuntimeError("gl"))
+        raises(RuntimeError, pc._draw_highlight, h, pc.MODELS["robot"], "head")
+        eq((g["glPushAttrib"].call_count, g["glPopAttrib"].call_count), (1, 1))
+
+
+@ext("Holographic construction 3 hardening")
+def concurrent_edits_and_rendering_do_not_deadlock_or_unbalance_matrices():
+    with pc_gl() as (pc, m), _no_gl(pc) as g:
+        _, h, ed = pc3_setup()
+        errs = []
+
+        def editor():
+            try:
+                for i in range(300):
+                    ed.select_part("head")
+                    ed.move_part(0.01 if i % 2 else -0.01)
+                    ed.rotate_model(0, 3, 0)
+                    ed.undo()
+            except Exception as ex:
+                errs.append(ex)
+        t = threading.Thread(target=editor, daemon=True)
+        t.start()
+        n = 0
+        while t.is_alive() and n < 5000:
+            pc.draw_construction(h, "robot")
+            n += 1
+        t.join(10)
+        assert not t.is_alive() and not errs, errs
+        eq(m["glPushMatrix"].call_count, m["glPopMatrix"].call_count)
+        eq(g["glPushAttrib"].call_count, g["glPopAttrib"].call_count)
+
+
+@ext("Holographic construction 3 hardening")
+def malformed_edit_values_are_rejected_without_state_change():
+    with pc_gl() as (pc, m):
+        _, h, ed = pc3_setup()
+        ed.select_part("head")
+        before, depth = ed.model_for("robot"), ed.undo_depth
+        for bad in (float("nan"), float("inf"), "1", None, True, [1]):
+            assert not (ed.move_part(bad) or ed.rotate_part(bad) or ed.move_model(bad) or ed.rotate_model(bad)), bad
+        for bad in (0, -1, float("nan"), "2", None, True, (1, 1), (1, 0, 1), [1, 2, "x"]):
+            assert not (ed.resize_part(bad) or ed.scale_model(bad)), bad
+        assert ed.model_for("robot") is before and ed.undo_depth == depth and ed.transform_for("robot") is None
+# <<< construction-editor-hardening v2
 
 
 # ============================================================================ presentation builder

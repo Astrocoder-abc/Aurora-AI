@@ -28,11 +28,13 @@ import threading
 import time
 from collections import Counter
 
+from jarvis_ui.memory_store import memory_path
+
 from OpenGL.GL import (glBegin, glEnd, glVertex2f, glColor4f, glLineWidth,
                        GL_QUADS, GL_LINES, GL_LINE_LOOP)
 
 BASE = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-EVENTS_FILE = os.path.join(BASE, "timeline_events.jsonl")
+EVENTS_FILE = memory_path("timeline_events.jsonl", BASE)
 DECK_DIR = os.path.join(BASE, "presentations")
 
 RECORDED = ("CODE:", "EXPERIMENT:", "COWORK:", "NOTES:", "SEARCH:", "SANDBOX:", "MONITOR:", "GAME:", "VAULT:", "TIMER:")

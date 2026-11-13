@@ -368,7 +368,7 @@ class Cowork:
 # SEMANTIC FILE SEARCH (extends the keyword vault in system_control)
 # ============================================================================
 
-INDEX_FILE = os.path.join(BASE, "semantic_index.json")
+INDEX_FILE = sc.memory_path("semantic_index.json", BASE)
 SKIP_DIRS = {".git", "node_modules", "venv", ".venv", "__pycache__", "site-packages", "$RECYCLE.BIN"}
 SKIP_FILES = re.compile(r"api_key|phone_pin|my_number|contacts|hub_token|gmail_token|google_client|\.env|password|secret|credential|"
                         r"id_rsa|cookies|login", re.I)

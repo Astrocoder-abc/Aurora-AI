@@ -24,10 +24,11 @@ import time
 from collections import defaultdict, deque
 
 from jarvis_ui import project_context as pc
+from jarvis_ui.memory_store import memory_path
 
 BASE = pc.BASE
 REPORT_DIR = os.path.join(BASE, "diagnostic_reports")
-PROFILE = os.path.join(BASE, "sentinel_profile.json")
+PROFILE = memory_path("sentinel_profile.json", BASE)
 PATCH_DIR = os.path.join(BASE, "patches")
 SECRET_FILES = re.compile(r"api_key|phone_pin|my_number|contacts\.json|hub_token|gmail_token|google_client|\.env|id_rsa|credential|"
                           r"wifi_networks|email_config|cookies|login data", re.I)

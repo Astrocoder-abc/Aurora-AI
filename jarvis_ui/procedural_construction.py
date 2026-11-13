@@ -26,7 +26,8 @@ returns True on success or False with a reason in .last_error, and never raises 
                     is rejected. Each edit builds a new validated Model (new uid), so display lists recompile once.
   history           undo()  undo_depth (bounded by MAX_UNDO)  reset() restores parts and transform; reset is undoable.
 The registered model is never modified: edits live in the editor, and replacing a model in the registry discards
-edits made to the old one. Selection is cleared when another model or hologram mode is shown.
+edits made to the old one. Selection is bound to the display it was made on: it is dropped when the model, the hologram mode or the
+display (materialize start) changes, and the renderer re-checks this on every draw.
 Gesture: thumbs-up selects the next part while a construction model is displayed (see main.py); no other gesture
 is bound, so drawing, zoom, orbit selection, volume and pan are unaffected.
 
@@ -36,8 +37,11 @@ gestures all apply unchanged. Part colour is deliberately not part of the schema
 Model names are NOT added to hologram.SHAPES, so the generic "show <shape>" voice matcher cannot trigger them.
 
 Threading: only draw_construction / draw_model issue OpenGL calls, and they run from Hologram.render().
-The editor, load_construction and install only change Python state (guarded by a lock) and are safe from other
-threads (like Hologram.load_shape).
+The editor only changes Python state (guarded by its own lock). install() wraps Hologram.render so each frame runs
+under hologram._construction_lock, and load_construction changes mode/shape_name/assemble flag/materialize start under
+that same lock: a frame therefore never sees a half-applied construction load, and a background (voice) thread
+simply waits at most one frame. Lock order is always construction lock -> editor lock. Other loaders
+(load_shape, load_atom, ...) are unchanged and keep Aurora's existing behaviour.
 
 Part fields (units match the other shape models, roughly +-1.5 across; y is up):
   name   unique, letters/digits/space/_/-, up to 32 characters
@@ -52,11 +56,13 @@ import math
 import numbers
 import re
 import threading
+import contextlib
 from collections import deque
 from dataclasses import dataclass, field
 
-from OpenGL.GL import (glCallList, glColor4f, glDeleteLists, glLineWidth, glPopMatrix, glPushMatrix, glRotatef,
-                       glScalef, glTranslatef)
+from OpenGL.GL import (GL_CURRENT_BIT, GL_CURRENT_COLOR, GL_LINE_BIT, GL_LINE_WIDTH, glCallList, glColor4f,
+                       glDeleteLists, glGetFloatv, glLineWidth, glPopAttrib, glPopMatrix, glPushAttrib, glPushMatrix,
+                       glRotatef, glScalef, glTranslatef)
 
 PRIMITIVES = ("box", "sphere", "cylinder", "pyramid")
 MAX_PARTS = 64
@@ -397,7 +403,7 @@ class ConstructionEditor:
         self.h = hologram
         self._lock = threading.RLock()
         self._edits = {}                  # model name -> _Edit
-        self._sel = None                  # (model name, lowercase part name)
+        self._sel = None                  # (model name, lowercase part name, display epoch)
         self.last_error = ""
 
     # ---- state ----------------------------------------------------------------------------------
@@ -418,14 +424,19 @@ class ConstructionEditor:
             e = self._edits[name] = _Edit(base)
         return e
 
+    def _epoch(self):
+        """Changes whenever any loader shows new content (every Hologram.load_* calls _trigger_materialize)."""
+        return getattr(self.h, "_materialize_start", None)
+
     def _validate(self):
-        """Active model name (or None). Drops a selection that belongs to another model, mode or missing part."""
+        """Active model name (or None). Drops a selection from another model, mode, display or a missing part."""
         name = self._active()
         if name is not None:
             self._edit_for(name)
         if self._sel:
-            model = self.model_for(self._sel[0]) if self._sel[0] == name else None
-            if model is None or not any(p.name.lower() == self._sel[1] for p in model.parts):
+            owner, key, epoch = self._sel
+            model = self.model_for(owner) if owner == name and epoch == self._epoch() else None
+            if model is None or not any(p.name.lower() == key for p in model.parts):
                 self._sel = None
         return name
 
@@ -477,8 +488,20 @@ class ConstructionEditor:
             return None if e is None or e.identity else (e.pos, e.rot, e.scale)
 
     def selected_part_for(self, name):
+        """Used by the renderer: validated on every call, so a stale selection can never be drawn."""
         with self._lock:
+            self._validate()
             return self._sel[1] if self._sel and self._sel[0] == name else None
+
+    def render_state(self, name):
+        """(model, transform, selected part key) read under ONE lock, so a frame never mixes old and new edits."""
+        with self._lock:
+            self._validate()                      # a stale selection can never be drawn (same rule as selected_part_for)
+            e = self._edit_for(name)
+            model = e.model if e is not None else MODELS.get(name)
+            xf = None if e is None or e.identity else (e.pos, e.rot, e.scale)
+            sel = self._sel[1] if self._sel and self._sel[0] == name else None
+            return model, xf, sel
 
     @property
     def selected_part(self):
@@ -505,7 +528,7 @@ class ConstructionEditor:
             key = name.strip().lower() if isinstance(name, str) else None
             if not any(p.name.lower() == key for p in self.model_for(active).parts):
                 return self._fail(f"no part called {name!r}")
-            self._sel = (active, key)
+            self._sel = (active, key, self._epoch())
             return True
         return self._do(go)
 
@@ -517,7 +540,7 @@ class ConstructionEditor:
             names = [p.name.lower() for p in self.model_for(active).parts]
             cur = names.index(self._sel[1]) if self._sel else None
             nxt = (0 if d > 0 else len(names) - 1) if cur is None else cur + d
-            self._sel = (active, names[nxt]) if 0 <= nxt < len(names) else None
+            self._sel = (active, names[nxt], self._epoch()) if 0 <= nxt < len(names) else None
             return self.selected_part
 
     def select_next_part(self):
@@ -690,8 +713,19 @@ def _draw_cached(h, name, model):
     glCallList(list_id)
 
 
+def _layer_state():
+    """(alpha, line width) of the shape layer currently being drawn (ghost, bloom or crisp outline)."""
+    try:
+        return float(glGetFloatv(GL_CURRENT_COLOR)[3]), float(glGetFloatv(GL_LINE_WIDTH))
+    except Exception:
+        return 0.95, 2.0
+
+
 def _draw_highlight(h, model, part_key):
-    """Bright pulsing outline over the selected part, drawn directly (never cached) so selection changes are free."""
+    """White pulsing outline over the selected part, drawn directly (never cached) so selection changes are free.
+    It follows whichever layer Hologram._draw_shape_layers is drawing: the layer's alpha scales the highlight (faint on
+    the ghost/bloom passes, crisp on the main pass) and its blend mode is inherited. Colour and line width are saved and
+    restored with glPushAttrib/glPopAttrib, so later layers and the rest of the frame see exactly the state they set."""
     part = next((p for p in model.parts if p.name.lower() == part_key), None)
     if part is None:
         return
@@ -699,10 +733,14 @@ def _draw_highlight(h, model, part_key):
     growth = _ease((t - part.delay) / GROW_SECONDS) if getattr(h, "_construction_assemble", True) is not False else 1.0
     if growth < MIN_GROWTH:
         return
-    glColor4f(1.0, 1.0, 1.0, 0.65 + 0.35 * math.sin(h.elapsed * 6.0))
-    glLineWidth(3.5)
-    _draw_part(_primitives(h), part, growth)
-    glLineWidth(2.0)
+    alpha, width = _layer_state()
+    glPushAttrib(GL_CURRENT_BIT | GL_LINE_BIT)
+    try:
+        glColor4f(1.0, 1.0, 1.0, min(1.0, alpha * (0.75 + 0.25 * math.sin(h.elapsed * 6.0))))
+        glLineWidth(width + 1.5)
+        _draw_part(_primitives(h), part, growth)
+    finally:
+        glPopAttrib()
 
 
 def draw_construction(h, name):
@@ -710,11 +748,9 @@ def draw_construction(h, name):
     (if any) inside its whole-model transform, plus the selection highlight. Geometry caching is unaffected by the
     transform and the highlight; only an edit (new Model uid) recompiles the display list."""
     ed = _editor(h)
-    model = ed.model_for(name) if ed else MODELS.get(name)
+    model, xf, sel = ed.render_state(name) if ed else (MODELS.get(name), None, None)
     if model is None:
         return
-    xf = ed.transform_for(name) if ed else None
-    sel = ed.selected_part_for(name) if ed else None
     if xf is not None:
         pos, rot, scale = xf
         glPushMatrix()
@@ -740,16 +776,17 @@ def load_construction(h, name="robot", assemble=True, keep_edits=False):
     name = _key(name)
     if name not in MODELS:
         return False
-    h.hide_weather()
-    h.mode = "shape"
-    h.shape_name = name
-    h._construction_assemble = bool(assemble)
-    h.mode_label = f"{name.upper()} CONSTRUCTION"
-    h.selected_index = None
-    ed = _editor(h)
-    if ed is not None:
-        ed.on_load(name, keep_edits)
-    h._trigger_materialize()
+    with getattr(h, "_construction_lock", None) or contextlib.nullcontext():     # frames never see a half-applied load
+        h.hide_weather()
+        h.mode = "shape"
+        h.shape_name = name
+        h._construction_assemble = bool(assemble)
+        h.mode_label = f"{name.upper()} CONSTRUCTION"
+        h.selected_index = None
+        ed = _editor(h)
+        if ed is not None:
+            ed.on_load(name, keep_edits)
+        h._trigger_materialize()
     return True
 
 
@@ -766,5 +803,12 @@ def install(hologram):
                 else load_construction(hologram, name, assemble))
     hologram.load_construction = _load
     hologram.construction = ConstructionEditor(hologram)
+    hologram._construction_lock = lock = threading.RLock()
+    render = getattr(hologram, "render", None)
+    if callable(render):
+        def locked_render(*args, **kwargs):
+            with lock:                                  # held for the frame; load_construction waits at most one frame
+                return render(*args, **kwargs)
+        hologram.render = locked_render
     hologram._construction_installed = True
     return hologram

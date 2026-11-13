@@ -19,6 +19,8 @@ import subprocess
 import time
 import urllib.parse
 
+from jarvis_ui.memory_store import memory_path
+
 try:
     from ctypes import POINTER, cast
     from comtypes import CLSCTX_ALL
@@ -42,8 +44,9 @@ def _p(name):
 
 
 def _load_json(name, default):
+    """Reads a JSON data file from memory/."""
     try:
-        with open(_p(name), "r", encoding="utf-8") as f:
+        with open(memory_path(name, BASE), "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return default
@@ -590,7 +593,7 @@ def read_codes(frame):
 # ============================================================================
 # NOTES
 # ============================================================================
-NOTES_FILE = _p("notes.txt")
+NOTES_FILE = memory_path("notes.txt", BASE)
 
 
 def add_note(text):
@@ -628,7 +631,7 @@ def vault_add_folder(path):
     folders = _load_json("vault_folders.json", [])
     if path not in folders:
         folders.append(path)
-        json.dump(folders, open(_p("vault_folders.json"), "w"), indent=2)
+        json.dump(folders, open(memory_path("vault_folders.json", BASE), "w"), indent=2)
     return True, path
 
 
@@ -665,7 +668,7 @@ def vault_build(on_log=None):
                 for i in range(0, len(w), 120):
                     chunk = " ".join(w[i:i + 120])
                     entries.append({"path": path, "text": chunk, "words": _vwords(chunk)})
-    json.dump(entries, open(_p("vault_index.json"), "w", encoding="utf-8"))
+    json.dump(entries, open(memory_path("vault_index.json", BASE), "w", encoding="utf-8"))
     if on_log:
         on_log(f"VAULT: indexed {files} file(s), {len(entries)} chunk(s)")
     return files, len(entries)

@@ -26,6 +26,7 @@ from datetime import datetime, timedelta
 
 from jarvis_ui import system_control as sc
 from jarvis_ui import gmail_client as gmail
+from jarvis_ui.memory_store import memory_path
 
 BASE = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
@@ -407,7 +408,7 @@ def propose_names(client, paths):
 # ============================================================================
 
 def _p(name):
-    return os.path.join(BASE, name)
+    return memory_path(name, BASE)
 
 
 def _json(name, default):
@@ -810,7 +811,7 @@ DATA_FILE = "study_data.json"
 
 
 def _study_path():
-    return os.path.join(BASE, DATA_FILE)
+    return memory_path(DATA_FILE, BASE)
 
 
 def _study_load():
@@ -1024,7 +1025,7 @@ class SkillError(Exception):
 
 
 def _skills_path():
-    return os.path.join(BASE, SKILLS_FILE)
+    return memory_path(SKILLS_FILE, BASE)
 
 
 def _skills_load():
