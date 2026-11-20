@@ -10,13 +10,13 @@ import os
 import sys
 import time
 
-import cv2
+import threading
 
-from jarvis_ui.hologram import Hologram
-from jarvis_ui.voice_assistant import VoiceAssistant, NullVoice
-from jarvis_ui.face_id import FaceID
-from jarvis_ui import system_control, addons, dashboard_modes, system_monitor, task_engine, self_diagnostics, procedural_construction
-from jarvis_ui.hand_tracker import BackgroundTracker
+from jarvis_ui.boot_sequence import BootSequence
+
+# Imported by load_modules() on a worker thread while the splash plays.
+cv2 = Hologram = VoiceAssistant = NullVoice = FaceID = BackgroundTracker = None
+system_control = addons = dashboard_modes = system_monitor = task_engine = self_diagnostics = procedural_construction = None
 
 GESTURE_TO_STATE = {"open_palm": "listening", "fist": "speaking"}
 SNAPSHOT_DIR = "snapshots"
@@ -32,14 +32,39 @@ def save_snapshot(frame):
     print(f"Snapshot saved: {path}")
 
 
-def build_voice(hologram, face_id):
+class BootLog:
+    """Buffers log lines until the hologram exists, then forwards them to its event log."""
+
+    def __init__(self):
+        self.buf, self.sink = [], None
+
+    def __call__(self, text):
+        if self.sink:
+            self.sink(text)
+        else:
+            self.buf.append(text)
+
+    def attach(self, sink):
+        self.sink = sink
+        for text in self.buf:
+            sink(text)
+        self.buf.clear()
+
+
+def create_voice(face_id, log):
+    """Builds the voice assistant without a hologram (attach_voice completes it once the window exists)."""
     try:
-        voice = VoiceAssistant(hologram, face_id, on_log=hologram.log_event)
+        return VoiceAssistant(None, face_id, on_log=log)
     except Exception:
         import traceback
         print("VoiceAssistant setup failed, continuing without voice:", flush=True)
         traceback.print_exc()
         return NullVoice()
+
+
+def attach_voice(voice, face_id, hologram):
+    voice.hologram = hologram
+    face_id._log = hologram.log_event
     try:
         from jarvis_ui import aurora_plus       # cowork, network hub, offline mode, file search
         aurora_plus.install(voice, hologram)
@@ -48,14 +73,46 @@ def build_voice(hologram, face_id):
         print("Aurora Plus unavailable, continuing without it:", flush=True)
         traceback.print_exc()
     voice.start()
-    return voice
+
+
+def load_modules(splash, state):
+    """Worker thread: heavy imports, hand tracker, face recognition and voice, reported to the splash log."""
+    global cv2, Hologram, VoiceAssistant, NullVoice, FaceID, BackgroundTracker
+    global system_control, addons, dashboard_modes, system_monitor, task_engine, self_diagnostics, procedural_construction
+    try:
+        splash.note("loading core libraries")
+        import cv2
+        from jarvis_ui.hologram import Hologram
+        from jarvis_ui.voice_assistant import VoiceAssistant, NullVoice
+        from jarvis_ui.face_id import FaceID
+        from jarvis_ui import system_control, addons, dashboard_modes, system_monitor, task_engine, self_diagnostics, procedural_construction
+        from jarvis_ui.hand_tracker import BackgroundTracker
+        log = state["log"] = BootLog()
+        splash.note("loading gesture tracking engine")
+        state["tracker"] = BackgroundTracker(addons.TipHandTracker(camera_index=0))
+        splash.note("loading face recognition")
+        state["face_id"] = FaceID(on_log=log)
+        splash.note("booting voice pipeline")
+        state["voice"] = create_voice(state["face_id"], log)
+    except BaseException as e:
+        state["error"] = e
 
 
 def main():
-    tracker = BackgroundTracker(addons.TipHandTracker(camera_index=0))
-    hologram = Hologram()
-    face_id = FaceID(on_log=hologram.log_event)
-    voice = build_voice(hologram, face_id)
+    splash = BootSequence()                 # opens first, before anything heavy is imported
+    state = {}
+    worker = threading.Thread(target=load_modules, args=(splash, state), daemon=True)
+    worker.start()
+    splash.run(lambda: not worker.is_alive())
+    splash.close()
+    if splash.quit:
+        os._exit(0)
+    if "error" in state:
+        raise state["error"]
+    tracker, face_id, voice = state["tracker"], state["face_id"], state["voice"]
+    hologram = Hologram()                   # the main window opens only now
+    state["log"].attach(hologram.log_event)
+    attach_voice(voice, face_id, hologram)
     drawer = addons.GestureDrawer(hologram, speak=voice.speak_now, on_log=hologram.log_event)
     hologram.drawer, voice.drawer = drawer, drawer
     addons.install(hologram, drawer)
@@ -165,7 +222,10 @@ def main():
                 hologram.apply_zoom_delta(result.zoom_delta)
             if result.roll_delta:
                 hologram.apply_roll_delta(result.roll_delta)
-            if result.swipe == "left":
+            pres = getattr(getattr(hologram, "modes", None), "presentation", None)
+            if result.swipe in ("left", "right") and pres is not None and pres.active:
+                pres.step_async(1 if result.swipe == "left" else -1)     # swipe left = next slide while presenting
+            elif result.swipe == "left":
                 hologram.cycle_theme(-1)
             elif result.swipe == "right":
                 hologram.cycle_theme(1)

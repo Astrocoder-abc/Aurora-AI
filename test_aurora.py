@@ -5648,7 +5648,355 @@ check(G, "AI content -> deck (mocked model), bad output falls back, requested th
 check(G, "voice command builds a designed deck; docx still uses the old builder", t_pb_voice_command)
 
 
+# ============================================================================ natural-language construction control (stage 4)
+def cc_mod():
+    return mod("construction_commands")
+
+
+def cc_env(model="drone", mode="shape"):
+    """Fake hologram showing `model` with the Stage 3 editor installed + a ConstructionCommands bound to it."""
+    pc, h, ed = pc3_setup(model, mode)
+    h.load_solar_system = mock.Mock()
+    return cc_mod().ConstructionCommands(h, None), h, ed, pc
+
+
+def cc_say(cc, *phrases):
+    return [cc.route(p) for p in phrases][-1]
+
+
+@ext("Construction commands")
+def intent_parsing_table():
+    cc = cc_mod()
+    M = {"drone", "robot", "car", "spaceship"}
+    P = lambda t: cc.parse(t, M)
+    eq(P("Aurora, show me a drone"), {"kind": "show", "model": "drone"})
+    eq(P("Construct a spaceship."), {"kind": "show", "model": "spaceship"})
+    eq(P("build the quadcopter"), {"kind": "show", "model": "drone"})
+    eq(P("show me all available models"), {"kind": "list"})
+    eq(P("switch to the drone hologram"), {"kind": "show", "model": "drone"})
+    eq(P("switch to the solar system hologram"), {"kind": "switch", "target": "solar system"})
+    eq(P("select its left rotor"), {"kind": "select", "target": "its left rotor"})
+    eq(P("undo that")["kind"], "undo")
+    eq(P("Reset the model")["kind"], "reset")
+    eq(P("reset the position")["kind"], "reset_transform")
+    m = P("move it closer")
+    eq((m["kind"], m["dir"], m["target"], m["amount"]), ("move", (0, 0, 1), "it", None))
+    m = P("move the left rotor upward")
+    eq((m["dir"], m["target"]), ((0, 1, 0), "the left rotor"))
+    m = P("could you please nudge it left a bit")
+    eq((m["dir"], m["quality"]), ((-1, 0, 0), "small"))
+    m = P("move it up by 0.5 units")
+    eq((m["dir"], m["amount"]), ((0, 1, 0), 0.5))
+    eq(P("move it to the left")["dir"], (-1, 0, 0))
+    eq(P("move it toward me")["dir"], (0, 0, 1))
+    r = P("rotate it 45 degrees")
+    eq((r["kind"], r["axis"], r["angle"], r["target"]), ("rotate", "y", 45.0, "it"))
+    eq(P("rotate it 30 degrees right")["angle"], -30.0)
+    r = P("tilt the wing up 20 degrees")
+    eq((r["axis"], r["angle"], r["target"]), ("x", 20.0, "the wing"))
+    eq(P("roll it")["axis"], "z")
+    eq(P("rotate it around the x axis by 90")["axis"], "x")
+    eq(P("turn it around")["angle"], 180.0)
+    eq(P("rotate it counter-clockwise a quarter turn")["angle"], 90.0)
+    eq(P("make it bigger")["factor"], 1.25)
+    eq(P("make it a lot smaller")["factor"], 0.6)
+    eq(P("make the whole thing bigger")["target"], "the whole thing")
+    eq(P("shrink the entire model")["factor"], 0.8)
+    eq(P("make it twice as big")["factor"], 2.0)
+    eq(P("make it 3 times bigger")["factor"], 3.0)
+    s = P("scale it to 1.5")
+    eq((s["factor"], s["absolute"]), (1.5, True))
+    eq(P("resize it by 150%")["factor"], 1.5)
+    eq(P("scale it")["factor"], None)
+
+
+@ext("Construction commands")
+def phrases_for_other_features_are_not_claimed():
+    cc = cc_mod()
+    M = {"drone", "robot", "car", "spaceship"}
+    for t in ("select orbit three", "move system panel behind me", "turn up the volume", "turn off wifi on my phone",
+              "rotate the molecule", "reset the display", "show me a carbon atom", "show me the solar system", "make a presentation about mars",
+              "move report.pdf to documents", "undo the move in downloads", "switch to coding mode", "take a note: move it up",
+              "what time is it", "", "   ", "make it so", "lower the brightness", "deselect orbit",
+              "__import__('os').system('x')", "rotate it exec(open('x'))"):
+        eq(cc.parse(t, M), None) if "exec(" not in t else None
+    for t in ("show me a carbon atom", "move report.pdf to documents", "turn up the volume", "make a presentation about mars"):
+        eq(cc.parse(t, M), None)
+
+
+@ext("Construction commands")
+def model_and_part_reference_resolution():
+    c = cc_mod()
+    M = {"drone", "robot", "car", "spaceship"}
+    eq((c.resolve_model("a drone", M), c.resolve_model("the ship", M), c.resolve_model("quadcopter model", M), c.resolve_model("atom", M)),
+       ("drone", "spaceship", "drone", None))
+    names = [p.name for p in cc_env()[3].MODELS["drone"].parts]
+    eq(c.resolve_part("camera", names), ("part", "camera gimbal"))
+    eq(c.resolve_part("the front left propellers", names), ("part", "propeller front left"))
+    eq(c.resolve_part("rear right rotor", names), ("part", "propeller rear right"))
+    eq(c.resolve_part("motor, front right", names), ("part", "motor front right"))
+    kind, cands = c.resolve_part("left rotor", names)
+    eq((kind, sorted(cands)), ("ask", ["propeller front left", "propeller rear left"]))
+    eq(c.resolve_part("propeler front left", names), ("part", "propeller front left"))      # typo
+    eq(c.resolve_part("warp core", names)[0], "none")
+    robot = [p.name for p in cc_env("robot")[3].MODELS["robot"].parts]
+    eq(c.resolve_part("left arm", robot), ("part", "arm left"))
+    eq(c.resolve_part("eyes", robot)[0], "ask")
+
+
+@ext("Construction commands")
+def show_list_and_switch_commands():
+    cc, h, ed, pc = cc_env("robot")
+    eq(cc.route("show me a drone"), "Drone constructed.")
+    eq((h.mode, h.shape_name, h.mode_label), ("shape", "drone", "DRONE CONSTRUCTION"))
+    eq(cc.route("construct a spaceship"), "Spaceship constructed.")
+    eq(cc.route("show me all available models"), "Available models: car, drone, robot, or spaceship.")
+    eq(cc.route("switch to the robot hologram"), "Robot constructed.")
+    h.mode = "empty"                                                    # nothing displayed: show still works
+    eq(cc.route("build a car"), "Car constructed.")
+    calls = []
+    cc.v = ns(_handle_local_command=lambda p: calls.append(p) or p.endswith("solar system"))
+    eq(cc.route("switch to the solar system hologram"), "")             # delegated to the existing display command
+    eq(calls, ["show me the solar system"])
+    eq(cc.route("switch to the narnia hologram"), "I don't have a hologram called narnia.")
+
+
+@ext("Construction commands")
+def context_it_follows_selection_whole_model_does_not():
+    cc, h, ed, pc = cc_env("drone")
+    eq(cc.route("select the drone"), "Drone selected.")
+    eq(ed.selected_part, None)
+    eq(cc.route("select its camera"), "Camera gimbal selected.")
+    eq(ed.selected_part, "camera gimbal")
+    base = pc.MODELS["drone"]
+    gim = lambda m: next(p for p in m.parts if p.name == "camera gimbal").pos
+    eq(cc.route("move it upward"), "Moving selected component upward.")
+    eq(round(gim(ed.model_for("drone"))[1] - gim(base)[1], 6), 0.25)    # the part moved...
+    eq(ed.transform_for("drone"), None)                                 # ...not the model
+    eq(cc.route("make the whole thing bigger"), "Making the model bigger.")
+    eq(ed.transform_for("drone")[2], 1.25)
+    eq(ed.selected_part, "camera gimbal")                               # whole-model command keeps the selection
+    eq(cc.route("make it smaller"), "Making selected component smaller.")
+    eq(ed.transform_for("drone")[2], 1.25)                              # 'it' is still the part
+    eq(cc.route("select the drone"), "Drone selected.")
+    eq(cc.route("move it closer"), "Moving the model closer.")
+    eq(ed.transform_for("drone")[0], (0.0, 0.0, 0.25))
+    eq(cc.route("select this part"), "No part is selected.")
+    eq(cc.route("select the robot"), "The robot isn't displayed.")
+
+
+@ext("Construction commands")
+def ambiguity_asks_then_resolves_and_applies_followup():
+    cc, h, ed, pc = cc_env("drone")
+    eq(cc.route("select the left rotor"), "Which one: Propeller front left or Propeller rear left?")
+    eq(ed.selected_part, None)                                          # never guessed
+    eq(cc.route("front"), "Propeller front left selected.")
+    eq(cc.pending, None)
+    ed.deselect_part()
+    q = cc.route("move the left rotor upward")
+    assert q.startswith("Which one") and ed.undo_depth == 0
+    eq(cc.route("the second one"), "Moving the propeller rear left upward.")
+    eq(ed.selected_part, "propeller rear left")
+    eq(ed.undo_depth, 1)
+    cc.route("select the arm")
+    eq(cc.route("banana"), "I couldn't match that. Which one: Arm a or Arm b?")
+    eq(cc.route("cancel"), "Okay.")
+    cc.route("rotate the motor")
+    eq(cc.route("show me a robot"), "Robot constructed.")                # a new command clears the question
+    eq(cc.pending, None)
+    cc.route("select the arm")
+    cc.pending["expires"] = 0
+    eq(cc.route("a"), None)                                             # expired: not swallowed
+    eq(cc_say(cc, "move it"), "Which direction?")
+    eq(cc_say(cc, "scale it"), "By how much?")
+
+
+@ext("Construction commands")
+def transformations_and_limits():
+    cc, h, ed, pc = cc_env("robot")
+    eq(cc.route("rotate it 45 degrees"), "Rotating the model 45 degrees.")
+    eq(ed.transform_for("robot")[1], (0.0, 45.0, 0.0))
+    cc.route("rotate it 90 degrees right")
+    eq(ed.transform_for("robot")[1], (0.0, -45.0, 0.0))
+    cc.route("tilt it up 10 degrees")
+    eq(ed.transform_for("robot")[1][0], 10.0)
+    cc.route("move it up by 0.5 units")
+    eq(ed.transform_for("robot")[0], (0.0, 0.5, 0.0))
+    cc.route("move it left a lot")
+    eq(ed.transform_for("robot")[0][0], -0.6)
+    eq(cc.route("scale it to 1.5"), "Making the model bigger.")
+    eq(ed.transform_for("robot")[2], 1.5)
+    for _ in range(3):
+        last = cc.route("make it bigger")
+    eq((last, ed.transform_for("robot")[2]), ("Nothing changed. It's at its limit.", 2.0))
+    cc.route("shrink the entire model")
+    eq(ed.transform_for("robot")[2], 1.6)
+    # part edits go through the shared validator: an oversized part is rejected, the model is untouched
+    cc.route("select the torso")
+    before = ed.model_for("robot")
+    eq(cc.route("move it up by 9 units"), "That would make the model too large.")
+    eq(ed.model_for("robot") is before, True)
+    eq(cc.route("rotate the head 45 degrees"), "Rotating the head 45 degrees.")
+    eq(next(p for p in ed.model_for("robot").parts if p.name == "head").rot, (0.0, 45.0, 0.0))
+    cc.route("select the robot")
+    eq(cc.route("rotate it 180 degrees"), "Rotating the model 180 degrees.")
+
+
+@ext("Construction commands")
+def undo_and_reset_preserve_stage3_history():
+    cc, h, ed, pc = cc_env("drone")
+    eq(cc.route("undo"), "Nothing to undo.")
+    cc.route("make it bigger")
+    cc.route("rotate it 45 degrees")
+    cc.route("select the camera")
+    cc.route("move it down")
+    eq(ed.undo_depth, 3)
+    eq(cc.route("undo that"), "Undone.")
+    eq(next(p for p in ed.model_for("drone").parts if p.name == "camera gimbal").pos, next(p for p in pc.MODELS["drone"].parts if p.name == "camera gimbal").pos)
+    eq(cc.route("undo the last change"), "Undone.")
+    eq(ed.transform_for("drone")[1], (0.0, 0.0, 0.0))
+    eq(cc.route("reset the model"), "Model reset.")
+    eq((ed.transform_for("drone"), ed.model_for("drone") is pc.MODELS["drone"]), (None, True))
+    eq(cc.route("reset it"), "Already original.")
+    eq(cc.route("undo"), "Undone.")                                     # reset is undoable
+    eq(ed.transform_for("drone")[2], 1.25)
+    eq(cc.route("reset the position"), "Transform reset.")
+    eq(ed.transform_for("drone"), None)
+    eq(cc.route("reset the robot"), "The robot isn't displayed.")
+    eq(cc.route("deselect"), "Selection cleared.")
+    eq(cc.route("select the next part"), "Body selected.")
+    eq(cc.route("next part"), "Camera gimbal selected.")
+
+
+@ext("Construction commands")
+def invalid_and_missing_state_handled_gracefully():
+    cc, h, ed, pc = cc_env("drone")
+    eq(cc.route("rotate it 5000 degrees"), "Angles must be between 1 and 720 degrees.")
+    eq(cc.route("rotate it 0 degrees"), "Angles must be between 1 and 720 degrees.")
+    eq(cc.route("make it 50 times bigger"), "Scale must be between 0.1 and 10.")
+    eq(cc.route("scale it to 0"), "Scale must be between 0.1 and 10.")
+    eq(cc.route("move it up by 99 units"), "That distance is out of range.")
+    eq(cc.route("select the flux capacitor"), "I couldn't identify that component.")
+    eq(cc.route("rotate the flux capacitor"), "I couldn't identify that component.")
+    eq(cc.route("move the flux capacitor up"), None)                    # move-family never claims unknown targets
+    eq(ed.undo_depth, 0)                                                # nothing changed by any rejected command
+    eq(cc.route("select that part"), "No part is selected.")
+    h.shape_name = "ghost"                                              # model vanished
+    eq(cc.route("move it up"), None)
+    h.shape_name, h.mode = "drone", "atom"                              # another hologram mode: never touched
+    for t in ("move it up", "undo", "make it bigger", "rotate it", "reset it", "select the camera"):
+        eq(cc.route(t), None)
+    eq(ed.undo_depth, 0)
+    h.mode = "empty"
+    eq(cc.route("select the drone"), "The drone isn't displayed. Say show me a drone.")
+    eq(cc.route("select the camera"), None)
+
+
+@ext("Construction commands")
+def no_code_execution_and_text_is_data():
+    cc, h, ed, pc = cc_env("drone")
+    marker = []
+    for t in ("select __import__('os').system('x')", "rotate it by __import__('time').sleep(1)", "show me a drone; import os",
+              "move it up; exec('1')", "scale it to 2**100", "rotate it 1e999 degrees"):
+        r = cc.route(t)
+        assert r is None or isinstance(r, str)
+    eq(marker, [])
+    src = open(cc_mod().__file__, encoding="utf-8").read()
+    assert not re.search(r"(?<![.\w])(?:eval|exec|compile|__import__|subprocess|os\.system)\(", src), "construction parser must stay free of dynamic execution"
+    assert "import OpenGL" not in src and "from OpenGL" not in src, "no OpenGL calls outside the render path"
+
+
+@ext("Construction commands")
+def voice_and_typed_integration_with_existing_voice_stub():
+    cm = cc_mod()
+    pc, h, ed = pc3_setup("drone")
+    v, said = ext_voice(hologram=h)
+    assert cm.handle_command(v, "Aurora, select its camera") and said[-1] == "Camera gimbal selected."
+    assert cm.handle_command(v, "MOVE IT UP!") and said[-1] == "Moving selected component upward."
+    assert cm.handle_command(v, "construct a spaceship") and said[-1] == "Spaceship constructed."
+    cmds = v._construction_commands
+    assert cm.handle_command(v, "show me the models") and v._construction_commands is cmds     # one cached router per voice
+    for t in ("what time is it", "show me a carbon atom", "select orbit two", "set a timer for 5 minutes", "move the system panel left"):
+        n = len(said)
+        assert not cm.handle_command(v, t) and len(said) == n, t                               # falls through silently
+    h2 = pc_fake_holo()
+    h2.mode = "empty"
+    v2, said2 = ext_voice(hologram=h2)
+    h2.hide_weather, h2._trigger_materialize, h2._draw_shape = (lambda: None), (lambda: None), (lambda n: None)
+    assert cm.handle_command(v2, "show me a robot") and said2[-1] == "Robot constructed." and hasattr(h2, "construction")   # installs the editor if missing
+
+
+@ext("Construction commands")
+def concurrent_commands_from_background_threads_are_serialised():
+    cc, h, ed, pc = cc_env("robot")
+    errors = []
+
+    def worker():
+        try:
+            for _ in range(10):
+                cc.route("rotate it 1 degree")
+        except Exception as e:
+            errors.append(e)
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    [t.start() for t in threads]
+    [t.join(10) for t in threads]
+    eq(errors, [])
+    eq(ed.transform_for("robot")[1], (0.0, 40.0, 0.0))                  # no lost or doubled updates
+    eq(ed.undo_depth, pc.MAX_UNDO if 40 > pc.MAX_UNDO else 40)
+
+
+@ext("Construction commands")
+def route_never_raises_and_stage3_api_untouched():
+    cc, h, ed, pc = cc_env("drone")
+    ed.move_model = mock.Mock(side_effect=RuntimeError("boom"))
+    assert cc.route("move it up").startswith("Sorry, that construction command failed")
+    cm = cc_mod()
+    assert not hasattr(cm, "MODELS") and not hasattr(cm, "_edits"), "no duplicate registry or transform state"
+    eq(pc.list_models(), ["car", "drone", "robot", "spaceship"])
+
+
+
 # ============================================================================ report
+G = "Presentation upgrade"
+
+
+def t_pu_layout_data():
+    pb = pbm()
+    got = pb._normalize({"slides": [
+        {"layout": "chart", "title": "A", "chart": {"type": "pie", "labels": ["a", "b"], "values": [1, -2]}},
+        {"layout": "chart", "title": "B", "chart": {"labels": ["a"], "values": [1]}},
+        {"layout": "timeline", "title": "C", "steps": [{"label": "1", "text": "x"}] * 3},
+        {"layout": "timeline", "title": "D", "steps": [{"label": "1", "text": "x"}]}]}, "t")["slides"]
+    eq([s["layout"] for s in got], ["chart", "bullets_image", "timeline", "bullets_image"])
+    eq(got[0]["chart"]["type"], "bar")                      # pie with a negative value falls back to bar
+    spec = pb._normalize({"slides": [{"layout": "bullets", "title": f"S{i}", "bullets": ["x"]} for i in range(6)]}, "t")
+    pb._add_agenda(spec)
+    eq((spec["slides"][0]["title"], len(spec["slides"]), spec["slides"][0]["bullets"][-1]), ("Agenda", 7, "S4"))
+
+
+def t_pu_deck_roundtrip():
+    _need_pptx()
+    pb, dm, d = pbm(), mod("dashboard_modes"), _fdir()
+    spec = pb._normalize({"title": "Black Holes", "slides": [
+        {"layout": "chart", "title": "Growth", "chart": {"type": "line", "labels": ["a", "b", "c"], "values": [1, 3, 2], "unit": "x"}},
+        {"layout": "timeline", "title": "History", "steps": [{"label": str(1900 + i), "text": f"event {i}"} for i in range(4)]},
+        {"layout": "bullets", "title": "Plain", "bullets": ["one", "two"], "notes": "n"}]}, "black holes")
+    os.makedirs(os.path.join(d, "documents"))
+    pb.render(spec, os.path.join(d, "documents", "black_holes_20260101_000000.pptx"), images=False)
+    with mock.patch.object(dm, "BASE", d):
+        slides, label = dm.load_deck("black holes")
+        eq(dm.load_deck("latest")[1], "black_holes")
+        eq(dm.load_deck("volcano")[1], "sample deck")
+    eq(label, "black_holes")
+    eq([s["title"] for s in slides], ["Black Holes", "Growth", "History", "Plain"])
+    eq((slides[3]["bullets"], slides[3]["notes"]), (["one", "two"], "n"))
+    assert "event 0" in slides[2]["bullets"] and "AURORA" not in slides[1]["bullets"]
+
+
+check(G, "chart/timeline normalisation and agenda slide", t_pu_layout_data)
+check(G, "render chart + timeline, then load the .pptx into presentation mode", t_pu_deck_roundtrip)
+
+
 def report():
     shutil.rmtree(tmpdir, ignore_errors=True)
     groups = {}

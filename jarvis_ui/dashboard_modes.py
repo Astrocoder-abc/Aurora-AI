@@ -223,6 +223,40 @@ def parse_slides(text):
     return slides
 
 
+def _find_pptx(name):
+    """Newest generated .pptx in documents/ whose file name contains `name` (empty or 'latest' = newest of all)."""
+    key = re.sub(r"[^a-z0-9]+", "_", (name or "").lower()).strip("_")
+    key = "" if key in ("latest", "last", "newest", "recent") else key
+    folder = os.path.join(BASE, "documents")
+    try:
+        files = [os.path.join(folder, f) for f in os.listdir(folder)
+                 if f.lower().endswith(".pptx") and not f.startswith("~$") and key in f.lower()]
+    except OSError:
+        return None
+    return max(files, key=os.path.getmtime) if files else None
+
+
+def _pptx_slides(path):
+    """Slides (title, bullets, speaker notes) read from a .pptx, including decks made by presentation_builder."""
+    from pptx import Presentation
+    slides = []
+    for sl in Presentation(path).slides:
+        texts = []
+        for sh in sl.shapes:
+            if sh.has_text_frame:
+                for para in sh.text_frame.paragraphs:
+                    text = "".join(r.text for r in para.runs).strip().lstrip("\u25AA ").strip()
+                    if len(text) > 1 and text != "AURORA" and not re.fullmatch(r"\d+ / \d+", text):
+                        texts.append(text)
+        title = sl.shapes.title.text_frame.text.strip() if sl.shapes.title is not None else ""
+        title = title or (texts[0] if texts else "")
+        notes = sl.notes_slide.notes_text_frame.text.strip() if sl.has_notes_slide else ""
+        bullets = [t_ for t_ in texts if t_ != title]
+        if title or bullets:
+            slides.append({"title": title, "bullets": bullets[:8], "notes": notes, "demo": ""})
+    return slides
+
+
 def load_deck(name=None):
     """-> (slides, label). Falls back to presentation.md, then the sample deck."""
     paths = []
@@ -239,6 +273,14 @@ def load_deck(name=None):
                     return slides, os.path.splitext(os.path.basename(p))[0].lower()
             except OSError:
                 continue
+    pptx = _find_pptx(name) if name else None
+    if pptx:
+        try:
+            slides = _pptx_slides(pptx)
+            if slides:
+                return slides, re.sub(r"_\d{8}_\d{6}$", "", os.path.splitext(os.path.basename(pptx))[0].lower())
+        except Exception:
+            pass
     return SAMPLE_DECK, "sample deck"
 
 
@@ -314,6 +356,14 @@ class Presentation:
             return "That was the last slide."
         return self.goto(j)
 
+    def step_async(self, d):
+        """Gesture entry point: changes slides off the render thread (a slide's demo command may block)."""
+        def run():
+            reply = self.step(d)
+            if reply:
+                self.m.say(reply)
+        threading.Thread(target=run, daemon=True).start()
+
     def set_timer(self, seconds):
         self.timer_end, self.timer_total, self.warned = time.time() + seconds, seconds, set()
 
@@ -365,6 +415,12 @@ class Presentation:
         if self.timer_end is not None and re.search(r"\b(?:how much time|time left|time remaining)\b", t):
             mins, secs = divmod(max(0, int(self.timer_end - time.time())), 60)
             return f"{mins} minutes {secs} seconds left." if mins else f"{secs} seconds left."
+        if re.search(r"\bslides? (?:are )?left\b|\bhow many slides\b", t):
+            left = n - self.i - 1
+            return f"{left} slide{'s' if left != 1 else ''} left." if left else "This is the last slide."
+        if re.search(r"\bread (?:this|the) slide\b|\bwhat(?:'s| is) on (?:this|the) slide\b", t):
+            s = self.slides[self.i]
+            return ". ".join([s["title"]] + s["bullets"]) or "This slide is empty."
         if re.search(r"\bhow long\b.*\bpresent", t):
             return f"You've been presenting for {int((time.time() - self.started) // 60)} minutes."
         if re.search(r"\bnext slide\b|^(?:next|forward)$", t):
@@ -525,6 +581,14 @@ class DashboardModes:
         p = self.presentation
         if p.active:
             return p.command(t)
+        m = re.match(r"present\s+(?:my\s+|the\s+|a\s+)?(.+?)(?:\s+(?:presentation|deck|powerpoint|slides))?$", t)
+        if m and not m.group(1).startswith(("mode", "slide")):
+            name = m.group(1).strip()
+            explicit = bool(re.search(r"\b(?:presentation|deck|powerpoint|slides)$", t)) or name in ("latest", "last", "newest")
+            if load_deck(name)[1] != "sample deck":
+                return p.open(name)
+            if explicit:
+                return f"I couldn't find a presentation called {name}. Make one first, like: make a presentation about {name}."
         if re.search(r"\bpresentation mode\b|\b(?:start|open|begin)\s+(?:the\s+|my\s+|a\s+)?presentation\b", t):
             if re.search(r"\b(?:off|exit|end|close|stop)\b", t):
                 return "Presentation mode isn't on."

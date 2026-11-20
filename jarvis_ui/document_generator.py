@@ -184,5 +184,6 @@ def handle_command(voice, text):
     except OSError:
         pass
     voice._speak(f"Your {LABEL[kind]} is ready with {size} {unit}, saved in the documents folder."
-                 + ("" if used_ai else " I'm offline, so it's a blank outline for you to fill in."))
+                 + ("" if used_ai else " I'm offline, so it's a blank outline for you to fill in.")
+                 + (" Say present the latest presentation to show it." if kind == "pptx" else ""))
     return True

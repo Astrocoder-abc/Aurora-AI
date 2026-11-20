@@ -51,9 +51,10 @@ def _optional(name):
 
 
 (sandbox_labs, addons, dashboard_modes, system_monitor, document_generator, adaptive_interface,
- visual_calculator, operation_simulator, project_workspace) = (
+ visual_calculator, operation_simulator, project_workspace, construction_commands) = (
     _optional(n) for n in ("sandbox_labs", "addons", "dashboard_modes", "system_monitor", "document_generator",
-                           "adaptive_interface", "visual_calculator", "operation_simulator", "project_workspace"))
+                           "adaptive_interface", "visual_calculator", "operation_simulator", "project_workspace",
+                           "construction_commands"))
 
 WAKE_WORD_CORE, WAKE_FUZZY = "aurora", 0.72
 VISION_RE = re.compile(r"\bwhat (?:can |do )?you see\b|\bwhat am i (?:holding|looking at|wearing)\b|\blook at (?:this|me)\b"
@@ -799,7 +800,7 @@ class VoiceAssistant:
             return True
 
         if any(f and f.handle_command(self, text) for f in
-               (operation_simulator, project_workspace, adaptive_interface, visual_calculator)):
+               (operation_simulator, project_workspace, adaptive_interface, visual_calculator, construction_commands)):
             #   # skills, calendar, email, notes, files, study, translation
             return True
         if self.plus is not None and self.plus.route(text):        # cowork, hub, offline mode, file search
